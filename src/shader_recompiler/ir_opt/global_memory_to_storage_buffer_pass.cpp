@@ -6,6 +6,7 @@
 
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -69,6 +70,12 @@ struct StorageInfo {
     /// From Eglantine 0380b062: a 28,102-instruction compute shader took 3.4 s to translate.
     std::unordered_map<const IR::Inst*, TrackResult> first_tracks;
     std::unordered_map<const IR::Inst*, TrackResult> fallback_tracks;
+    /// Instructions from which a breadth-first search for the first attempt (or the fallback)
+    /// cannot succeed: searches from new addresses otherwise walked again what failed ones had
+    /// (725 failing searches of ~5,600 instructions each in a 28,000-instruction compute shader:
+    /// 593 ms -> 75 ms). From PokeDinner ce968650.
+    std::unordered_set<const IR::Inst*> first_exhausted;
+    std::unordered_set<const IR::Inst*> fallback_exhausted;
 };
 
 /// Returns true when the instruction is a global memory instruction
@@ -349,7 +356,8 @@ std::optional<LowAddrInfo> TrackLowAddress(IR::Inst* inst) {
 
 /// Tries to track the storage buffer address used by a global memory instruction
 std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias, Environment* native_env = nullptr,
-                                       small_vector<StorageBufferAddr, 4>* candidates = nullptr) {
+                                       small_vector<StorageBufferAddr, 4>* candidates = nullptr,
+                                       std::unordered_set<const IR::Inst*>* exhausted = nullptr) {
     const auto pred{[bias, native_env](const IR::Inst* inst) -> std::optional<StorageBufferAddr> {
         if (inst->GetOpcode() != IR::Opcode::GetCbufU32 &&
             inst->GetOpcode() != IR::Opcode::GetCbufU32x2) {
@@ -387,7 +395,9 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
         return storage_buffer;
     }};
     if (!native_env) {
-        return BreadthFirstSearch(value, pred);
+        // The predicate depends only on the bias: each caller keeps one set per bias.
+        return exhausted ? IR::BreadthFirstSearchPruned(value, pred, *exhausted)
+                         : BreadthFirstSearch(value, pred);
     }
     // A base pointer survives addition and selection, but not multiplication or a
     // predicate calculation. Searching those expressions can find strides first.
@@ -477,7 +487,8 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const TrackResult& first_track = cached_track(info.first_tracks, [&] {
         TrackResult result;
         result.storage_buffer = Track(low_addr, native ? nullptr : &nvn_bias, native ? &env : nullptr,
-                                      native ? &result.candidates : nullptr);
+                                      native ? &result.candidates : nullptr,
+                                      native ? nullptr : &info.first_exhausted);
         return result;
     });
     const small_vector<StorageBufferAddr, 4>& candidates = first_track.candidates;
@@ -499,7 +510,8 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         // If it fails, track without a bias
         storage_buffer = cached_track(info.fallback_tracks, [&] {
             TrackResult result;
-            result.storage_buffer = Track(low_addr, nullptr, native ? &env : nullptr);
+            result.storage_buffer = Track(low_addr, nullptr, native ? &env : nullptr, nullptr,
+                                          native ? nullptr : &info.fallback_exhausted);
             return result;
         }).storage_buffer;
         if (!storage_buffer) {
