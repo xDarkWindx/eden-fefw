@@ -104,6 +104,8 @@ protected:
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
 
+    Tegra::MaxwellDeviceMemoryManager& device_memory;
+
 private:
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
@@ -159,7 +161,6 @@ private:
     /// @brief Create a new shader entry and register it
     const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
 
-    Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     mutable std::mutex lookup_mutex;
     std::mutex invalidation_mutex;
