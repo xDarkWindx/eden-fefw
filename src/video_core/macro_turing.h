@@ -129,13 +129,12 @@ private:
                 }
             }
             // Both ALUs read the register file before either destination is
-            // committed. Carry chaining remains explicit between the lanes.
-            const auto input_regs = regs;
-            const Word input_initialized = initialized;
+            // committed: regs and initialized only change after the ALU loop, so
+            // they are read in place. Carry chaining remains explicit between the lanes.
             const auto get = [&](Word reg, Word lane) -> Word {
                 if (reg < 24) {
-                    if (!(input_initialized & (1U << reg))) fail("uninitialized register read");
-                    return input_regs[reg];
+                    if (!(initialized & (1U << reg))) fail("uninitialized register read");
+                    return regs[reg];
                 }
                 switch (reg) {
                 case 24: return 0;
