@@ -17,6 +17,7 @@
 
 #ifdef ARCHITECTURE_x86_64
 #include "common/x64/xbyak.h"
+#include "video_core/macro_turing_jit.h"
 #endif
 
 #include "common/assert.h"
@@ -1352,15 +1353,32 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         LOG_TRACE(HW_GPU, "Native MME context={:#x}", context);
         LOG_TRACE(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
-        const auto result = maxwell3d.GetNativeMacroInterpreter().ExecuteDecoded(native_decoded_code, method, parameters,
-            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
-            [&](u32 address, u32 value) {
-                if (address >= 0xe00) return false;
-                maxwell3d.CallMethod(system, address, value, true);
-                return true;
-            }, [&](u64 address, std::span<u32> words) {
-                return maxwell3d.ReadMacroMemory(address, words);
-            });
+        auto& interpreter = maxwell3d.GetNativeMacroInterpreter();
+        const auto read = [&](u32 address) {
+            return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
+        };
+        const auto emit = [&](u32 address, u32 value) {
+            if (address >= 0xe00) return false;
+            maxwell3d.CallMethod(system, address, value, true);
+            return true;
+        };
+        const TuringMacroInterpreter::MemoryRead memory_read = [&](u64 address, std::span<u32> words) {
+            return maxwell3d.ReadMacroMemory(address, words);
+        };
+        const auto result = [&] {
+#ifdef ARCHITECTURE_x86_64
+            if (TuringMacroJitEnabled()) {
+                if (!native_jit) {
+                    native_jit = std::make_shared<TuringMacroJit>();
+                }
+                if (native_jit->Prepare(native_code, native_code_generation)) {
+                    return native_jit->Execute(method, parameters, interpreter.dram, read, emit,
+                                               memory_read);
+                }
+            }
+#endif
+            return interpreter.ExecuteDecoded(native_decoded_code, method, parameters, read, emit, memory_read);
+        }();
         if (!result.success) {
             native_execution_failed = true;
             std::ofstream dump("native-mme-" + std::to_string(method) + ".bin", std::ios::binary);

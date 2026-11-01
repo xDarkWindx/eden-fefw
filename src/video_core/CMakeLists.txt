@@ -90,6 +90,8 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_turing.h
+    macro_turing_jit.h
     fence_manager.h
     gpu.cpp
     gpu.h

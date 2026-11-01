@@ -22,6 +22,8 @@ class System;
 
 namespace Tegra {
 
+class TuringMacroJit;
+
 namespace Engines {
 class Maxwell3D;
 }
@@ -231,6 +233,7 @@ struct MacroEngine {
                 native_code[native_write_offset++] = data;
                 native_decoded_code[instruction] = TuringMacroInterpreter::Decode(
                     std::span<const u32, 3>{native_code.data() + instruction * 3, 3});
+                ++native_code_generation;
             }
             return;
         }
@@ -258,6 +261,9 @@ struct MacroEngine {
     std::array<u32, 0x3000> native_code{};
     std::array<TuringMacroInterpreter::Instruction, 0x1000> native_decoded_code{};
     TuringMacroInterpreter native_interpreter;
+    // Compiled native_code (macro_turing_jit.h), rebuilt when native_code_generation changes.
+    std::shared_ptr<TuringMacroJit> native_jit;
+    u64 native_code_generation{};
 
 };
 

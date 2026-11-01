@@ -21,6 +21,9 @@
 #include "video_core/native_query_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
+#ifdef ARCHITECTURE_x86_64
+#include "video_core/macro_turing_jit.h"
+#endif
 
 namespace Tegra::Engines {
 
@@ -67,26 +70,44 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         if (!is_last_call) return true;
         const u32 entry = ((*native_executing_macro - 0xe00) / 2) % native_macro_positions.size();
         native_executing_macro.reset();
-        const auto result = native_interpreter.ExecuteDecoded(native_macro->native_decoded_code,
-            native_macro_positions[entry], native_parameters,
-            [&](u32 address) { return address < native_registers.size() ? native_registers[address] : 0U; },
-            [&](u32 address, u32 value) {
-                static u32 diagnostic_writes{};
-                if (diagnostic_writes++ < 4096) LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
-                if (address >= 0xe00) return false;
-                // Macros stream inline data one word at a time. EDEN_MACRO_UPLOAD_BATCH=1 buffers
-                // the words and flushes them as one write before any other method (or at the end
-                // of the macro), instead of one AccelerateInlineToMemory per word. Opt-in: the
-                // saved battle then reaches 60 fps, which exposes a black-output race (see
-                // plans/codex-handoff.md); at <=56 fps the batched output is correct.
-                static const bool batch = std::getenv("EDEN_MACRO_UPLOAD_BATCH") != nullptr;
-                const bool streams_upload = batch &&
-                                            address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
-                                            upload_state.DefersPartialFlush();
-                if (!streams_upload) upload_state.FlushPartial();
-                CallMethod(system, address, value, !streams_upload);
-                return true;
-            });
+        const auto read = [&](u32 address) {
+            return address < native_registers.size() ? native_registers[address] : 0U;
+        };
+        const auto emit = [&](u32 address, u32 value) {
+            static u32 diagnostic_writes{};
+            if (diagnostic_writes++ < 4096) LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
+            if (address >= 0xe00) return false;
+            // Macros stream inline data one word at a time. EDEN_MACRO_UPLOAD_BATCH=1 buffers
+            // the words and flushes them as one write before any other method (or at the end
+            // of the macro), instead of one AccelerateInlineToMemory per word. Opt-in: the
+            // saved battle then reaches 60 fps, which exposes a black-output race (see
+            // plans/codex-handoff.md); at <=56 fps the batched output is correct.
+            static const bool batch = std::getenv("EDEN_MACRO_UPLOAD_BATCH") != nullptr;
+            const bool streams_upload = batch &&
+                                        address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
+                                        upload_state.DefersPartialFlush();
+            if (!streams_upload) upload_state.FlushPartial();
+            CallMethod(system, address, value, !streams_upload);
+            return true;
+        };
+        const auto result = [&] {
+#ifdef ARCHITECTURE_x86_64
+            if (TuringMacroJitEnabled()) {
+                if (!native_macro->native_jit) {
+                    native_macro->native_jit = std::make_shared<TuringMacroJit>();
+                }
+                if (native_macro->native_jit->Prepare(native_macro->native_code,
+                                                      native_macro->native_code_generation)) {
+                    return native_macro->native_jit->Execute(native_macro_positions[entry],
+                                                             native_parameters,
+                                                             native_interpreter.dram, read, emit);
+                }
+            }
+#endif
+            return native_interpreter.ExecuteDecoded(native_macro->native_decoded_code,
+                                                     native_macro_positions[entry], native_parameters,
+                                                     read, emit);
+        }();
         upload_state.FlushPartial();
         if (!result.success) {
             native_macro->native_execution_failed = true;
