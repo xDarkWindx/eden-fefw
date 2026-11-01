@@ -128,6 +128,9 @@ public:
     void NotifyShutdown();
 
 private:
+    /// Marks a command as executed and wakes a caller blocked on it.
+    static void SignalCommand(SynchState& sync_state, u64 fence, bool block);
+
     /// Pushes a command to be executed by the GPU thread
     u64 PushCommand(CommandData&& command_data, bool block, bool is_async);
 

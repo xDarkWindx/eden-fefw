@@ -98,6 +98,8 @@ add_library(video_core STATIC
     native_query_trace.h
     native_root_table.h
     native_semaphore.h
+    gpu_split.cpp
+    gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h

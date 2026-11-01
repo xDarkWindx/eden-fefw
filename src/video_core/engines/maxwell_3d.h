@@ -10,6 +10,7 @@
 #include <bitset>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <vector>
@@ -34,6 +35,10 @@ class System;
 
 namespace Tegra {
 class MemoryManager;
+}
+
+namespace VideoCommon {
+class GpuSplit;
 }
 
 namespace VideoCore {
@@ -3149,6 +3154,10 @@ public:
     }
     void SetNativeMacroContext(std::shared_ptr<NativeMacroContext> context) {
         native_macro_context = std::move(context);
+        native_failure_flags = native_macro_context
+                                   ? NativeFailureFlags{&native_macro_context->engine.native_execution_failed,
+                                                        &native_macro_context->compute_engine.native_execution_failed}
+                                   : NativeFailureFlags{};
     }
     MacroEngine& GetNativeMacroEngine() { return native_macro_context ? native_macro_context->engine : macro_engine; }
     TuringMacroInterpreter& GetNativeMacroInterpreter() { return native_interpreter; }
@@ -3160,6 +3169,15 @@ public:
 
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+
+    /// GPU thread split with macros on its front half (gpu_split.h, EDEN_GPU_SPLIT=2), called by
+    /// the front instead of CallMethod/CallMultiMethod: runs native macros against copies of the
+    /// registers they read and sends every write to the back.
+    [[nodiscard]] bool FrontRunsMacros() { return GetNativeMacroEngine().native_turing; }
+    void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                         u32 argument, bool is_last_call);
+    void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                              const u32* base_start, u32 amount, u32 methods_pending);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3302,6 +3320,20 @@ private:
 
     std::vector<std::pair<GPUVAddr, size_t>> macro_segments;
     bool current_macro_dirty{};
+
+    // GPU thread split, macros on the front (gpu_split.h).
+    struct FrontState;
+    FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+    void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                    bool is_last_call, bool from_macro);
+    void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+    /// The split stopped mid-session: macros run here again (on the single GPU thread).
+    void LeaveFront();
+    /// What ProcessMacro and CallMacroMethod do after a macro, run on the back.
+    void FinishFrontMacro(Core::System& system);
+    std::unique_ptr<FrontState> front;
+    bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

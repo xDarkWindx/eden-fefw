@@ -16,6 +16,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -39,19 +40,52 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
 
         auto current_context = context.Acquire();
         CommandDataContainer next;
+        auto& split = VideoCommon::GpuSplit::Get();
         while (!stop_token.stop_requested()) {
+            split.MaybeStart(system);
             if (scheduler.HasPendingNativeChannels()) {
                 scheduler.ResumePending(system.GPU());
                 if (!state.queue.TryPop(next)) {
+                    split.Publish();
                     std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     continue;
                 }
             } else if (!state.queue.TryPop(next)) {
-                rasterizer->OnGpuThreadIdle();
+                if (split.Active()) {
+                    split.Defer([r = rasterizer] { r->OnGpuThreadIdle(); });
+                    split.Publish();
+                } else {
+                    rasterizer->OnGpuThreadIdle();
+                }
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
                 break;
+            }
+            if (split.Active()) {
+                // Only command lists are parsed here; everything else runs on the back thread
+                // in order, and so does the signal that the command ran.
+                auto* const rasterizer_ptr = renderer.ReadRasterizer();
+                if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+                } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
+                    split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
+                } else if (const auto* flush = std::get_if<FlushRegionCommand>(&next.data)) {
+                    split.Defer([rasterizer_ptr, addr = flush->addr, size = flush->size] {
+                        rasterizer_ptr->FlushRegion(addr, size);
+                    });
+                } else if (const auto* invalidate = std::get_if<InvalidateRegionCommand>(&next.data)) {
+                    split.Defer([rasterizer_ptr, addr = invalidate->addr, size = invalidate->size] {
+                        rasterizer_ptr->OnCacheInvalidation(addr, size);
+                    });
+                } else {
+                    ASSERT(false);
+                }
+                split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
+                    SignalCommand(*state_ptr, fence, block);
+                });
+                split.Publish();
+                continue;
             }
             Common::Timeline::Mark("gpu_begin", next.data.index(), next.fence);
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
@@ -65,20 +99,25 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             } else {
                 ASSERT(false);
             }
-            state.signaled_fence.store(next.fence);
             Common::Timeline::Mark("gpu_end", next.data.index(), next.fence);
             // Diagnostic: EDEN_GPU_THREAD_DELAY_US slows the GPU thread to test speed-dependent bugs.
             if (static const long delay_us = [] { const char* v = std::getenv("EDEN_GPU_THREAD_DELAY_US"); return v ? std::atol(v) : 0L; }(); delay_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds{delay_us});
             }
-            if (next.block) {
-                // We have to lock the write_lock to ensure that the condition_variable wait not get a
-                // race between the check and the lock itself.
-                std::scoped_lock lk{state.write_lock};
-                state.cv.notify_all();
-            }
+            SignalCommand(state, next.fence, next.block);
         }
+        split.Stop();
     });
+}
+
+void ThreadManager::SignalCommand(SynchState& sync_state, u64 fence, bool block) {
+    sync_state.signaled_fence.store(fence);
+    if (block) {
+        // We have to lock the write_lock to ensure that the condition_variable wait not get a
+        // race between the check and the lock itself.
+        std::scoped_lock lk{sync_state.write_lock};
+        sync_state.cv.notify_all();
+    }
 }
 
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {

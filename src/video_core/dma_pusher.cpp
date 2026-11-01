@@ -12,8 +12,10 @@
 #include "core/core.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -40,11 +42,24 @@ void DmaPusher::DispatchCalls() {
             break;
         }
     }
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Defer([gpu = &system.GPU()] {
+            gpu->FlushCommandsBatched();
+            gpu->OnCommandListEnd();
+        });
+        split.Publish();
+        return;
+    }
     system.GPU().FlushCommandsBatched();
     system.GPU().OnCommandListEnd();
 }
 
 bool DmaPusher::HasFailedNativeWork() const {
+    // With the GPU thread split the back thread clears the flags after each method it runs
+    // (gpu_split.cpp), as this does on one thread. (The split stays off with EDEN_NATIVE_STRICT.)
+    if (VideoCommon::GpuSplit::Get().Active()) {
+        return false;
+    }
     const auto& context = channel_state.native_macro_context;
     if (!channel_state.native_abi || !context ||
         !(context->engine.native_execution_failed || context->compute_engine.native_execution_failed)) {
@@ -111,10 +126,22 @@ bool DmaPusher::Step() {
             const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
-                subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+                auto* const engine_state = subchannels[dma_state.subchannel];
+                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                    // The caches behind IsMemoryDirty belong to the split's back thread.
+                    split.Defer([engine_state, memory = &memory_manager,
+                                 address = GPUVAddr{dma_state.dma_get}, bytes = words * sizeof(u32)] {
+                        engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
+                    });
+                } else {
+                    engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
+                }
             }
         }
-        const bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
+        // A safe read flushes the caches, which belong to the split's back thread while it runs
+        // (the split only starts with unsafe reads; the settings can change mid-game).
+        const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
+                              (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         // The words as submitted, unless this entry resumes after an acquire (the words after it
         // may be new) or the GPU has newer words that the safe read would flush.
         const bool submitted = command_resume_offset == 0 &&
@@ -148,6 +175,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
+        VideoCommon::GpuSplit::Get().Drain();
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
             synced = true;
@@ -222,6 +250,14 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method_count = command_header.method_count;
 }
 
+bool DmaPusher::WantsSegment() const {
+    // current_dma_segment is read by macro parameter collection (Maxwell3D) and inline uploads
+    // (KeplerCompute data_upload).
+    const auto engine = subchannel_type[dma_state.subchannel];
+    return engine == Engines::EngineTypes::KeplerCompute ||
+           (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
+}
+
 void DmaPusher::CallMethod(u32 argument) {
     if (dma_state.method < non_puller_methods) {
         puller.CallPullerMethod(*this, Engines::Puller::MethodCall{
@@ -232,6 +268,30 @@ void DmaPusher::CallMethod(u32 argument) {
         });
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+            if (split.FrontMacros()) {
+                const auto type = subchannel_type[dma_state.subchannel];
+                if (type == Engines::EngineTypes::Maxwell3D) {
+                    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+                    if (maxwell3d->FrontRunsMacros()) {
+                        maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
+                                                   dma_state.is_last_call);
+                        return;
+                    }
+                } else if (type == Engines::EngineTypes::KeplerCompute) {
+                    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
+                    if (compute->FrontRunsMacros()) {
+                        compute->FrontCallMethod(system, split, dma_state.method, argument,
+                                                 dma_state.is_last_call, &segment);
+                        return;
+                    }
+                }
+            }
+            split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
+                         WantsSegment() ? &segment : nullptr);
+            return;
+        }
         if (!subchannel->execution_mask[dma_state.method]) {
             subchannel->method_sink.emplace_back(dma_state.method, argument);
         } else {
@@ -247,6 +307,30 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         puller.CallMultiMethod(*this, dma_state.method, dma_state.subchannel, base_start, num_methods, dma_state.method_count);
     } else {
         auto subchannel = subchannels[dma_state.subchannel];
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            const GPUVAddr segment = dma_state.dma_get + dma_state.dma_word_offset;
+            if (split.FrontMacros()) {
+                const auto type = subchannel_type[dma_state.subchannel];
+                if (type == Engines::EngineTypes::Maxwell3D) {
+                    auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
+                    if (maxwell3d->FrontRunsMacros()) {
+                        maxwell3d->FrontCallMultiMethod(system, split, dma_state.method, base_start,
+                                                        num_methods, dma_state.method_count);
+                        return;
+                    }
+                } else if (type == Engines::EngineTypes::KeplerCompute) {
+                    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannel);
+                    if (compute->FrontRunsMacros()) {
+                        compute->FrontCallMultiMethod(system, split, dma_state.method, base_start,
+                                                      num_methods, dma_state.method_count, &segment);
+                        return;
+                    }
+                }
+            }
+            split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
+                              dma_state.method_count, WantsSegment() ? &segment : nullptr);
+            return;
+        }
         subchannel->ConsumeSink(system);
         subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
         subchannel->CallMultiMethod(system, dma_state.method, base_start, num_methods, dma_state.method_count);

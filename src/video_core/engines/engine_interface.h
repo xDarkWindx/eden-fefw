@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <bitset>
 #include <limits>
 #include <vector>
@@ -47,6 +48,11 @@ public:
     std::vector<std::pair<u32, u32>> method_sink{};
     GPUVAddr current_dma_segment;
     bool current_dirty{};
+    /// The channel's native macro failure flags (NativeMacroContext), if any. On one GPU thread
+    /// DmaPusher clears them after each method; with the GPU thread split (gpu_split.h) the back
+    /// thread does, after each method it executes, so a failure skips the same draws.
+    using NativeFailureFlags = std::array<bool*, 2>;
+    NativeFailureFlags native_failure_flags{};
 protected:
     virtual void ConsumeSinkImpl(Core::System& system) {
         for (auto [method, value] : method_sink) {
