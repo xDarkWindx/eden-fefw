@@ -35,6 +35,7 @@
 #include "video_core/shader_notify.h"
 #include "video_core/native_vprs.h"
 #include "video_core/stack_trace_diagnostics.h"
+#include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -436,6 +437,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     texture_cache.SynchronizeDescriptors(false);
 
+    const bool dedupe_samplers = VideoCommon::TextureLookupDedupeEnabled() &&
+                                 !VideoCommon::NativeTextureRequestsEnabled();
+    static thread_local VideoCommon::LookupMemo<VideoCommon::SamplerId, 256> sampler_memo;
+    if (dedupe_samplers) {
+        sampler_memo.Reset("samplers");
+    }
+
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
 
     const auto& regs{maxwell3d->regs};
@@ -621,7 +629,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
                 views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+                VideoCommon::SamplerId sampler;
+                if (const auto* const known = dedupe_samplers ? sampler_memo.Find(handle.second) : nullptr) {
+                    sampler = *known;
+                } else {
+                    sampler = texture_cache.GetSamplerId(handle.second, false);
+                    if (dedupe_samplers) {
+                        sampler_memo.Store(handle.second, sampler);
+                    }
+                }
                 samplers.push_back(sampler);
             }
         }
