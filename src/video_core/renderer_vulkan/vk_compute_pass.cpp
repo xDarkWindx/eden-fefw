@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -615,7 +616,15 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
     });
-    scheduler.Finish();
+    // Only later GPU work reads the decoded image, ordered by the barrier above, and the staging
+    // buffer and descriptor sets are recycled by tick, so the CPU does not have to wait. Waiting
+    // here stalled emulation once per streamed ASTC texture. EDEN_ASTC_GPU_FINISH restores it.
+    static const bool finish = std::getenv("EDEN_ASTC_GPU_FINISH") != nullptr;
+    if (finish) {
+        scheduler.Finish();
+    } else {
+        scheduler.Flush();
+    }
 }
 
 constexpr u32 BL3D_BINDING_INPUT_BUFFER  = 0;
