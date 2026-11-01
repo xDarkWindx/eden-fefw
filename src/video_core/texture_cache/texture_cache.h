@@ -25,6 +25,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
@@ -222,14 +223,27 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
     const bool capture = !compute && gpu_memory->UsesNativeTiling() && BeginNativeTextureCapture();
+    const bool dedupe = !capture && TextureLookupDedupeEnabled();
+    static thread_local LookupMemo<ImageViewId, 1024> memo;
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
         if (blacklist) {
             has_blacklisted = false;
         }
+        if (dedupe) {
+            // A pass that deletes images is repeated, so the memo only lives for one pass.
+            memo.Reset(compute ? "compute-views" : "views");
+        }
         for (ImageViewInOut& view : views) {
-            view.id = VisitImageView(view.index, compute);
+            if (const ImageViewId* const known = dedupe ? memo.Find(view.index) : nullptr) {
+                view.id = *known;
+            } else {
+                view.id = VisitImageView(view.index, compute);
+                if (dedupe) {
+                    memo.Store(view.index, view.id);
+                }
+            }
             if (capture && view.id != NULL_IMAGE_VIEW_ID) {
                 const ImageViewBase& image_view = slot_image_views[view.id];
                 if (!image_view.IsBuffer() && image_view.image_id) {
