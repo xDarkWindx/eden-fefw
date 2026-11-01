@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -361,12 +362,30 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
+    // Records of buffer-backed arrays repeat the same view and sampler; within one descriptor of one
+    // draw the pair always yields the same handles.
+    struct SampledImage {
+        VkImageView view{};
+        VkSampler sampler{};
+        bool rescaled{};
+    };
+    const bool dedupe = VideoCommon::TextureLookupDedupeEnabled();
+    static thread_local VideoCommon::LookupMemo<SampledImage, 1024, u64> memo;
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
+        if (dedupe) {
+            memo.Reset("descriptors");
+        }
         for (u32 index = 0; index < desc.count; ++index) {
             const auto& guest_view = *views++;
             const VideoCommon::ImageViewId image_view_id{guest_view.id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            const u64 memo_key = u64{image_view_id.index} | (u64{sampler_id.index} << 32);
+            if (const SampledImage* const known = dedupe ? memo.Find(memo_key) : nullptr) {
+                guest_descriptor_queue.AddSampledImage(known->view, known->sampler);
+                is_rescaled |= known->rescaled;
+                continue;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (desc.buffer_source.enabled && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
@@ -392,10 +411,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
+            const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+            guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
+            if (dedupe) {
+                memo.Store(memo_key, SampledImage{vk_image_view, vk_sampler, element_rescaled});
+            }
         }
         rescaling.PushTexture(is_rescaled);
     }

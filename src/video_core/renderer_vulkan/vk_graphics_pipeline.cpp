@@ -432,7 +432,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
     boost::container::small_vector<size_t, 64> excluded_views;
     boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    views.reserve(num_image_elements);
+    // Sized up front and written in place: buffer-backed arrays add hundreds of records per draw.
+    views.resize(num_image_elements);
+    size_t view_count{};
+    const auto add_view{[&](const VideoCommon::ImageViewInOut& view) LAMBDA_FORCEINLINE {
+        if (view_count < views.size()) {
+            views[view_count] = view;
+        } else {
+            views.push_back(view);
+        }
+        ++view_count;
+    }};
     samplers.reserve(num_textures);
 
     texture_cache.SynchronizeDescriptors(false);
@@ -594,7 +604,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                views.push_back({
+                add_view({
                     .index = handle.first,
                     .blacklist = blacklist,
                     .id = {}
@@ -622,12 +632,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                             throw Shader::RuntimeError("Invalid buffer texture exclusion field");
                         const u32 word = read_buffer_texture_word(u64{index} * source.stride + exclusion.offset);
                         if (exclusion.Matches(word)) {
-                            excluded_views.push_back(views.size());
+                            excluded_views.push_back(view_count);
                             break;
                         }
                     }
                 }
-                views.push_back({handle.first});
+                add_view({handle.first});
 
                 VideoCommon::SamplerId sampler;
                 if (const auto* const known = dedupe_samplers ? sampler_memo.Find(handle.second) : nullptr) {
@@ -663,6 +673,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         config_stage(4);
+    }
+    if (view_count != views.size()) {
+        views.resize(view_count);
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
