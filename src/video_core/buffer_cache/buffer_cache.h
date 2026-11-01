@@ -12,6 +12,8 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string_view>
+#include <thread>
 
 #include "common/range_sets.inc"
 #include "shader_recompiler/exception.h"
@@ -1111,6 +1113,27 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
 }
 
 template <class P>
+void BufferCache<P>::RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& pool) {
+    if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
+        // Resolving one segment can join, and so delete, the buffer of another; repeat until
+        // every segment points at a live buffer.
+        for (int pass = 0; pass < 16; ++pass) {
+            bool resolved = false;
+            for (MultiRangeSegment& segment : pool) {
+                if (!segment.buffer_id) {
+                    segment.buffer_id = FindBuffer(segment.device_addr, segment.size,
+                                                   runtime.PrefersSparseSources());
+                    resolved = true;
+                }
+            }
+            if (!resolved) {
+                return;
+            }
+        }
+    }
+}
+
+template <class P>
 void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                               std::vector<MultiRangeSegment>& pool) {
     binding.segment_first = 0;
@@ -1171,6 +1194,18 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
         }
         if (binding.segment_first + binding.segment_count > pool.size()) {
             return false;
+        }
+        for (u32 index = 0; index < binding.segment_count; ++index) {
+            const BufferId id = pool[binding.segment_first + index].buffer_id;
+            if (!id || !slot_buffers.contains(id)) [[unlikely]] {
+                static u32 dead_logs = 0;
+                if (dead_logs < 16) {
+                    ++dead_logs;
+                    LOG_ERROR(HW_GPU, "Multi-range segment points at a deleted buffer_id={}",
+                              id.index);
+                }
+                return false;
+            }
         }
         const bool grouped = binding.segment_size != 0;
         is_written |= grouped && binding.segment_written;
@@ -1427,6 +1462,7 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
                 PrepareGroupedStorage(bindings, graphics_segments);
             }
         }
+        RefreshMultiRangeSegments(graphics_segments);
     });
 }
 
@@ -1447,6 +1483,7 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
                 PrepareGroupedStorage(bindings, compute_segments);
             }
         }
+        RefreshMultiRangeSegments(compute_segments);
     });
 }
 
@@ -1776,14 +1813,24 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         if (!overlap_id) {
             continue;
         }
-        if (!slot_buffers.contains(overlap_id)) [[unlikely]] {
-            // A deleted buffer is still in the page table. Joining it would delete whichever
-            // buffer reuses the slot next, possibly the one being created here.
+        // A stale entry points at a deleted slot, at a slot reused by a buffer that is not
+        // registered yet, or at a buffer that does not cover this page. Joining it would delete
+        // (or unregister) a buffer that does not own the page, so drop the entry instead.
+        const bool live = slot_buffers.contains(overlap_id);
+        const Buffer* const candidate = live ? &slot_buffers[overlap_id] : nullptr;
+        const bool registered = candidate && candidate->getLRUID() != SIZE_MAX;
+        const bool covers = candidate && candidate->CpuAddr() <= device_addr &&
+                            device_addr < candidate->CpuAddr() + candidate->SizeBytes();
+        if (!registered || !covers) [[unlikely]] {
             static u32 stale_logs = 0;
             if (stale_logs < 16) {
                 ++stale_logs;
-                LOG_ERROR(HW_GPU, "Stale buffer page: device_addr={:#x} buffer_id={}",
-                          device_addr, overlap_id.index);
+                LOG_ERROR(HW_GPU,
+                          "Stale buffer page: device_addr={:#x} buffer_id={} live={} "
+                          "registered={} range={:#x}+{:#x}",
+                          device_addr, overlap_id.index, live, registered,
+                          candidate ? candidate->CpuAddr() : 0,
+                          candidate ? candidate->SizeBytes() : 0);
             }
             page_table[device_addr >> CACHING_PAGEBITS] = BufferId{};
             continue;
@@ -1886,29 +1933,97 @@ template <bool insert>
 void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     Buffer& buffer = slot_buffers[buffer_id];
     const auto size = buffer.SizeBytes();
+    const DAddr device_addr_begin = buffer.CpuAddr();
+    const DAddr device_addr_end = device_addr_begin + size;
+    const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
+    const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
+    if (static const bool check_pages = std::getenv("EDEN_BUFFER_PAGE_CHECK") != nullptr;
+        check_pages) [[unlikely]] {
+        CheckPageTableChange<insert>(buffer_id, page_begin, page_end);
+    }
     if (insert) {
         total_used_memory += Common::AlignUp(size, 1024);
         buffer.setLRUID(lru_cache.Insert(buffer_id, frame_tick));
     } else {
         total_used_memory -= Common::AlignUp(size, 1024);
-        lru_cache.Free(buffer.getLRUID());
+        if (buffer.getLRUID() != SIZE_MAX) {
+            lru_cache.Free(buffer.getLRUID());
+            buffer.setLRUID(SIZE_MAX);
+        }
     }
-    const DAddr device_addr_begin = buffer.CpuAddr();
-    const DAddr device_addr_end = device_addr_begin + size;
-    const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
-    const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
     for (u64 page = page_begin; page != page_end; ++page) {
         if constexpr (insert) {
             page_table[page] = buffer_id;
-        } else {
+        } else if (page_table[page] == buffer_id) {
             page_table[page] = BufferId{};
         }
     }
 }
 
 template <class P>
+template <bool insert>
+void BufferCache<P>::CheckPageTableChange(BufferId buffer_id, u64 page_begin, u64 page_end) {
+    static u32 logs = 0;
+    const auto report = [&](std::string_view what, u64 page, BufferId other) {
+        if (logs >= 64) {
+            return;
+        }
+        ++logs;
+        const Buffer& buffer = slot_buffers[buffer_id];
+        const bool other_live = other && slot_buffers.contains(other);
+        LOG_ERROR(HW_GPU,
+                  "Buffer page check ({}): {} buffer_id={} range={:#x}+{:#x} page_addr={:#x} "
+                  "other_id={} other_live={} other_range={:#x}+{:#x}",
+                  insert ? "register" : "unregister", what, buffer_id.index, buffer.CpuAddr(),
+                  buffer.SizeBytes(), page << CACHING_PAGEBITS, other.index, other_live,
+                  other_live ? slot_buffers[other].CpuAddr() : 0,
+                  other_live ? slot_buffers[other].SizeBytes() : 0);
+    };
+    // The cache is meant to be mutated from one thread at a time; a change of thread hints at
+    // a path that bypasses the cache mutex.
+    static std::thread::id last_thread{};
+    static u32 thread_logs = 0;
+    const std::thread::id this_thread = std::this_thread::get_id();
+    if (last_thread != std::thread::id{} && last_thread != this_thread && thread_logs < 8) {
+        ++thread_logs;
+        LOG_ERROR(HW_GPU, "Buffer page check: mutating thread changed at buffer_id={} ({})",
+                  buffer_id.index, insert ? "register" : "unregister");
+    }
+    last_thread = this_thread;
+    if constexpr (insert) {
+        // ResolveOverlaps unregistered every overlap, so the new range must be empty.
+        for (u64 page = page_begin; page != page_end; ++page) {
+            if (page_table[page]) {
+                report("overwrites a page entry", page, page_table[page]);
+            }
+        }
+        // Entries for this id outside the range are left over from the slot's previous buffer.
+        for (u64 page = 0; page != page_table.size(); ++page) {
+            if (page_table[page] == buffer_id && (page < page_begin || page >= page_end)) {
+                report("reused slot already in the page table", page, buffer_id);
+            }
+        }
+    } else {
+        if (slot_buffers[buffer_id].getLRUID() == SIZE_MAX) {
+            report("buffer was never registered", page_begin, BufferId{});
+        }
+        for (u64 page = page_begin; page != page_end; ++page) {
+            if (page_table[page] != buffer_id) {
+                report("page not owned by the buffer", page, page_table[page]);
+            }
+        }
+        // Any entry for this buffer outside its range survives the unregister and goes stale.
+        for (u64 page = 0; page != page_table.size(); ++page) {
+            if (page_table[page] == buffer_id && (page < page_begin || page >= page_end)) {
+                report("entry outside the buffer's range", page, buffer_id);
+            }
+        }
+    }
+}
+
+template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
-    if (buffer_id != NULL_BUFFER_ID) {
+    if (buffer_id != NULL_BUFFER_ID && buffer.getLRUID() != SIZE_MAX) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
     }
 }
@@ -2176,6 +2291,15 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     replace(channel_state->transform_feedback_buffers);
     replace(channel_state->compute_uniform_buffers);
     replace(channel_state->compute_storage_buffers);
+    // Multi-range segments hold buffer ids outside the bindings; a join later in the same update
+    // can delete a buffer an earlier segment resolved to.
+    for (auto* pool : {&graphics_segments, &compute_segments}) {
+        for (MultiRangeSegment& segment : *pool) {
+            if (segment.buffer_id == buffer_id) {
+                segment.buffer_id = BufferId{};
+            }
+        }
+    }
 
     // Mark the whole buffer as CPU written to stop tracking CPU writes
     if (!do_not_mark) {

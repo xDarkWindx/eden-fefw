@@ -226,7 +226,9 @@ const CPUCaps g_cpu_caps = [] {
     }
 
     // AMD CPUs do not implement leaf 0x15; without a frequency the wall clock falls back to the OS clock.
-    if (caps.invariant_tsc && caps.tsc_frequency == 0) {
+    // Intel CPUs that have the leaf but report no crystal frequency (e.g. Coffee Lake) keep the OS clock,
+    // as before: a tester's i5-9400F started crashing at boot when this fallback moved it to the RDTSC clock.
+    if (max_std_fn < 0x15 && caps.invariant_tsc && caps.tsc_frequency == 0) {
         caps.tsc_frequency = X64::EstimateRDTSCFrequency();
     }
 

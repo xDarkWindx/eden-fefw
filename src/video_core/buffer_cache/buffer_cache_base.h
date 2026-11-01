@@ -240,6 +240,9 @@ public:
     void ResolveMultiRangeStorage(Binding& binding, bool is_written,
                                   std::vector<MultiRangeSegment>& pool);
 
+    /// Resolves segments whose buffer was deleted by a join later in the same update.
+    void RefreshMultiRangeSegments(std::vector<MultiRangeSegment>& pool);
+
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
     void WriteMemory(DAddr device_addr, u64 size);
@@ -458,6 +461,10 @@ private:
 
     template <bool insert>
     void ChangeRegister(BufferId buffer_id);
+
+    /// Debug check (EDEN_BUFFER_PAGE_CHECK): logs page_table changes that leave stale entries.
+    template <bool insert>
+    void CheckPageTableChange(BufferId buffer_id, u64 page_begin, u64 page_end);
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
