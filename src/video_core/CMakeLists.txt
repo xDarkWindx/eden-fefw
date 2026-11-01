@@ -168,8 +168,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_descriptor_pool.h
     renderer_vulkan/vk_fence_manager.cpp
     renderer_vulkan/vk_fence_manager.h
-    renderer_vulkan/vk_finish_trace.cpp
-    renderer_vulkan/vk_finish_trace.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
     renderer_vulkan/vk_multi_range_buffer.cpp
@@ -230,6 +228,8 @@ add_library(video_core STATIC
     shader_environment.h
     shader_notify.cpp
     shader_notify.h
+    stack_trace_diagnostics.cpp
+    stack_trace_diagnostics.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp

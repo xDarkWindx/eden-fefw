@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "video_core/renderer_vulkan/vk_finish_trace.h"
+#include "video_core/stack_trace_diagnostics.h"
+
+#include <atomic>
+#include <cstdlib>
+
+#include "common/logging.h"
 
 #ifdef _MSC_VER
 #ifndef NOMINMAX
@@ -16,21 +21,53 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
-
-#include "common/logging.h"
 #endif
 
-namespace Vulkan {
+namespace VideoCommon {
+
+namespace {
+std::atomic<u64> watched_addr{};
+std::atomic<u64> watched_size{};
+} // Anonymous namespace
+
+bool StackTraceEnabled() {
+#ifdef _MSC_VER
+    static const bool enabled = std::getenv("EDEN_FINISH_TRACE") != nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+void WatchStackTraceRange(u64 device_addr, u64 size) {
+    if (watched_addr.load(std::memory_order_relaxed) == device_addr &&
+        watched_size.load(std::memory_order_relaxed) == size) {
+        return;
+    }
+    watched_addr.store(device_addr, std::memory_order_relaxed);
+    watched_size.store(size, std::memory_order_relaxed);
+    static std::atomic<u32> lines{};
+    if (lines.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_ERROR(Render_Vulkan, "StackTrace watching GPU-written range {:#x}+{:#x}", device_addr,
+                  size);
+    }
+}
+
+bool InWatchedStackTraceRange(u64 device_addr, u64 size) {
+    const u64 begin = watched_addr.load(std::memory_order_relaxed);
+    const u64 length = watched_size.load(std::memory_order_relaxed);
+    return length != 0 && device_addr < begin + length && begin < device_addr + size;
+}
 
 #ifdef _MSC_VER
 namespace {
-constexpr unsigned long kDepth = 8;
+constexpr unsigned long kDepth = 10;
 using Stack = std::array<void*, kDepth>;
 
 std::string Symbolise(void* address) {
@@ -57,44 +94,45 @@ std::string Symbolise(void* address) {
 }
 } // Anonymous namespace
 
-void NoteFinishCaller() {
-    static const bool enabled = std::getenv("EDEN_FINISH_TRACE") != nullptr;
-    if (!enabled) {
+void NoteStackTrace(const char* tag) {
+    if (!StackTraceEnabled()) {
         return;
     }
     Stack stack{};
-    // Skip this function and Scheduler::Finish.
-    CaptureStackBackTrace(2, kDepth, stack.data(), nullptr);
+    // Skip this function only; the tagged caller is the first frame.
+    CaptureStackBackTrace(1, kDepth, stack.data(), nullptr);
 
     static std::mutex mutex;
-    static std::map<Stack, unsigned> counts;
+    static std::map<std::pair<const char*, Stack>, u32> counts;
     static auto window_start = std::chrono::steady_clock::now();
     std::scoped_lock lock{mutex};
-    ++counts[stack];
+    ++counts[{tag, stack}];
     const auto now = std::chrono::steady_clock::now();
     const double secs = std::chrono::duration<double>(now - window_start).count();
     if (secs < 4.0) {
         return;
     }
-    std::vector<std::pair<Stack, unsigned>> sorted(counts.begin(), counts.end());
+    std::vector<std::pair<std::pair<const char*, Stack>, u32>> sorted(counts.begin(),
+                                                                       counts.end());
     std::sort(sorted.begin(), sorted.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-    for (size_t i = 0; i < sorted.size() && i < 6; ++i) {
+    for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
         std::string trace;
-        for (void* frame : sorted[i].first) {
+        for (void* frame : sorted[i].first.second) {
             if (!frame) {
                 break;
             }
             trace += trace.empty() ? "" : " <- ";
             trace += Symbolise(frame);
         }
-        LOG_ERROR(Render_Vulkan, "FinishTrace {:.1f}s n={} {}", secs, sorted[i].second, trace);
+        LOG_ERROR(Render_Vulkan, "StackTrace {} {:.1f}s n={} {}", sorted[i].first.first, secs,
+                  sorted[i].second, trace);
     }
     counts.clear();
     window_start = now;
 }
 #else
-void NoteFinishCaller() {}
+void NoteStackTrace(const char*) {}
 #endif
 
-} // namespace Vulkan
+} // namespace VideoCommon

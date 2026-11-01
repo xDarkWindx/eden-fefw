@@ -17,6 +17,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
+#include "video_core/stack_trace_diagnostics.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/native_diagnostics.h"
 #include "video_core/guest_memory.h"
@@ -255,6 +256,10 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads) {
+        if (VideoCommon::StackTraceEnabled() &&
+            VideoCommon::InWatchedStackTraceRange(*cpu_dest_address, amount)) {
+            VideoCommon::NoteStackTrace("HandleWrite");
+        }
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -1677,6 +1682,10 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (VideoCommon::StackTraceEnabled() &&
+        VideoCommon::InWatchedStackTraceRange(device_addr, size)) {
+        VideoCommon::NoteStackTrace("HandleWrite");
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];

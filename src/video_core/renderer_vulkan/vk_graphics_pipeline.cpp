@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
 #include "video_core/native_vprs.h"
+#include "video_core/stack_trace_diagnostics.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -500,6 +501,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                 const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
                                 if (range_address != expected || !range_size || !device_address)
                                     throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
+                                if (VideoCommon::StackTraceEnabled() &&
+                                    buffer_cache.IsRegionGpuModified(*device_address, range_size)) {
+                                    VideoCommon::WatchStackTraceRange(*device_address, range_size);
+                                    VideoCommon::NoteStackTrace("HandleDownload");
+                                }
                                 buffer_cache.DownloadMemory(*device_address, range_size);
                                 expected += range_size;
                             }
