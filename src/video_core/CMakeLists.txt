@@ -446,6 +446,14 @@ if (ENABLE_NSIGHT_AFTERMATH)
     target_include_directories(video_core PRIVATE "$ENV{NSIGHT_AFTERMATH_SDK}/include")
 endif()
 
+# EDEN_PROFILE_SYMBOLS: embed full debug info in video_core objects of optimized builds, so CPU
+# profilers name its internal functions instead of the nearest public symbol. Code generation is
+# unchanged.
+option(EDEN_PROFILE_SYMBOLS "Embed full debug info in video_core for profiling" OFF)
+if (MSVC AND EDEN_PROFILE_SYMBOLS)
+    set_property(TARGET video_core PROPERTY MSVC_DEBUG_INFORMATION_FORMAT Embedded)
+endif()
+
 if (MSVC)
     target_compile_options(video_core PRIVATE
         /we4242 # 'identifier': conversion from 'type1' to 'type2', possible loss of data
