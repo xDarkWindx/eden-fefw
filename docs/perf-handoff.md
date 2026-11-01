@@ -62,7 +62,12 @@ Copy-Item build\bin\eden.exe, build\bin\eden.pdb "E:\EmuRoms\Emuladores\eden-fef
 | ef68e0d | Opção CMake `EDEN_PROFILE_SYMBOLS` (`/Z7` só no `video_core`) | usado nos perfis |
 | 111f225, 439d9f3 | Diagnóstico `EDEN_FINISH_TRACE` (`stack_trace_diagnostics.*`) | usado |
 | 4e792b1 | Merge do v1.07 do Duck912 (24ccb4d, 8c6f052: crashes no cache de buffers) | compilado pelo usuário |
-| **5735096** | **JIT de macros portado do Eglantine** (`macro_turing_jit.h`), com o DMA de FIFO na semântica do Duck912 | diferencial com 100 mil programas e 1,1 milhão de leituras de DMA; 3,9x no benchmark. **O usuário ainda não compilou nem testou no jogo.** |
+| 5735096 | JIT de macros portado do Eglantine (`macro_turing_jit.h`), com o DMA de FIFO na semântica do Duck912 | diferencial com 100 mil programas e 1,1 milhão de leituras de DMA; 3,9x no benchmark. Usuário compilou no MSVC e o jogo rodou sem artefatos |
+| 46cc3bf | Cache de tradução do `DeviceMemoryManager` por thread (Eglantine 06f294c7; corrida com Map/Unmap) | compilado |
+| 36f4c66 | Worker do Vulkan recebe trabalho a cada 32 draws e só é acordado se estiver esperando (Eglantine a99484f3) | compilado |
+| **141c986** | **Thread da GPU dividida em duas** (`gpu_split.*`, Eglantine 7a251d3a e seguintes). `EDEN_GPU_SPLIT=2` (padrão): macros na frente com cópia dos registradores; `=1` macros atrás; `=0` uma thread. `EDEN_GPU_SPLIT_VERIFY=1` compara as cópias a cada 4096 macros e loga diferenças | harness do ring (4,8 mi de operações, TSan) e harness do Maxwell3D real (5 mi de chamadas, 612 mil macros); detalhes no commit. **Usuário ainda não testou no jogo.** |
+| 8c82aa1 | Hash de passagem para chaves inteiras em `Common::unordered_map/set`; `RangeSet::Intersects` em `IsRegionGpuModified` (Eglantine 6b718567) | `Intersects` contra `ForEachInRange`: 6 sementes, depois 40 x ~100 mil |
+| fdf816c | Tradução de shaders: busca em largura linear e cache do rastreio de storage buffers (Eglantine 0380b062, adaptado ao `Track` nativo do Duck912) | lógica do "visitado" contra a busca linear: 20 + 2000 casos |
 
 Interruptores para A/B: `EDEN_NO_TEXTURE_DEDUPE=1`, `EDEN_ASTC_GPU_FINISH=1`, `EDEN_MME_JIT=0`.
 Configuração recomendada ao usuário: ASTC Recompression = Uncompressed. `EDEN_MACRO_UPLOAD_BATCH=1`
@@ -71,20 +76,26 @@ Configuração recomendada ao usuário: ASTC Recompression = Uncompressed. `EDEN
 Resultados: level-up, mapa e batalhas em 30 FPS (antes, 18-22). Mapa com 3 esquadrões inimigos: ~24
 (antes, ~20). Nessa cena, a thread da GPU fica em ~80% de um núcleo.
 
+O objetivo do usuário é o jogo inteiro a pelo menos 30 FPS; ele não quer medir o ganho de cada mudança
+separadamente. Teste preferido: rodadas pequenas e variadas primeiro, depois a grande.
+
 ## Pendências, em ordem
 
-1. **Testar o build do JIT (5735096)** nos 3 esquadrões, com e sem `EDEN_MME_JIT=0`. Se der erro de
-   compilação no MSVC, corrigir (só foi compilado com o GCC, num teste isolado).
+1. **Testar o split (141c986) no jogo.** Ligado por padrão. Se der crash ou artefato: `EDEN_GPU_SPLIT=0`
+   (uma thread) e `EDEN_GPU_SPLIT=1` (macros atrás) isolam a etapa; `EDEN_GPU_SPLIT_VERIFY=1` loga
+   "Split front register" se a cópia da frente divergir. Pontos específicos do fork já tratados (ver o
+   commit): draws instanciados adiados (`ProcessDirtyRegisters` emite o draw em qualquer escrita fora
+   do laço) e flags de falha nativa (`native_execution_failed`, zeradas depois de cada método).
 2. **Regressão: grama piscando e uma animação de braço estranha.** Apareceu depois do build com o merge
    do Duck912 e das duas mudanças pequenas. Plano: abrir sem `EDEN_MACRO_UPLOAD_BATCH` (as variáveis
    continuam valendo na mesma janela do PowerShell); testar o release oficial v1.07 do Duck912 (pasta nova,
    com junction para a pasta `user`); se o oficial estiver bom, compilar o `f30e550` (antes do merge).
    Interruptores: `EDEN_NO_TEXTURE_DEDUPE=1`, `EDEN_ASTC_GPU_FINISH=1`, `EDEN_MME_JIT=0`.
-3. **Próximo ganho grande: dividir a thread da GPU**, como o Eglantine fez (`gpu_split.cpp`,
-   `NX2_GPU_THREAD_SPLIT.md` no `Eglantine-fook`; uma thread processa comandos e macros, outra executa os
-   métodos; eles mediram 1,4 a 1,6x). É invasivo: fazer atrás de uma variável de ambiente, desligado por
-   padrão. Talvez também a memorização de macros (`macro_memo.h` deles).
-4. Atualizar o `upstream-patch` com b81abe6, fc79ad1, ecf3785, f30e550 e (depois de testado) o JIT.
+3. Itens do Eglantine ainda não trazidos (avaliados): invalidação adiada de uploads inline (1c7c2468),
+   fences (1c2ed2a0, 544977c0: o Duck912 tem coalescência própria, conflitam), locks dos caches
+   (e08b4025, invasivo), coletor de buffers com uma espera (4d7558e2, só ajuda com VRAM no limite).
+   Depois do split, o gargalo do Eglantine passou a ser a preparação de draws na thread de trás.
+4. Atualizar o `upstream-patch` com b81abe6, fc79ad1, ecf3785, f30e550, o JIT e o split.
 5. Release no GitHub para o pessoal do Reddit: zip do `build\bin` com
    `robocopy build\bin <destino> /E /XJ /XD user /XF *.pdb *.ilk *.lib *.exp`. **Nunca** incluir a pasta
    `user` (chaves e firmware). Opcionalmente, GitHub Actions.
@@ -92,6 +103,15 @@ Resultados: level-up, mapa e batalhas em 30 FPS (antes, 18-22). Mapa com 3 esqua
    mudanças nas tabelas TIC/TSC e nas imagens.
 
 ## Método de teste usado aqui
+
+- Build Linux do `video_core` nesta sessão (só para compilar e ligar harnesses): CMake 3.31 via pip,
+  dependências do apt, e as que o proxy bloqueia (downloads de arquivo do GitHub, git.eden-emu.dev,
+  googlesource) clonadas com git e passadas como `-D<pacote>_CUSTOM_DIR=...`; stubs para libgav1 e tzdb;
+  `-Dfmt_FORCE_BUNDLED=ON -Dxbyak_FORCE_BUNDLED=ON -DENABLE_WERROR=OFF`. Cuidado com `pkill -f <padrão>`:
+  ele mata o próprio shell se o padrão estiver na linha de comando.
+- Harness do Maxwell3D real: liga `maxwell_3d.o`, `draw_manager.o`, `engine_upload.o`, `macro.o`,
+  `gpu_split.o` e a `libcommon.a` com `-Wl,--unresolved-symbols=ignore-all`, define no teste os métodos
+  do `MemoryManager` (memória falsa) e um rasterizador que loga hash dos registradores em cada draw.
 
 - Testes diferenciais fora do repositório, compilados com g++ e stubs (`common/logging.h`,
   `common/x64/xbyak.h` -> `<xbyak/xbyak.h>`). O Xbyak foi clonado de `github.com/herumi/xbyak`.
