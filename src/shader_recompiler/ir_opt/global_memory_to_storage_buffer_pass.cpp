@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <optional>
+#include <unordered_map>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -50,11 +51,24 @@ using StorageInstVector = small_vector<StorageInst, 24>;
 using StorageWritesSet =
     flat_set<StorageBufferAddr, std::less<StorageBufferAddr>, small_vector<StorageBufferAddr, 16>>;
 
+/// A Track result: the storage buffer and, for native kernels, every pointer the address can
+/// come from.
+struct TrackResult {
+    std::optional<StorageBufferAddr> storage_buffer;
+    small_vector<StorageBufferAddr, 4> candidates;
+};
+
 struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
     StorageWritesSet writes;
     bool native_runtime_bounds{};
+    /// Track results by the instruction the search starts from, for the first attempt and the
+    /// unbiased fallback: accesses through the same address share them, and a search can walk
+    /// thousands of instructions (the IR does not change while storage buffers are collected).
+    /// From Eglantine 0380b062: a 28,102-instruction compute shader took 3.4 s to translate.
+    std::unordered_map<const IR::Inst*, TrackResult> first_tracks;
+    std::unordered_map<const IR::Inst*, TrackResult> fallback_tracks;
 };
 
 /// Returns true when the instruction is a global memory instruction
@@ -448,9 +462,26 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const IR::U32 low_addr{low_addr_info->value};
     // Native kernels use eight-byte pointer arguments, without NVN descriptor spacing.
     // Applying the NVN bias can skip the pointer and select a dimension or stride instead.
-    small_vector<StorageBufferAddr, 4> candidates;
-    std::optional<StorageBufferAddr> storage_buffer{
-        Track(low_addr, native ? nullptr : &nvn_bias, native ? &env : nullptr, native ? &candidates : nullptr)};
+    TrackResult immediate;
+    const auto cached_track = [&](auto& cache, auto&& track) -> const TrackResult& {
+        if (low_addr.IsImmediate()) {
+            immediate = track();
+            return immediate;
+        }
+        const IR::Inst* const start{low_addr.InstRecursive()};
+        if (const auto it = cache.find(start); it != cache.end()) {
+            return it->second;
+        }
+        return cache.emplace(start, track()).first->second;
+    };
+    const TrackResult& first_track = cached_track(info.first_tracks, [&] {
+        TrackResult result;
+        result.storage_buffer = Track(low_addr, native ? nullptr : &nvn_bias, native ? &env : nullptr,
+                                      native ? &result.candidates : nullptr);
+        return result;
+    });
+    const small_vector<StorageBufferAddr, 4>& candidates = first_track.candidates;
+    std::optional<StorageBufferAddr> storage_buffer{first_track.storage_buffer};
     if (native && candidates.size() > 1) {
         // The address may come from any of several pointers, so a single storage buffer cannot be
         // chosen statically. Bind them all and keep the access global: the backend then picks the
@@ -466,7 +497,11 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     }
     if (!storage_buffer) {
         // If it fails, track without a bias
-        storage_buffer = Track(low_addr, nullptr, native ? &env : nullptr);
+        storage_buffer = cached_track(info.fallback_tracks, [&] {
+            TrackResult result;
+            result.storage_buffer = Track(low_addr, nullptr, native ? &env : nullptr);
+            return result;
+        }).storage_buffer;
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");
