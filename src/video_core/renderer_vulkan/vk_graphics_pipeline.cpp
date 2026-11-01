@@ -6,6 +6,7 @@
 
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -13,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <unordered_map>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -506,7 +508,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                     VideoCommon::WatchStackTraceRange(*device_address, range_size);
                                     VideoCommon::NoteStackTrace("HandleDownload");
                                 }
-                                buffer_cache.DownloadMemory(*device_address, range_size);
+                                // EDEN_HANDLE_DOWNLOAD_MS=<n> (experiment): refresh a GPU-written
+                                // handle buffer at most every n ms instead of waiting for the GPU
+                                // each frame; draws in between read the last downloaded copy.
+                                static const long handle_download_ms = [] {
+                                    const char* value = std::getenv("EDEN_HANDLE_DOWNLOAD_MS");
+                                    return value ? std::strtol(value, nullptr, 10) : 0L;
+                                }();
+                                bool download = true;
+                                if (handle_download_ms > 0) {
+                                    static std::unordered_map<u64, std::chrono::steady_clock::time_point> last_download;
+                                    const auto now = std::chrono::steady_clock::now();
+                                    const auto [it, is_new] = last_download.try_emplace(*device_address, now);
+                                    if (!is_new && now - it->second < std::chrono::milliseconds(handle_download_ms)) {
+                                        download = false;
+                                    } else {
+                                        it->second = now;
+                                    }
+                                }
+                                if (download) {
+                                    buffer_cache.DownloadMemory(*device_address, range_size);
+                                }
                                 expected += range_size;
                             }
                             if (expected != base + source.size)
