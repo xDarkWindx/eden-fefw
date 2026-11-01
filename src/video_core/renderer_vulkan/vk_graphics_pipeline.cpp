@@ -441,7 +441,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         ++view_count;
     }};
-    samplers.reserve(num_textures);
+    samplers.resize(num_textures);
+    size_t sampler_count{};
 
     texture_cache.SynchronizeDescriptors(false);
 
@@ -626,7 +627,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         sampler_memo.Store(handle.second, sampler);
                     }
                 }
-                samplers.push_back(sampler);
+                if (sampler_count < samplers.size()) {
+                    samplers[sampler_count] = sampler;
+                } else {
+                    samplers.push_back(sampler);
+                }
+                ++sampler_count;
             }
         }
         if constexpr (Spec::has_images) {
@@ -656,6 +662,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         views.resize(view_count);
     }
     ASSERT(views.size() == num_image_elements);
+    if (sampler_count != samplers.size()) {
+        samplers.resize(sampler_count);
+    }
     ASSERT(samplers.size() == num_textures);
     texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
     // These slots cannot reach this operation under the shader's own branch
