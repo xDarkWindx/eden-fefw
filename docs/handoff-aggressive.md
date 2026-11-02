@@ -1,0 +1,112 @@
+# Passagem de contexto: reaproveitamento agressivo do banco de texturas (Fortune's Weave)
+
+Leia este arquivo inteiro antes de começar. O histórico completo está em `docs/perf-handoff.md` (mesmo
+diretório); aqui está só o necessário para a próxima etapa. Escrito em 2026-11-02.
+
+## Usuário e regras
+
+- xDarkWindx, fala português, tom casual-profissional, sem bajulação. Windows, Ryzen 7 5700X (8C/16T),
+  RTX 5060 Ti 16 GB, 96 GB RAM. Jogo: **Fire Emblem: Fortune's Weave** (Switch 2). Tem limite semanal de uso:
+  seja econômico, faça rodadas que valham o build dele.
+- Repositório: `xDarkWindx/eden-fefw` (fork do `Duck912/eden-fefw`, em git.eden-emu.dev, bloqueado na rede da sessão).
+  - `main`: o que ele joga. Releases até **v1.10** (commit `b50a518`). Não mexer no `main` sem ele pedir.
+  - `perf/compact-texture-tables`: experimentos desta etapa (base para o próximo branch, ver abaixo).
+- Commits: mensagens em inglês explicando o porquê; autor `xDarkWindx <darkwindrox@gmail.com>`; terminar com as
+  linhas `Co-Authored-By` e `Claude-Session` que a sessão indicar. Nunca citar identificador de modelo em commits.
+  Ele autoriza commit e push direto nos branches de trabalho.
+- A sessão não cria releases (API bloqueada): ela escreve as notas em `/home/user/release-notes-vX.md` e ele publica.
+
+## Fluxo de build e teste dele
+
+```powershell
+git fetch origin
+git checkout <branch>        # ou git pull se já estiver nele
+cmake --build build --target yuzu
+Copy-Item build\bin\eden.exe "E:\EmuRoms\Emuladores\eden-fefw-v1.05-windows-x64\eden-<nome>.exe" -Force
+```
+
+- Executáveis de teste com outro nome na mesma pasta (usam a mesma pasta `user`: saves e config).
+- Variáveis de ambiente na mesma janela do PowerShell em que abre o exe (`$env:VAR="1"; .\eden-x.exe`).
+- Log: `user\log\eden_log.txt`. Ele sabe usar `Select-String` e o Criador de Perfil do Visual Studio
+  (Uso da CPU, filtro por thread, Chamador/Receptor, símbolos da Microsoft ligados).
+- Verificação nesta sessão (Linux, sem build completo): `g++ -std=c++20 -fsyntax-only -Wall` dos arquivos
+  alterados com `-Isrc -Iexternals` + fmt 11, VulkanMemoryAllocator e Vulkan-Headers clonados do GitHub
+  (`-DFMT_HEADER_ONLY`); harnesses fora da árvore (g++/TSan) para lógica isolável. Ele compila no MSVC.
+
+## Onde está o gargalo (medido)
+
+- Cenas cheias (praça da cidade 15-21 FPS, palácio ~20, multidão de NPCs) são limitadas pela **thread de trás da
+  GPU emulada** (`GpuSplit::BackLoop`, 100% de um núcleo; CPU total ~22-25%, GPU real ~60%).
+- `ConfigureImpl` (`vk_graphics_pipeline.cpp`) é ~52% dessa thread.
+- Estatísticas (`EDEN_TEXTURE_TABLE_STATS=1` no branch `perf/compact-texture-tables`), praça:
+  ~11 mil draws/s; ~4,7 mil/s ligam um **array de texturas indexado por constant buffer** com
+  **2970 elementos, 1390 pares (TIC,TSC) distintos, 1245 views distintas**; esse array é **byte a byte igual ao do
+  draw anterior do mesmo pipeline em 84%** dos casos. Arrays em buffer (`buffer_source`) quase não aparecem ali.
+- Ou seja: o jogo usa um **banco de texturas bindless** (~1250 texturas) em quase todo draw. No Switch custa zero;
+  aqui cada draw resolve ~1245 views (`TextureCache::VisitImageView` + `PrepareImageView`), resolve samplers e
+  escreve ~3000 descritores. A compactação (pares distintos) só cortou pela metade e não mudou o FPS.
+- O FPS cai quando a vista abre e sobe ao se aproximar de paredes: o custo é por draw, não pelo que aparece.
+
+## Estado do branch `perf/compact-texture-tables` (base)
+
+1. `video_core/texture_cache/compact_texture_table.h`: `CompactTextureTable` (pares distintos + par de cada
+   elemento, construção com tabelas diretas), blocos por draw, `CompactViewLookups`/`ExpandViewLookups`,
+   `PushCompactTextureBlock`, estatísticas.
+2. `GraphicsPipeline::BufferTextureHandles` (deque, por pipeline): handles decodificados de arrays em buffer e de
+   arrays de constant buffer (16+ elementos; lidos em bloco; `cbuf_handles` em `ConfigureImpl`), reusados se os
+   bytes não mudam. Arrays de cbuf são decodificados no lugar.
+3. `PushImageDescriptors` (`pipeline_helper.h`) com caminho compacto (`CompactTextureBinding`).
+4. `vk_update_descriptor.cpp`: a fila de descritores cresce (até 4x) quando estoura, em vez de `WaitWorker` a cada
+   estouro (o jogo escreve >1 mi de descritores por frame). Sem efeito no FPS, mas tira duas paradas por frame.
+5. Interruptores: `EDEN_NO_COMPACT_TEXTURE_TABLES=1`, `EDEN_TEXTURE_TABLE_STATS=1`.
+Verificado: harness de equivalência (20 mil draws, 14 mi descritores idênticos, ordem das consultas igual);
+decodificação de cbuf contra `read_handle` (23 mi handles). O usuário testou: sem texturas erradas, FPS igual à v1.10.
+
+## Próxima etapa: as versões agressivas (novo branch a partir de `perf/compact-texture-tables`)
+
+Sugestão de nome: `perf/texture-heap-reuse`. Fazer em camadas, medir cada uma.
+
+### Agressiva 1: reaproveitar o banco resolvido entre draws
+
+Quando o array do draw tem os mesmos bytes do anterior (o cache de handles já sabe: `cbuf_reused`), reusar os ids
+de view e sampler resolvidos no draw anterior, pulando `VisitImageView`/`PrepareImageView`/`GetSamplerId` das
+~1245 entradas. Só é válido se **nada que afeta a resolução mudou** desde então. Pontos a investigar e cobrir
+(`video_core/texture_cache/texture_cache.h`, `texture_cache_base.h`, `descriptor_table.h`):
+
+- **Tabelas TIC/TSC**: o conteúdo das entradas pode mudar sem aviso (`DescriptorTable::Read` compara a cada
+  leitura). Validação barata candidata: guardar uma cópia do trecho da tabela TIC/TSC coberto pelos índices do
+  banco (min..max) e comparar com `memcmp` por draw (~40 KB; muito mais barato que 1245 `VisitImageView`). Também
+  endereço/limite das tabelas (`SynchronizeDescriptors`, `texture_bindings_serial`).
+- **Imagens/views criadas, apagadas ou realocadas**: `has_deleted_images`, `DeleteImage`/`UnregisterImage`,
+  `slot_image_views` (ids reaproveitados após apagar!). Um contador de geração incrementado nesses pontos.
+- **Escritas da CPU em memória de texturas**: invalidação marca imagens (CpuModified) e `PrepareImage` reenvia.
+  Bump de geração quando uma imagem é marcada.
+- **Aliases e modificação pela GPU**: `PrepareImage` sincroniza aliases (`SynchronizeAliases`) quando ticks de
+  modificação diferem. `MarkModification` acontece em todo draw (render targets): **não** pode invalidar tudo; é
+  preciso saber se alguma imagem do banco é também render target/alias (ex.: shadow maps amostrados pelo banco).
+- **Escala (rescaling)**: `ScaleUp`/`ScaleDown`, `IsRescaling` afeta descritores e o push constant.
+- **LRU/uso**: `PrepareImageView` atualiza tick de uso das imagens (coleta de lixo). Pular isso pode fazer o cache
+  apagar uma imagem em uso: garantir que o tick seja atualizado (ex.: uma vez por frame para o banco inteiro).
+- **Modo de verificação obrigatório**: `EDEN_HEAP_REUSE_VERIFY=1` resolve normalmente E pelo reuso, compara ids
+  e loga diferenças (com o motivo provável). Usar jogando para achar pontos de invalidação esquecidos antes de
+  ligar por padrão. Interruptor para desligar o reuso (`EDEN_NO_HEAP_REUSE=1`).
+
+### Agressiva 2: reaproveitar os descritores escritos
+
+Com a 1 valendo e as mesmas views/samplers/rescale, os ~3000 `VkDescriptorImageInfo` do bloco são idênticos aos
+do draw anterior: copiar o bloco pronto (memcpy ~72 KB) em vez de montar entrada a entrada, ou, mais agressivo,
+reaproveitar o `VkDescriptorSet`/região do descriptor buffer e pular a atualização no worker do Vulkan (custo de
+driver na thread do worker, não medido ainda). Cuidado com o ciclo de vida da fila de descritores
+(`vk_update_descriptor`, fatias por frame) e com `descriptor_allocator`.
+
+### Descartado por escala
+
+Heap bindless persistente no Vulkan (shader lendo o banco como no hardware): reescreve recompilador e cache de
+texturas.
+
+## Como medir
+
+- Mesmo exe, A/B por variável de ambiente; pontos fixos: praça da cidade (vista aberta para o centro, ~15-21),
+  palácio de Megaira (~20), seleção de personagem e campo (já ~30, não podem piorar).
+- Perfil por thread no VS (thread de trás) antes/depois; estatísticas no log.
+- Pedir prints de qualquer textura errada/piscando e testar com o interruptor desligado para isolar.
