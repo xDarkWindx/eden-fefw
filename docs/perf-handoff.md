@@ -157,5 +157,10 @@ atualizar o `upstream-patch` para o Duck912.
   idle image`). O caminho do Duck912 dava a cada uma uma fence nova (`++next_completion_value`) sem frame
   correspondente, abrindo buracos na sequência; as fences foram a ~197 mil e nunca eram alcançadas. Agora a
   imagem devolve a fence que já tinha (e roda `PumpOutput`); um Warning a cada 4096 dessas devoluções.
+- O loop de `release of idle image` continuou: o `Flush` do AV1 decodificava as entradas pendentes, que no fim do
+  clipe são EOS, e entregava esses EOS depois do `Start`; o jogo achava que o clipe novo já tinha acabado e parava
+  de mandar dados. Agora o `Flush` do AV1 descarta tudo (como `MediaCodec.flush()`); saídas não buscadas devolvem
+  a imagem ao decodificador. O contador de FPS do Eden provavelmente não conta as apresentações nativas (VI2):
+  cai a zero com o jogo rodando a 30 (não verificado).
 - PokeDinner/Eglantine não têm decodificador de vídeo nativo (outra arquitetura de Switch 2); não há o que portar.
 - Se continuar: filtro de log `*:Info Service.AM:Debug` e procurar `native video` antes do crash.

@@ -633,19 +633,29 @@ private:
                         result = PumpOutput();
                     }
                 } else {
-                    // AV1 (Fortune's Weave flushes its looping character-select clips). Decode every
-                    // input submitted so far, then reset libgav1 so the next input may start a new
-                    // sequence. The decoder is not frame-parallel, so it holds no frames of its own
-                    // and SignalEOS loses nothing; decoded frames wait for an image as usual.
-                    result = ResultSuccess;
-                    while (result.IsSuccess() && !pending_inputs.empty()) {
-                        result = DecodePendingInput();
+                    // AV1 (Fortune's Weave flushes its character-select clips when one ends or the
+                    // character changes, then calls Start). Like MediaCodec.flush(), drop everything
+                    // in flight: the game ends a clip with EOS inputs, and handing those EOS frames out
+                    // after the following Start made it treat the new clip as finished, stop
+                    // submitting and spin releasing images. Outputs written but not fetched give their
+                    // image back to the decoder, at the end of the fence sequence (their old fence was
+                    // already reached). libgav1 is reset so the next input may start a new sequence.
+                    for (const auto& properties : output_properties) {
+                        const auto image = std::ranges::find(registered_images, properties[0], &RegisteredImage::id);
+                        if (image != registered_images.end() && !image->available) {
+                            image->completion_value = ++next_completion_value;
+                            image->available = true;
+                        }
                     }
-                    if (result.IsSuccess() && decoder->SignalEOS() != libgav1::kStatusOk) {
-                        result = Kernel::ResultInvalidState;
-                    }
-                    if (result.IsSuccess()) {
-                        result = PumpOutput();
+                    LOG_DEBUG(Service_AM, "native AV1 flush drops inputs={}, frames={}, outputs={}",
+                              pending_inputs.size(), decoded_frames.size(), output_properties.size());
+                    output_properties.clear();
+                    decoded_frames.clear();
+                    pending_inputs.clear();
+                    pending_input_bytes = 0;
+                    result = decoder->SignalEOS() == libgav1::kStatusOk ? ResultSuccess : Kernel::ResultInvalidState;
+                    if (result.IsSuccess() && submission_event && transfer_memory) {
+                        submission_event->Signal(kernel);
                     }
                 }
             }
