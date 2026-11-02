@@ -16,7 +16,6 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
-#include "video_core/gpu_written_pages.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -121,11 +120,6 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        // Words the GPU wrote (command lists and macro parameters a culling dispatch fills in each
-        // frame) exist only in host buffers until downloaded, and the copy taken at submission
-        // predates them: bring them to guest memory and run from there.
-        const bool gpu_written =
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -150,7 +144,7 @@ bool DmaPusher::Step() {
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         // The words as submitted, unless this entry resumes after an acquire (the words after it
         // may be new) or the GPU has newer words that the safe read would flush.
-        const bool submitted = command_resume_offset == 0 && !gpu_written &&
+        const bool submitted = command_resume_offset == 0 &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
@@ -254,46 +248,6 @@ void DmaPusher::SetState(const CommandHeader& command_header) {
     dma_state.method = command_header.method;
     dma_state.subchannel = command_header.subchannel;
     dma_state.method_count = command_header.method_count;
-}
-
-bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
-    // EDEN_GPU_WRITTEN_FLUSH=0: run every entry from its copy taken at submission, as before.
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_GPU_WRITTEN_FLUSH");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (!enabled || !channel_state.native_abi || size == 0) {
-        return false;
-    }
-    // Accurate GPU reads every entry through the caches already.
-    if (!VideoCommon::GpuSplit::Get().Active() &&
-        (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe())) {
-        return false;
-    }
-    bool written = false;
-    constexpr GPUVAddr PageMask = (GPUVAddr{1} << VideoCommon::GpuWrittenPages::PageBits) - 1;
-    for (GPUVAddr page = address & ~PageMask; page < address + size; page += PageMask + 1) {
-        if (const auto device = memory_manager.GpuToCpuAddress(page);
-            device && VideoCommon::GpuWrittenPages::Any(*device, 1)) {
-            written = true;
-            break;
-        }
-    }
-    if (!written) {
-        return false;
-    }
-    // The caches belong to the split's back thread: it first runs what the front sent (the
-    // dispatch that writes these words among it). From PokeDinner 006e27f4 and 5a957312.
-    VideoCommon::GpuSplit::Get().Drain();
-    if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
-        static std::atomic<u32> logs{};
-        if (logs.fetch_add(1) < 16) {
-            LOG_INFO(HW_GPU, "Command list words at {:#x} ({} bytes) were written by the GPU: flushed",
-                     address, size);
-        }
-    }
-    return true;
 }
 
 bool DmaPusher::WantsSegment() const {

@@ -158,9 +158,6 @@ private:
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
     [[nodiscard]] bool WantsSegment() const;
-    /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    /// Returns whether the entry is on pages the GPU wrote (to be read from guest memory).
-    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
