@@ -150,5 +150,8 @@ atualizar o `upstream-patch` para o Duck912.
 - Suspeito principal: `Flush` só existia para H.264; com AV1 devolvia `ResultNotImplemented`. Implementado
   (decodifica as entradas pendentes, `SignalEOS` no libgav1, `PumpOutput`). Flush que falha e `ReleaseImage`
   com fence (outro caminho `0x4201`) agora logam em Warning.
+- Depois disso, `Start` logo após o `Flush` dava `0xfa01` (InvalidState, o decodificador já constava como
+  iniciado); a thread do vídeo morria com PANIC e o jogo congelava ~5s depois. Agora um decodificador que
+  passou por `Flush` aceita `Start` de novo (semântica do MediaCodec). `Start` que falha loga em Warning.
 - PokeDinner/Eglantine não têm decodificador de vídeo nativo (outra arquitetura de Switch 2); não há o que portar.
 - Se continuar: filtro de log `*:Info Service.AM:Debug` e procurar `native video` antes do crash.

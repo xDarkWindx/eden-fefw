@@ -126,6 +126,7 @@ private:
             operation_syncpoint.reset();
         }
         started = false;
+        flushed = false;
         if (submission_event) submission_event->Clear(kernel);
     }
 
@@ -579,6 +580,7 @@ private:
                 }
                 if (result.IsSuccess()) {
                     started = false;
+                    flushed = false;
                     pending_inputs.clear();
                     pending_input_bytes = 0;
                     decoded_frames.clear();
@@ -643,6 +645,9 @@ private:
                 }
             }
         }
+        if (result.IsSuccess()) {
+            flushed = true;
+        }
         if (result.IsError()) {
             LOG_WARNING(Service_AM, "native video flush failed: {:#x}, codec={}, pending_inputs={}",
                         result.raw, h264_context ? "H.264" : "AV1", pending_inputs.size());
@@ -658,13 +663,22 @@ private:
         Result result = Kernel::ResultInvalidCombination;
         if (packet[0] == 0x16 && packet[1] == 0) {
             result = Kernel::ResultInvalidState;
-            if (Initialized() && configuration && !registered_images.empty() && !started) {
+            // Like a MediaCodec flush, a flushed decoder is resumed with Start (Fortune's Weave
+            // calls Flush then Start when its character-select clip loops or changes, and aborts
+            // on InvalidState). Games that keep submitting after Flush need no Start.
+            if (Initialized() && configuration && !registered_images.empty() && (!started || flushed)) {
                 started = true;
+                flushed = false;
                 submission_event->Signal(kernel);
                 result = ResultSuccess;
             }
         }
-        LOG_DEBUG(Service_AM, "native video start result={:#x}", result.raw);
+        if (result.IsError()) {
+            LOG_WARNING(Service_AM, "native video start failed: {:#x}, started={}, images={}", result.raw,
+                        started, registered_images.size());
+        } else {
+            LOG_DEBUG(Service_AM, "native video start result={:#x}", result.raw);
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result.raw);
     }
@@ -825,6 +839,7 @@ private:
     u64 pending_input_bytes{};
     u64 next_submission_id{1};
     bool started{};
+    bool flushed{}; // Flushed since the last Start: Start may resume decoding.
     Kernel::KProcess* process;
     NativeVideoKind kind;
     Kernel::KTransferMemory* transfer_memory{};
