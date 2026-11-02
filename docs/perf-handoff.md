@@ -180,5 +180,6 @@ atualizar o `upstream-patch` para o Duck912.
   esvaziam a fila e esperam a thread ficar ociosa antes de mexer no libgav1; `Reset` faz join. H.264 inalterado.
   Verificado: `g++ -fsyntax-only -Wall` do arquivo (fmt 11 clonado) e um modelo do protocolo com TSan (300 rodadas
   aleatórias com Flush e erros; sem corrida, deadlock ou frame fora de ordem).
+- Resultado do usuário com a thread de decodificação (c960d20): seleção de personagem em 30 FPS quase sempre.
 - Próximos candidatos: a cópia DMA da imagem do vídeo
   no lado da GPU (`SwizzleSubrectImpl<0,4>`/`<1,4>`, ~8,5% no perfil do usuário); threads do libgav1 (4).
