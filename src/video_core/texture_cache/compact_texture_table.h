@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "video_core/texture_cache/types.h"
@@ -20,6 +21,27 @@ namespace VideoCommon {
 /// (they are then bound element by element, as before; for A/B comparisons).
 inline bool CompactTextureTablesEnabled() {
     static const bool enabled = std::getenv("EDEN_NO_COMPACT_TEXTURE_TABLES") == nullptr;
+    return enabled;
+}
+
+/// EDEN_NO_HEAP_REUSE disables the reuse of resolved texture banks between draws
+/// (texture_bank_reuse.h) and, with it, the reuse of their descriptors.
+inline bool HeapReuseEnabled() {
+    static const bool enabled = std::getenv("EDEN_NO_HEAP_REUSE") == nullptr;
+    return enabled;
+}
+
+/// EDEN_HEAP_REUSE_VERIFY: every reusable bank (and descriptor block) is resolved again as without
+/// reuse, the fresh result is the one bound, and differences are logged. For finding a missed
+/// invalidation while playing, without the wrong textures it would cause.
+inline bool HeapReuseVerify() {
+    static const bool enabled = std::getenv("EDEN_HEAP_REUSE_VERIFY") != nullptr;
+    return enabled;
+}
+
+/// EDEN_NO_DESCRIPTOR_REUSE keeps the bank reuse but writes the descriptors element by element.
+inline bool DescriptorReuseEnabled() {
+    static const bool enabled = HeapReuseEnabled() && std::getenv("EDEN_NO_DESCRIPTOR_REUSE") == nullptr;
     return enabled;
 }
 
@@ -38,6 +60,20 @@ struct CompactTextureTable {
     std::vector<u32> unique_tscs;   ///< Distinct TSC indices, first-occurrence order
     std::vector<Pair> pairs;        ///< Distinct pairs, first-occurrence order
     std::vector<u32> element_pairs; ///< Pair of every element
+    u64 tics_hash{};                ///< Of unique_tics (finds the resolved bank)
+    u64 tscs_hash{};                ///< Of unique_tscs
+
+    /// The descriptors last written for this table, with what named them: the resolved banks
+    /// (stamps, see texture_bank_reuse.h) and the texture cache generation. Raw bytes of the
+    /// backend's descriptor entries. Emptied by Build.
+    struct DescriptorCache {
+        u64 view_stamp{};
+        u64 sampler_stamp{};
+        u64 generation{};
+        bool rescaled{};
+        std::vector<u64> words;
+    };
+    mutable DescriptorCache descriptor_cache;
 
     /// handles: (TIC, TSC) of every element; excluded: non-zero for excluded elements.
     /// Direct-mapped like the per-draw lookup memos, so a build costs about what binding the elements
@@ -75,6 +111,13 @@ struct CompactTextureTable {
             element_tics.push_back(tic);
             element_pairs.push_back(pair_slot);
         }
+        tics_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_tics.data()),
+                                       unique_tics.size() * sizeof(u32));
+        tscs_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_tscs.data()),
+                                       unique_tscs.size() * sizeof(u32));
+        descriptor_cache.view_stamp = 0;
+        descriptor_cache.sampler_stamp = 0;
+        descriptor_cache.words.clear();
     }
 
 private:
@@ -117,13 +160,17 @@ struct CompactTextureBlock {
     size_t first_sampler{};
     size_t view_ids{};    ///< Offset of this block's resolved view ids
     size_t sampler_ids{}; ///< Offset of this block's resolved sampler ids
+    bool views_reused{};  ///< view_ids already hold the bank's ids (nothing to look up)
+    u64 view_stamp{};     ///< Resolved view bank (0: none; see texture_bank_reuse.h)
+    u64 sampler_stamp{};  ///< Resolved sampler bank (0: none)
 };
 
 /// Lists what a draw's view lookup has to resolve: every view outside the blocks (in order) and, in
 /// place of each block, its unique TICs. The texture cache then visits the same first occurrences in
 /// the same order as with the elements themselves (its per-draw memo serves the repeats).
 /// positions receives, for each entry of fill outside a block, its index in views. Returns false if
-/// a block does not start at an element boundary (nothing may be bound then).
+/// a block does not start at an element boundary (nothing may be bound then). Blocks whose views
+/// were reused add no lookups.
 template <typename View>
 [[nodiscard]] bool CompactViewLookups(std::span<const View> views,
                                       std::span<const CompactTextureBlock> blocks,
@@ -137,8 +184,10 @@ template <typename View>
         if (next_block < blocks.size() && blocks[next_block].first_view == index) {
             const CompactTextureBlock& block = blocks[next_block++];
             block_fill_offsets.push_back(fill.size());
-            for (const u32 tic : block.table->unique_tics) {
-                fill.push_back(View{.index = tic, .blacklist = false, .id = {}});
+            if (!block.views_reused) {
+                for (const u32 tic : block.table->unique_tics) {
+                    fill.push_back(View{.index = tic, .blacklist = false, .id = {}});
+                }
             }
             index += block.table->element_tics.size();
             continue;
@@ -173,8 +222,10 @@ void ExpandViewLookups(std::span<View> views, std::span<SamplerId> samplers,
         }
         const CompactTextureBlock& block = blocks[block_index];
         const CompactTextureTable& table = *block.table;
-        for (size_t slot = 0; slot < table.unique_tics.size(); ++slot) {
-            view_ids[block.view_ids + slot] = fill[entry++].id;
+        if (!block.views_reused) {
+            for (size_t slot = 0; slot < table.unique_tics.size(); ++slot) {
+                view_ids[block.view_ids + slot] = fill[entry++].id;
+            }
         }
         for (size_t element = 0; element < table.element_tics.size(); ++element) {
             const auto& pair = table.pairs[table.element_pairs[element]];
@@ -223,11 +274,34 @@ struct CompactTextureStats {
     u64 elements{};
     u64 pairs{};
     u64 unique_views{};
+    u64 unique_samplers{};
+    // Bank reuse (texture_bank_reuse.h); counted by the texture cache and the pipeline.
+    u64 view_hits{};
+    u64 view_misses{};       ///< No bank with these indices
+    u64 view_stale_table{};  ///< Descriptor table moved, resized or another channel
+    u64 view_stale_generation{}; ///< Images created, deleted, rescaled or written by the CPU
+    u64 view_stale_memory{}; ///< Descriptor table entries rewritten
+    u64 view_unstored{};     ///< Could not be kept (an image still pending upload, unmapped table)
+    u64 view_retries{};      ///< Reused, then invalidated by the rest of the draw's lookups
+    u64 alias_prepares{};
+    u64 snapshot_bytes{};
+    u64 sampler_hits{};
+    u64 sampler_misses{};
+    u64 descriptor_hits{};
+    u64 descriptor_misses{};
+    u64 verify_checks{};
+    u64 verify_mismatches{};
     std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
 
     static bool Enabled() {
         static const bool enabled = std::getenv("EDEN_TEXTURE_TABLE_STATS") != nullptr;
         return enabled;
+    }
+
+    /// The GPU thread's statistics (one thread configures graphics draws).
+    static CompactTextureStats& Get() {
+        static CompactTextureStats stats;
+        return stats;
     }
 
     void Report() {
@@ -248,6 +322,27 @@ struct CompactTextureStats {
                  table_draws ? double(elements) / table_draws : 0.0,
                  table_draws ? double(pairs) / table_draws : 0.0,
                  table_draws ? double(unique_views) / table_draws : 0.0);
+        const auto per_second = [seconds](u64 value) { return value / seconds; };
+        const auto rate = [](u64 part, u64 total) { return total ? part * 100.0 / double(total) : 0.0; };
+        const u64 view_lookups = view_hits + view_misses + view_stale_table + view_stale_generation +
+                                 view_stale_memory;
+        LOG_INFO(Render_Vulkan,
+                 "Texture banks: views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
+                 "generation {:.0f}/s, entries {:.0f}/s, unstored {:.0f}/s, retries {:.0f}/s); "
+                 "samplers reused {:.1f}% of {:.0f}/s; descriptors reused {:.1f}% of {:.0f}/s; "
+                 "{:.1f} unique samplers, {:.1f} alias prepares and {:.0f} snapshot bytes per reuse; "
+                 "verify {:.0f}/s, mismatches {}",
+                 rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
+                 per_second(view_stale_table), per_second(view_stale_generation),
+                 per_second(view_stale_memory), per_second(view_unstored), per_second(view_retries),
+                 rate(sampler_hits, sampler_hits + sampler_misses),
+                 per_second(sampler_hits + sampler_misses),
+                 rate(descriptor_hits, descriptor_hits + descriptor_misses),
+                 per_second(descriptor_hits + descriptor_misses),
+                 table_draws ? double(unique_samplers) / table_draws : 0.0,
+                 view_hits ? double(alias_prepares) / view_hits : 0.0,
+                 view_hits ? double(snapshot_bytes) / view_hits : 0.0, per_second(verify_checks),
+                 verify_mismatches);
         *this = {};
         window = now;
     }

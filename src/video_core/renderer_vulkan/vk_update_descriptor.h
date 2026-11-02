@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -59,6 +60,17 @@ public:
 
     const DescriptorUpdateEntry* UpdateData() const noexcept {
         return upload_start;
+    }
+
+    /// Where the next entry goes (the entries added since a call to this start there).
+    [[nodiscard]] const DescriptorUpdateEntry* Cursor() const noexcept {
+        return payload_cursor;
+    }
+
+    /// Appends count entries copied from raw entry bytes (entries written before, see Cursor).
+    void AddEntries(const void* entries, size_t count) {
+        std::memcpy(payload_cursor, entries, count * sizeof(DescriptorUpdateEntry));
+        payload_cursor += count;
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {

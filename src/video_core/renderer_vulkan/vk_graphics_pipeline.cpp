@@ -445,7 +445,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     static thread_local std::vector<VideoCommon::ImageViewInOut> compact_fill;
     static thread_local std::vector<size_t> compact_positions;
     static thread_local std::vector<size_t> compact_fill_offsets;
-    static thread_local VideoCommon::CompactTextureStats compact_stats;
+    VideoCommon::CompactTextureStats& compact_stats = VideoCommon::CompactTextureStats::Get();
     compact_blocks.clear();
     compact_view_ids.clear();
     compact_sampler_ids.clear();
@@ -468,6 +468,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     // Compact tables rely on the lookups being deduplicated (the repeats are what they fold).
     const bool compact_tables = dedupe_samplers && VideoCommon::CompactTextureTablesEnabled();
     const bool stats = VideoCommon::CompactTextureStats::Enabled();
+    // Resolved banks reused between draws (texture_bank_reuse.h); verification resolves them again.
+    const bool heap_reuse = compact_tables && VideoCommon::HeapReuseEnabled();
+    const bool heap_verify = heap_reuse && VideoCommon::HeapReuseVerify();
+    static thread_local std::vector<VideoCommon::SamplerId> verify_sampler_ids;
     static thread_local VideoCommon::LookupMemo<VideoCommon::SamplerId, 256> sampler_memo;
     if (dedupe_samplers) {
         sampler_memo.Reset("samplers");
@@ -678,6 +682,64 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             ++sampler_count;
         }};
+        // A compact table's block: its samplers resolve here, in binding order, one per distinct TSC
+        // (or come from the resolved sampler bank); its views resolve with the draw's other views.
+        const auto add_compact_block{[&](const VideoCommon::CompactTextureTable& table, u32 count) {
+            VideoCommon::CompactTextureBlock block{
+                .table = &table,
+                .first_view = view_count,
+                .first_sampler = sampler_count,
+                .view_ids = compact_view_ids.size(),
+                .sampler_ids = compact_sampler_ids.size(),
+            };
+            const size_t num_samplers = table.unique_tscs.size();
+            compact_sampler_ids.resize(block.sampler_ids + num_samplers);
+            const std::span<VideoCommon::SamplerId> ids(compact_sampler_ids.data() + block.sampler_ids,
+                                                        num_samplers);
+            u64 stamp = heap_reuse ? texture_cache.TryReuseSamplerBank(table.tscs_hash, table.unique_tscs, ids) : 0;
+            const bool verify = stamp != 0 && heap_verify;
+            if (verify) {
+                verify_sampler_ids.assign(ids.begin(), ids.end());
+            }
+            if (stamp == 0 || verify) {
+                for (size_t slot = 0; slot < num_samplers; ++slot) {
+                    ids[slot] = resolve_sampler(table.unique_tscs[slot]);
+                }
+            }
+            if (verify) {
+                ++compact_stats.verify_checks;
+                if (!std::ranges::equal(verify_sampler_ids, ids)) {
+                    ++compact_stats.verify_mismatches;
+                    static u32 logged{};
+                    if (logged++ < 32) {
+                        size_t differing{};
+                        for (size_t slot = 0; slot < num_samplers; ++slot) {
+                            differing += verify_sampler_ids[slot] != ids[slot] ? 1 : 0;
+                        }
+                        LOG_WARNING(Render_Vulkan, "Texture bank reuse check: {} of {} reused samplers "
+                                    "differ from the resolved ones", differing, num_samplers);
+                    }
+                    stamp = 0;
+                }
+            }
+            if (stamp == 0 && heap_reuse) {
+                stamp = texture_cache.StoreSamplerBank(table.tscs_hash, table.unique_tscs, ids);
+            }
+            block.sampler_stamp = stamp;
+            if (stats) {
+                compact_stats.unique_samplers += num_samplers;
+            }
+            compact_view_ids.resize(compact_view_ids.size() + table.unique_tics.size());
+            compact_blocks.push_back(block);
+            view_count += count;
+            sampler_count += count;
+            if (views.size() < view_count) {
+                views.resize(view_count);
+            }
+            if (samplers.size() < sampler_count) {
+                samplers.resize(sampler_count);
+            }
+        }};
         // Texture arrays indexed from a constant buffer (thousands of elements per draw in Fortune's
         // Weave): the words are read in one block and the decoded handles reused while the words are
         // unchanged, as for buffer-backed arrays. Decoding matches read_handle word for word.
@@ -773,26 +835,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             if (compact_tables && !desc.buffer_source.enabled && desc.count >= 16) {
                 if (const BufferTextureHandles* const decoded = cbuf_handles(desc)) {
-                    const VideoCommon::CompactTextureTable& table = decoded->compact;
-                    compact_blocks.push_back(VideoCommon::CompactTextureBlock{
-                        .table = &table,
-                        .first_view = view_count,
-                        .first_sampler = sampler_count,
-                        .view_ids = compact_view_ids.size(),
-                        .sampler_ids = compact_sampler_ids.size(),
-                    });
-                    for (const u32 tsc_index : table.unique_tscs) {
-                        compact_sampler_ids.push_back(resolve_sampler(tsc_index));
-                    }
-                    compact_view_ids.resize(compact_view_ids.size() + table.unique_tics.size());
-                    view_count += desc.count;
-                    sampler_count += desc.count;
-                    if (views.size() < view_count) {
-                        views.resize(view_count);
-                    }
-                    if (samplers.size() < sampler_count) {
-                        samplers.resize(sampler_count);
-                    }
+                    add_compact_block(decoded->compact, desc.count);
                     continue;
                 }
             }
@@ -802,26 +845,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     // Samplers resolve here, in binding order, one per distinct TSC; views resolve with
                     // the draw's other views (FillImageViews), one per distinct TIC; the elements are
                     // written from those afterwards (ExpandViewLookups).
-                    const VideoCommon::CompactTextureTable& table = decoded.compact;
-                    compact_blocks.push_back(VideoCommon::CompactTextureBlock{
-                        .table = &table,
-                        .first_view = view_count,
-                        .first_sampler = sampler_count,
-                        .view_ids = compact_view_ids.size(),
-                        .sampler_ids = compact_sampler_ids.size(),
-                    });
-                    for (const u32 tsc_index : table.unique_tscs) {
-                        compact_sampler_ids.push_back(resolve_sampler(tsc_index));
-                    }
-                    compact_view_ids.resize(compact_view_ids.size() + table.unique_tics.size());
-                    view_count += desc.count;
-                    sampler_count += desc.count;
-                    if (views.size() < view_count) {
-                        views.resize(view_count);
-                    }
-                    if (samplers.size() < sampler_count) {
-                        samplers.resize(sampler_count);
-                    }
+                    add_compact_block(decoded.compact, desc.count);
                     continue;
                 }
                 for (u32 index = 0; index < desc.count; ++index) {
@@ -873,16 +897,98 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (compact_blocks.empty()) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
     } else {
-        // Same lookups in the same order as for the elements (first occurrences), minus the repeats.
-        if (!VideoCommon::CompactViewLookups<VideoCommon::ImageViewInOut>(
-                views, compact_blocks, compact_fill, compact_positions, compact_fill_offsets)) {
-            throw Shader::RuntimeError("Compact texture table outside the draw's views");
+        // Banks resolved at an earlier draw and still valid skip their lookups.
+        static thread_local std::vector<std::pair<size_t, u64>> verify_blocks;
+        static thread_local std::vector<VideoCommon::ImageViewId> verify_view_ids;
+        verify_blocks.clear();
+        verify_view_ids.clear();
+        bool any_reused = false;
+        if (heap_reuse) {
+            for (size_t block_index = 0; block_index < compact_blocks.size(); ++block_index) {
+                auto& block = compact_blocks[block_index];
+                const auto& table = *block.table;
+                const std::span<VideoCommon::ImageViewId> ids(compact_view_ids.data() + block.view_ids,
+                                                              table.unique_tics.size());
+                const u64 stamp = texture_cache.TryReuseViewBank(table.tics_hash, table.unique_tics, ids);
+                if (stamp == 0) {
+                    continue;
+                }
+                if (heap_verify) {
+                    // Resolved below as without reuse; compared afterwards.
+                    verify_blocks.emplace_back(block_index, stamp);
+                    verify_view_ids.insert(verify_view_ids.end(), ids.begin(), ids.end());
+                    continue;
+                }
+                block.views_reused = true;
+                block.view_stamp = stamp;
+                any_reused = true;
+            }
         }
-        texture_cache.FillImageViews(std::span(compact_fill.data(), compact_fill.size()), false,
-                                     Spec::has_images);
-        VideoCommon::ExpandViewLookups<VideoCommon::ImageViewInOut>(
-            views, samplers, compact_blocks, compact_fill, compact_positions, compact_fill_offsets,
-            compact_view_ids, compact_sampler_ids);
+        const auto resolve_views{[&] {
+            // Same lookups in the same order as for the elements (first occurrences), minus the
+            // repeats and the reused banks.
+            if (!VideoCommon::CompactViewLookups<VideoCommon::ImageViewInOut>(
+                    views, compact_blocks, compact_fill, compact_positions, compact_fill_offsets)) {
+                throw Shader::RuntimeError("Compact texture table outside the draw's views");
+            }
+            texture_cache.FillImageViews(std::span(compact_fill.data(), compact_fill.size()), false,
+                                         Spec::has_images);
+            VideoCommon::ExpandViewLookups<VideoCommon::ImageViewInOut>(
+                views, samplers, compact_blocks, compact_fill, compact_positions, compact_fill_offsets,
+                compact_view_ids, compact_sampler_ids);
+        }};
+        const u64 generation = texture_cache.BankGeneration();
+        resolve_views();
+        if (any_reused && texture_cache.BankGeneration() != generation) {
+            // The other lookups created, deleted or rescaled images: the reused ids may be stale.
+            for (auto& block : compact_blocks) {
+                block.views_reused = false;
+                block.view_stamp = 0;
+            }
+            ++compact_stats.view_retries;
+            resolve_views();
+        }
+        if (heap_reuse) {
+            size_t verify_index = 0;
+            size_t verify_offset = 0;
+            for (size_t block_index = 0; block_index < compact_blocks.size(); ++block_index) {
+                auto& block = compact_blocks[block_index];
+                if (block.views_reused) {
+                    continue;
+                }
+                const auto& table = *block.table;
+                const std::span<const VideoCommon::ImageViewId> ids(
+                    compact_view_ids.data() + block.view_ids, table.unique_tics.size());
+                if (verify_index < verify_blocks.size() && verify_blocks[verify_index].first == block_index) {
+                    const u64 stamp = verify_blocks[verify_index++].second;
+                    const auto reused = std::span(verify_view_ids).subspan(verify_offset, ids.size());
+                    verify_offset += ids.size();
+                    ++compact_stats.verify_checks;
+                    if (std::ranges::equal(reused, ids)) {
+                        block.view_stamp = stamp;
+                        continue;
+                    }
+                    ++compact_stats.verify_mismatches;
+                    static u32 logged{};
+                    if (logged++ < 32) {
+                        size_t differing{};
+                        size_t first{ids.size()};
+                        for (size_t slot = 0; slot < ids.size(); ++slot) {
+                            if (reused[slot] != ids[slot]) {
+                                first = (std::min)(first, slot);
+                                ++differing;
+                            }
+                        }
+                        LOG_WARNING(Render_Vulkan,
+                                    "Texture bank reuse check: {} of {} reused views differ from the "
+                                    "resolved ones (first: TIC {} reused id {} resolved id {})",
+                                    differing, ids.size(), table.unique_tics[first],
+                                    reused[first].index, ids[first].index);
+                    }
+                }
+                block.view_stamp = texture_cache.StoreViewBank(table.tics_hash, table.unique_tics, ids);
+            }
+        }
     }
     if (stats) {
         ++compact_stats.draws;

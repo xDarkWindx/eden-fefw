@@ -40,6 +40,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/texture_bank_reuse.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
@@ -265,6 +266,27 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
+    /// Texture banks reused between graphics draws (texture_bank_reuse.h). Bumped wherever a
+    /// resolved bank may have become stale.
+    [[nodiscard]] u64 BankGeneration() const noexcept {
+        return bank_generation;
+    }
+
+    /// Writes the view ids last resolved for these TIC indices into ids, if still valid, after
+    /// redoing what reuse cannot skip (alias synchronization, LRU ticks). Returns the bank's stamp,
+    /// or 0 if it has to be resolved (FillImageViews) and stored again.
+    [[nodiscard]] u64 TryReuseViewBank(u64 hash, std::span<const u32> tics, std::span<ImageViewId> ids);
+
+    /// Keeps view ids just resolved for these TIC indices. Returns their stamp, or 0 if they cannot
+    /// be kept.
+    u64 StoreViewBank(u64 hash, std::span<const u32> tics, std::span<const ImageViewId> ids);
+
+    /// As TryReuseViewBank, for sampler ids of TSC indices.
+    [[nodiscard]] u64 TryReuseSamplerBank(u64 hash, std::span<const u32> tscs, std::span<SamplerId> ids);
+
+    /// As StoreViewBank, for sampler ids of TSC indices.
+    u64 StoreSamplerBank(u64 hash, std::span<const u32> tscs, std::span<const SamplerId> ids);
+
     std::recursive_mutex mutex;
 
 private:
@@ -464,6 +486,23 @@ private:
 
     bool has_deleted_images = false;
     bool is_rescaling = false;
+
+    /// Validates the entry's table and snapshot against the current graphics descriptor table.
+    template <typename Table>
+    [[nodiscard]] bool BankTableMatches(const TextureBankKey& entry, const Table& table) const;
+
+    /// Fills the common part of a bank entry; false if the snapshot cannot be taken or does not
+    /// hold what the table resolved (the guest rewrote an entry since).
+    template <typename Table>
+    bool CaptureBank(TextureBankKey& entry, u64 hash, std::span<const u32> indices, const Table& table);
+
+    /// EDEN_HEAP_REUSE_VERIFY: logs bank images the skipped preparation would have changed.
+    void VerifyViewBankImages(const ViewBankEntry& entry);
+
+    u64 bank_generation = 1;
+    u64 bank_stamp = 0;
+    TextureBankCache<ViewBankEntry> view_banks;
+    TextureBankCache<SamplerBankEntry> sampler_banks;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

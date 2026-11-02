@@ -25,6 +25,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/compact_texture_table.h"
 #include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -616,6 +617,7 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             return;
         }
         image.flags |= ImageFlagBits::CpuModified;
+        ++bank_generation; // The next preparation uploads it (reused banks skip preparation)
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
         }
@@ -921,6 +923,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
         Image& image = slot_images[id];
         if (False(image.flags & ImageFlagBits::CpuModified)) {
             image.flags |= ImageFlagBits::CpuModified;
+            ++bank_generation;
             if (True(image.flags & ImageFlagBits::Tracked)) {
                 UntrackImage(image, id);
             }
@@ -1699,6 +1702,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    ++bank_generation; // Views erased: their ids may be reused
 }
 
 template <class P>
@@ -2552,6 +2556,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    ++bank_generation; // New image: overlaps and aliases of existing images may have changed
     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
     if ((IsPixelFormatASTC(image.info.format) &&
          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
@@ -2593,6 +2598,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already registered image");
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
+    ++bank_generation;
     lru_cache.Free(image.lru_index);
     const auto& clear_page_table =
         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
@@ -2820,6 +2826,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         channel_info.compute_image_table.Invalidate();
     }
     has_deleted_images = true;
+    ++bank_generation; // Views erased: their ids may be reused
 }
 
 template <class P>
@@ -2948,6 +2955,218 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
         return;
     }
     PrepareImage(image_view.image_id, is_modification, invalidate);
+}
+
+template <class P>
+template <typename Table>
+bool TextureCache<P>::BankTableMatches(const TextureBankKey& entry, const Table& table) const {
+    return entry.channel == channel_state && entry.table_addr == table.current_gpu_addr &&
+           entry.table_limit == table.current_limit && entry.snapshot.Matches(*gpu_memory);
+}
+
+template <class P>
+template <typename Table>
+bool TextureCache<P>::CaptureBank(TextureBankKey& entry, u64 hash, std::span<const u32> indices,
+                                  const Table& table) {
+    using Descriptor = typename std::remove_cvref_t<decltype(table.descriptors)>::value_type;
+    entry.stamp = 0;
+    entry.hash = hash;
+    entry.indices.assign(indices.begin(), indices.end());
+    entry.channel = channel_state;
+    entry.table_addr = table.current_gpu_addr;
+    entry.table_limit = table.current_limit;
+    if (!entry.snapshot.Capture(*gpu_memory, table.current_gpu_addr, indices, table.current_limit,
+                                sizeof(Descriptor))) {
+        return false;
+    }
+    // The ids were resolved from the table's copies of the entries (DescriptorTable::Read); the
+    // snapshot is only valid if memory still holds those.
+    for (const u32 index : indices) {
+        if (index > table.current_limit) {
+            continue;
+        }
+        const u8* const captured = entry.snapshot.Entry(index);
+        if (!captured || index / 64 >= table.read_descriptors.size() ||
+            (table.read_descriptors[index / 64] & (1ULL << (index % 64))) == 0 ||
+            index >= table.descriptors.size() ||
+            std::memcmp(captured, &table.descriptors[index], sizeof(Descriptor)) != 0) {
+            entry.snapshot.Clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::VerifyViewBankImages(const ViewBankEntry& entry) {
+    static u32 logged{};
+    auto& stats = CompactTextureStats::Get();
+    for (const ImageId image_id : entry.images) {
+        const Image& image = slot_images[image_id];
+        const bool pending_upload = True(image.flags & ImageFlagBits::CpuModified);
+        const bool new_aliases = !image.aliased_images.empty() &&
+                                 std::ranges::find(entry.alias_images, image_id) == entry.alias_images.end();
+        if (!pending_upload && !new_aliases) {
+            continue;
+        }
+        ++stats.verify_mismatches;
+        if (logged < 32) {
+            ++logged;
+            LOG_WARNING(HW_GPU,
+                        "Texture bank reuse check: image {:#x} ({}x{}, format {}) {}; the reuse would "
+                        "have skipped its preparation",
+                        image.gpu_addr, image.info.size.width, image.info.size.height,
+                        static_cast<u32>(image.info.format),
+                        pending_upload ? "has a CPU write pending upload" : "gained aliases");
+        }
+    }
+}
+
+template <class P>
+u64 TextureCache<P>::TryReuseViewBank(u64 hash, std::span<const u32> tics,
+                                      std::span<ImageViewId> ids) {
+    auto& stats = CompactTextureStats::Get();
+    ViewBankEntry* const entry = view_banks.Find(hash, tics);
+    if (!entry || entry->ids.size() != ids.size()) {
+        ++stats.view_misses;
+        return 0;
+    }
+    const auto& table = channel_state->graphics_image_table;
+    if (entry->channel != channel_state || entry->table_addr != table.current_gpu_addr ||
+        entry->table_limit != table.current_limit) {
+        ++stats.view_stale_table;
+        return 0;
+    }
+    if (entry->generation != bank_generation) {
+        ++stats.view_stale_generation;
+        return 0;
+    }
+    if (!entry->snapshot.Matches(*gpu_memory)) {
+        ++stats.view_stale_memory;
+        return 0;
+    }
+    if (HeapReuseVerify()) {
+        VerifyViewBankImages(*entry);
+    }
+    // What preparing every view would still have done: keep the images recent for the garbage
+    // collector (once per frame is what it looks at) and synchronize aliased images.
+    if (entry->frame_tick != frame_tick) {
+        for (const ImageId image_id : entry->images) {
+            lru_cache.Touch(slot_images[image_id].lru_index, frame_tick);
+        }
+        entry->frame_tick = frame_tick;
+    }
+    for (const ImageId image_id : entry->alias_images) {
+        PrepareImage(image_id, false, false);
+        if (entry->generation != bank_generation) {
+            break;
+        }
+    }
+    stats.alias_prepares += entry->alias_images.size();
+    if (entry->generation != bank_generation) {
+        // The synchronization rescaled an image (its views were recreated)
+        ++stats.view_stale_generation;
+        return 0;
+    }
+    std::ranges::copy(entry->ids, ids.begin());
+    view_banks.Touch(*entry);
+    ++stats.view_hits;
+    stats.snapshot_bytes += entry->snapshot.Bytes();
+    return entry->stamp;
+}
+
+template <class P>
+u64 TextureCache<P>::StoreViewBank(u64 hash, std::span<const u32> tics,
+                                   std::span<const ImageViewId> ids) {
+    if (tics.empty() || tics.size() != ids.size()) {
+        return 0;
+    }
+    auto& stats = CompactTextureStats::Get();
+    const auto& table = channel_state->graphics_image_table;
+    ViewBankEntry& entry = view_banks.Slot(hash, tics);
+    // The same bank resolved the same way (another stage of this draw): keep its stamp.
+    if (entry.SameIndices(hash, tics) && entry.generation == bank_generation &&
+        std::ranges::equal(entry.ids, ids) && BankTableMatches(entry, table)) {
+        view_banks.Touch(entry);
+        return entry.stamp;
+    }
+    entry.stamp = 0;
+    entry.images.clear();
+    entry.alias_images.clear();
+    for (const ImageViewId id : ids) {
+        if (!id || id == NULL_IMAGE_VIEW_ID) {
+            continue;
+        }
+        const ImageViewBase& view = slot_image_views[id];
+        if (view.IsBuffer() || !view.image_id) {
+            continue;
+        }
+        entry.images.push_back(view.image_id);
+    }
+    std::ranges::sort(entry.images);
+    const auto unique_end = std::ranges::unique(entry.images);
+    entry.images.erase(unique_end.begin(), unique_end.end());
+    for (const ImageId image_id : entry.images) {
+        const Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::CpuModified)) {
+            // Its upload is still pending (preparation did not run or was undone); a reuse would
+            // skip it.
+            ++stats.view_unstored;
+            return 0;
+        }
+        if (!image.aliased_images.empty()) {
+            entry.alias_images.push_back(image_id);
+        }
+    }
+    if (!CaptureBank(entry, hash, tics, table)) {
+        ++stats.view_unstored;
+        return 0;
+    }
+    entry.ids.assign(ids.begin(), ids.end());
+    entry.generation = bank_generation;
+    entry.frame_tick = frame_tick;
+    entry.stamp = ++bank_stamp;
+    view_banks.Touch(entry);
+    return entry.stamp;
+}
+
+template <class P>
+u64 TextureCache<P>::TryReuseSamplerBank(u64 hash, std::span<const u32> tscs,
+                                         std::span<SamplerId> ids) {
+    auto& stats = CompactTextureStats::Get();
+    SamplerBankEntry* const entry = sampler_banks.Find(hash, tscs);
+    // Samplers are never deleted: the ids only depend on the table and its entries.
+    if (!entry || entry->ids.size() != ids.size() ||
+        !BankTableMatches(*entry, channel_state->graphics_sampler_table)) {
+        ++stats.sampler_misses;
+        return 0;
+    }
+    std::ranges::copy(entry->ids, ids.begin());
+    sampler_banks.Touch(*entry);
+    ++stats.sampler_hits;
+    return entry->stamp;
+}
+
+template <class P>
+u64 TextureCache<P>::StoreSamplerBank(u64 hash, std::span<const u32> tscs,
+                                      std::span<const SamplerId> ids) {
+    if (tscs.empty() || tscs.size() != ids.size()) {
+        return 0;
+    }
+    const auto& table = channel_state->graphics_sampler_table;
+    SamplerBankEntry& entry = sampler_banks.Slot(hash, tscs);
+    if (entry.SameIndices(hash, tscs) && std::ranges::equal(entry.ids, ids) &&
+        BankTableMatches(entry, table)) {
+        sampler_banks.Touch(entry);
+        return entry.stamp;
+    }
+    if (!CaptureBank(entry, hash, tscs, table)) {
+        return 0;
+    }
+    entry.ids.assign(ids.begin(), ids.end());
+    entry.stamp = ++bank_stamp;
+    sampler_banks.Touch(entry);
+    return entry.stamp;
 }
 
 template <class P>
@@ -3107,6 +3326,7 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 template <class P>
 void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
+    ++bank_generation; // Channel states may have moved
     const auto it = channel_map.find(channel.bind_id);
     auto* this_state = &channel_storage[it->second];
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];

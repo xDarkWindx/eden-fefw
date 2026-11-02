@@ -421,6 +421,29 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             compact->blocks[compact->next].first_view == static_cast<size_t>(views - compact->views_base) &&
             compact->blocks[compact->next].table->element_tics.size() == desc.count) {
             const auto& block = compact->blocks[compact->next++];
+            // The descriptors written for this table last time, if they were made from the same
+            // resolved banks (same views and samplers) at the same texture cache generation (same
+            // image handles and scaling).
+            auto& cache = block.table->descriptor_cache;
+            static_assert(sizeof(DescriptorUpdateEntry) % sizeof(u64) == 0);
+            constexpr size_t words_per_entry = sizeof(DescriptorUpdateEntry) / sizeof(u64);
+            const u64 generation = texture_cache.BankGeneration();
+            const bool reusable = VideoCommon::DescriptorReuseEnabled() && block.view_stamp != 0 &&
+                                  block.sampler_stamp != 0;
+            const bool cached = reusable && cache.view_stamp == block.view_stamp &&
+                                cache.sampler_stamp == block.sampler_stamp &&
+                                cache.generation == generation &&
+                                cache.words.size() == size_t{desc.count} * words_per_entry;
+            auto& stats = VideoCommon::CompactTextureStats::Get();
+            if (cached && !VideoCommon::HeapReuseVerify()) {
+                guest_descriptor_queue.AddEntries(cache.words.data(), desc.count);
+                views += desc.count;
+                samplers += desc.count;
+                rescaling.PushTexture(cache.rescaled);
+                ++stats.descriptor_hits;
+                continue;
+            }
+            const DescriptorUpdateEntry* const first_entry = guest_descriptor_queue.Cursor();
             const bool is_rescaled = VideoCommon::PushCompactTextureBlock<SampledImage>(
                 block, compact->view_ids, compact->sampler_ids, pair_images,
                 [&](VideoCommon::ImageViewId image_view_id, VideoCommon::SamplerId sampler_id, u32 guest_index) {
@@ -433,6 +456,40 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             views += desc.count;
             samplers += desc.count;
             rescaling.PushTexture(is_rescaled);
+            if (reusable) {
+                if (cached) {
+                    // EDEN_HEAP_REUSE_VERIFY: written as without reuse, compared with the copy.
+                    ++stats.verify_checks;
+                    size_t differing{};
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        VkDescriptorImageInfo kept;
+                        std::memcpy(&kept, cache.words.data() + index * words_per_entry, sizeof(kept));
+                        const VkDescriptorImageInfo& fresh = first_entry[index].image;
+                        if (kept.sampler != fresh.sampler || kept.imageView != fresh.imageView ||
+                            kept.imageLayout != fresh.imageLayout) {
+                            ++differing;
+                        }
+                    }
+                    if (differing != 0 || cache.rescaled != is_rescaled) {
+                        ++stats.verify_mismatches;
+                        static u32 logged{};
+                        if (logged++ < 32) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Texture bank reuse check: {} of {} reused descriptors differ "
+                                        "from the written ones (rescaled {} vs {})",
+                                        differing, desc.count, cache.rescaled, is_rescaled);
+                        }
+                    }
+                } else {
+                    ++stats.descriptor_misses;
+                }
+                cache.view_stamp = block.view_stamp;
+                cache.sampler_stamp = block.sampler_stamp;
+                cache.generation = generation;
+                cache.rescaled = is_rescaled;
+                cache.words.resize(size_t{desc.count} * words_per_entry);
+                std::memcpy(cache.words.data(), first_entry, size_t{desc.count} * sizeof(DescriptorUpdateEntry));
+            }
             continue;
         }
         bool is_rescaled{};

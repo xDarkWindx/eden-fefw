@@ -110,3 +110,31 @@ texturas.
   palácio de Megaira (~20), seleção de personagem e campo (já ~30, não podem piorar).
 - Perfil por thread no VS (thread de trás) antes/depois; estatísticas no log.
 - Pedir prints de qualquer textura errada/piscando e testar com o interruptor desligado para isolar.
+
+## Estado (2026-11-02, segunda sessão): agressivas 1 e 2 implementadas, ligadas por padrão
+
+Feitas no próprio `perf/compact-texture-tables` (branch da sessão), um commit sobre `0b7ab17`.
+
+- `texture_cache/texture_bank_reuse.h`: `DescriptorRunSnapshot` (cópia das entradas TIC/TSC que o banco lê, em
+  trechos contíguos, lacunas de até 8 entradas cobertas; comparada página a página a cada reuso) e as entradas de
+  banco (`ViewBankEntry`, `SamplerBankEntry`, cache LRU de 8).
+- `TextureCache`: `bank_generation`, incrementado em `RegisterImage`/`UnregisterImage`, `DeleteImage`,
+  `InvalidateScale` (troca de escala apaga as views), `WriteMemory`/`UnmapGPUMemory` quando uma imagem passa a
+  `CpuModified`, `CreateChannel`. `TryReuseViewBank`/`StoreViewBank` (valida canal, endereço/limite da tabela,
+  geração e snapshot; no reuso ainda prepara as imagens com alias e renova o LRU uma vez por frame; só guarda se
+  nenhuma imagem do banco tem upload pendente e se o snapshot bate com o que a tabela resolveu).
+  `TryReuseSamplerBank`/`StoreSamplerBank` (samplers nunca são apagados: só tabela e snapshot).
+- `ConfigureImpl`: samplers do bloco vêm do banco; views reusadas antes do `FillImageViews`, que só resolve o
+  resto; se a geração mudar durante esse resto, tudo é resolvido de novo (`retries`).
+- Agressiva 2 (`PushImageDescriptors`): cada tabela guarda os descritores escritos com os carimbos (stamps) dos
+  bancos e a geração; se baterem, copia o bloco (`AddEntries`).
+- Interruptores: `EDEN_NO_HEAP_REUSE=1` (desliga 1 e 2), `EDEN_NO_DESCRIPTOR_REUSE=1` (só a 2),
+  `EDEN_HEAP_REUSE_VERIFY=1` (resolve e escreve tudo do jeito normal, usa o resultado normal e loga diferenças:
+  "Texture bank reuse check"). `EDEN_TEXTURE_TABLE_STATS=1` ganhou a linha "Texture banks" (taxa de reuso e
+  motivo de cada invalidação: new/table/generation/entries/unstored/retries).
+- Verificado: sintaxe (`vk_graphics_pipeline.cpp`, `vk_compute_pipeline.cpp`, instanciações Vulkan e OpenGL do
+  cache de texturas); harness com ASan/UBSan: snapshot (3000 tabelas aleatórias, densas/esparsas, páginas
+  faltando, mudanças dentro/fora/acima do limite) e blocos reusados contra a expansão normal e a referência
+  elemento a elemento (3000 rodadas), 0 falhas.
+- Falta: medir no jogo. Se a linha "Texture banks" mostrar muita invalidação por `generation`, o próximo passo é
+  restringir os incrementos às imagens que estão em algum banco.
