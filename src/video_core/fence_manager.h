@@ -7,7 +7,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -87,14 +86,6 @@ public:
             SignalFence(std::move(func));
             return;
         }
-        if (MustDelaySignal()) {
-            // The guest could read GPU-written data once this signals: a fence of its own, which
-            // runs it after the data is in guest memory, as with the balanced behaviour
-            // (SmartFences). Holding it for a later fence instead left the guest GPU's own
-            // readers of the release (dependencies, conditional rendering) waiting: black screen.
-            SignalFence(std::move(func));
-            return;
-        }
         func();
         coalesced_pending = true;
         ++coalesced_count;
@@ -112,20 +103,8 @@ public:
         coalesced_pending = false;
         coalesced_count = 0;
         last_coalesced_fence = std::chrono::steady_clock::now();
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         const bool should_flush = ShouldFlush();
-        const bool setting_delay = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
-        // With the fast behaviour, a signal that GPU-written data comes with (or that follows one
-        // still waiting for its data, to keep the guest's order) waits for the data to reach
-        // guest memory, as every signal does with the balanced behaviour.
-        const bool smart_delay = !setting_delay && SmartFences() &&
-                                 (should_flush || delayed_batches.load(std::memory_order_acquire) != 0);
-        const bool delay_fence = setting_delay || smart_delay;
-        if (smart_delay) {
-            // Counted until this fence's operations ran: the last of them lowers it.
-            delayed_batches.fetch_add(1, std::memory_order_acq_rel);
-            uncommitted_operations.emplace_back(std::move(func));
-            func = [this] { delayed_batches.fetch_sub(1, std::memory_order_acq_rel); };
-        }
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -138,7 +117,6 @@ public:
             uncommitted_operations.emplace_back(std::move(func));
         }
         pending_operations.emplace_back(std::move(uncommitted_operations));
-        uncommitted_operations.clear();
         QueueFence(new_fence);
         if (!delay_fence) {
             func();
@@ -318,29 +296,6 @@ private:
         }
         query_cache.CommitAsyncFlushes();
     }
-
-    /// EDEN_SMART_FENCES=0: with the fast fence behaviour, signal at once even when GPU-written
-    /// data is still on its way to guest memory (games that read it back then see old data:
-    /// Fortune's Weave's character models and grass broke apart).
-    static bool SmartFences() {
-        static const bool enabled = [] {
-            const char* value = std::getenv("EDEN_SMART_FENCES");
-            return value == nullptr || value[0] != '0';
-        }();
-        return enabled;
-    }
-
-    /// Whether a signal must wait for data the GPU wrote: it has some to download, or an earlier
-    /// signal is still waiting for its data (the guest must see them in order).
-    bool MustDelaySignal() const {
-        if (!SmartFences()) {
-            return false;
-        }
-        return delayed_batches.load(std::memory_order_acquire) != 0 || ShouldFlush();
-    }
-
-    /// Fences whose signals wait for their GPU-written data, not released yet.
-    std::atomic<u32> delayed_batches{};
 
     bool coalesced_pending{};
     u32 coalesced_count{};
