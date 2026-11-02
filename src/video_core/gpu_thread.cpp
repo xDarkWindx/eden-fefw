@@ -25,6 +25,17 @@
 
 namespace VideoCommon::GPUThread {
 
+namespace {
+/// EDEN_HELD_WRITES_AT_SUBMIT=0: apply held-back guest CPU writes only at fences, as before.
+bool ApplyHeldWrites() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_HELD_WRITES_AT_SUBMIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 ThreadManager::ThreadManager(Core::System& system_)
     : system{system_}
 {}
@@ -69,6 +80,10 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                    // Held-back guest CPU writes first (see the single-thread path below).
+                    if (ApplyHeldWrites()) {
+                        split.Defer([gpu = &system.GPU()] { gpu->InvalidateGPUCache(); });
+                    }
                     scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
                 } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                     split.Defer([gpu = &system.GPU()] { gpu->TickWork(); });
@@ -91,6 +106,14 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             Common::Timeline::Mark("gpu_begin", next.data.index(), next.fence);
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                // Guest CPU writes to GPU-written memory are held back until the GPU thread
+                // applies them, by default at the next fence (rare with fast fences). The guest
+                // made them before it submitted this list, which may read them: apply them first.
+                // Fortune's Weave's character models broke apart (stale bone data) and its grass
+                // flickered without this. From PokeDinner c3be47da (Eden-NS2 15b48a6615).
+                if (ApplyHeldWrites()) {
+                    system.GPU().InvalidateGPUCache();
+                }
                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
             } else if (std::holds_alternative<GPUTickCommand>(next.data)) {
                 system.GPU().TickWork();
