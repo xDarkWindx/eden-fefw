@@ -120,7 +120,8 @@ espelhado no branch `pokedinner` deste repositório; o servidor git.eden-emu.dev
 - Diagnóstico útil: GPU Mode Accurate e Fence Behavior Balanced escondiam o problema (com muito custo);
   `EDEN_NX2_PB_SNAPSHOT=0` piora (rochas piscando).
 
-Próximos passos: medir FPS com o build atual (Default e Balanced); grupo de compilação de shaders do
+Resultado (usuário, 6891933): Fence Behavior Default, GPU Mode Fast, campo aberto em ~30 FPS quase sempre,
+sem artefatos. Configuração recomendada: Default. Próximos passos: medir a cena dos 3 esquadrões; grupo de compilação de shaders do
 PokeDinner (Wael3rd: 9a876a74, 452dc273, b59fd995, bebdff8c e os do recompilador) para menos travadas;
 atualizar o `upstream-patch` para o Duck912.
 
