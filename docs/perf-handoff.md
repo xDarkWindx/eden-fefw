@@ -102,6 +102,28 @@ separadamente. Teste preferido: rodadas pequenas e variadas primeiro, depois a g
 6. Ideia arriscada, não iniciada: reaproveitar conjuntos de descritores entre draws. Precisa detectar
    mudanças nas tabelas TIC/TSC e nas imagens.
 
+## Sessão de 2026-11-02: artefatos resolvidos
+
+Sintomas antigos (grama e capa piscando, cabeça solta, capa esticada; prédios pretos depois) resolvidos
+no `main` até 2b73a41, com GPU Mode = Fast. O que resolveu, do PokeDinner `c3be47da` (fork do Eglantine,
+espelhado no branch `pokedinner` deste repositório; o servidor git.eden-emu.dev é bloqueado na sessão):
+- 6d535dd: escritas da CPU seguradas (memória que a GPU também escreve) são aplicadas antes de cada
+  command list (`InvalidateGPUCache` no envio) e copiando só os bytes (`OnCachedWrite`). Arrumou o
+  personagem e a grama. Interruptores: `EDEN_HELD_WRITES_AT_SUBMIT=0`, `EDEN_CACHED_WRITE=0`.
+- 2b73a41: jogos do Switch 2 copiam de volta só as páginas que a CPU lê (`NoteCpuRead` via
+  `GetFlushArea`; precisa do Reactive Flushing ligado). A cópia de tudo trazia a versão velha da GPU
+  por cima do que o jogo tinha escrito. Resolveu o resto, até a grama de longe. `EDEN_BUFFER_DOWNLOADS=1`
+  volta a copiar tudo.
+- Tentativas descartadas (revertidas): "smart fences" (borrão, 19 FPS, um travamento) e ler command
+  lists escritas pela GPU da memória (prédios pretos/invisíveis: as páginas marcadas cobrem janelas
+  inteiras de storage, e a lista lida da memória já era a do frame seguinte).
+- Diagnóstico útil: GPU Mode Accurate e Fence Behavior Balanced escondiam o problema (com muito custo);
+  `EDEN_NX2_PB_SNAPSHOT=0` piora (rochas piscando).
+
+Próximos passos: medir FPS com o build atual (Default e Balanced); grupo de compilação de shaders do
+PokeDinner (Wael3rd: 9a876a74, 452dc273, b59fd995, bebdff8c e os do recompilador) para menos travadas;
+atualizar o `upstream-patch` para o Duck912.
+
 ## Método de teste usado aqui
 
 - Build Linux do `video_core` nesta sessão (só para compilar e ligar harnesses): CMake 3.31 via pip,
