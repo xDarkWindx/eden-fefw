@@ -124,8 +124,17 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        // EDEN_CACHED_WRITE=0: apply them by invalidation (re-upload from guest memory), as before.
+        static const bool cached_write = [] {
+            const char* value = std::getenv("EDEN_CACHED_WRITE");
+            return value == nullptr || value[0] != '0';
+        }();
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCachedWrite(address, size);
+            if (cached_write) {
+                renderer->ReadRasterizer()->OnCachedWrite(address, size);
+            } else {
+                renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+            }
         });
         system.GatherGPUDirtyMemory(callback_writes);
     }
