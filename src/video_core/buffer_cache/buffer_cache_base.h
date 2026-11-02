@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -328,6 +329,10 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    /// The guest CPU reads [addr, addr + size) (a reactive flush asked for it): without
+    /// AsyncBufferDownloads, GPU writes there are still copied back at fences from now on.
+    void NoteCpuRead(DAddr addr, size_t size);
+
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
@@ -530,6 +535,37 @@ private:
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
+
+    /// Whether every GPU-written range is copied back to guest memory at the next fence. Switch 2
+    /// titles (native tiling) copy back only what their CPU reads (cpu_read_ranges): copying
+    /// everything is a large part of each fence's cost, and the reactive flush still brings any
+    /// other page the CPU reads. From PokeDinner c3be47da (Eden-NS2 15b48a6615), where copying
+    /// everything dropped Pokemon Pokopia from 60 to about 42 frames a second.
+    /// EDEN_BUFFER_DOWNLOADS=1 copies everything back, =0 only CPU-read pages, for every title.
+    bool AsyncBufferDownloads() const {
+        static const int forced = [] {
+            const char* value = std::getenv("EDEN_BUFFER_DOWNLOADS");
+            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+        }();
+        if (forced >= 0) {
+            return forced == 1;
+        }
+        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
+    }
+    /// Buffer pages the guest CPU reads (NoteCpuRead).
+    Common::RangeSet<DAddr> cpu_read_ranges;
+
+    /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next
+    /// fence.
+    void QueueDownload(DAddr addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            uncommitted_gpu_modified_ranges.Add(addr, size);
+            return;
+        }
+        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
+            uncommitted_gpu_modified_ranges.Add(start, end - start);
+        });
+    }
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers

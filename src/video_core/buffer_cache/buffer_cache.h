@@ -244,7 +244,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
-        uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+        QueueDownload(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
     // This subtraction in this order is important for overlapping copies.
@@ -722,6 +722,19 @@ void BufferCache<P>::PopAsyncBuffers() {
     async_buffers_death_ring.emplace_back(*async_buffer);
     async_buffers.pop_front();
     pending_downloads.pop_front();
+}
+
+template <class P>
+void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
+    if (AsyncBufferDownloads() || size == 0) {
+        return;
+    }
+    size_t covered = 0;
+    cpu_read_ranges.ForEachInRange(addr, size,
+                                   [&](DAddr start, DAddr end) { covered += end - start; });
+    if (covered < size) {
+        cpu_read_ranges.Add(addr, size);
+    }
 }
 
 template <class P>
@@ -1731,7 +1744,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
-    uncommitted_gpu_modified_ranges.Add(device_addr, size);
+    QueueDownload(device_addr, size);
 }
 
 template <class P>

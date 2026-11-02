@@ -1384,6 +1384,13 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     {
+        // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+                                 Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
+                                     Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
+    }
+    {
         std::scoped_lock lock{texture_cache.mutex};
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
