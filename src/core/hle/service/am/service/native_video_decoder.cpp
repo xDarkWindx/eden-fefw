@@ -498,6 +498,11 @@ private:
                 }
             }
         }
+        if (result == Kernel::ResultNotImplemented) {
+            // A release that waits on a fence is not handled; make it visible, the game aborts on it.
+            LOG_WARNING(Service_AM, "native video release image={} with a fence is unsupported: {:#x} {:#x} {:#x} {:#x}",
+                        packet[2], packet[4], packet[5], packet[6], packet[7]);
+        }
         LOG_DEBUG(Service_AM, "native video release image={}, threshold={}, result={:#x}", packet[2], completion_value, result.raw);
         IPC::ResponseBuilder rb{ctx, 10};
         rb.Push(result.raw);
@@ -613,7 +618,6 @@ private:
         if (packet[0] == 0x18 && packet[1] == 0) {
             result = Kernel::ResultInvalidState;
             if (started && configuration) {
-                result = Kernel::ResultNotImplemented;
                 if (h264_context) {
                     // Decode everything submitted, then drain the decoder so no frame stays queued.
                     result = PumpOutput();
@@ -621,10 +625,30 @@ private:
                         DrainH264();
                         result = PumpOutput();
                     }
+                } else {
+                    // AV1 (Fortune's Weave flushes its looping character-select clips). Decode every
+                    // input submitted so far, then reset libgav1 so the next input may start a new
+                    // sequence. The decoder is not frame-parallel, so it holds no frames of its own
+                    // and SignalEOS loses nothing; decoded frames wait for an image as usual.
+                    result = ResultSuccess;
+                    while (result.IsSuccess() && !pending_inputs.empty()) {
+                        result = DecodePendingInput();
+                    }
+                    if (result.IsSuccess() && decoder->SignalEOS() != libgav1::kStatusOk) {
+                        result = Kernel::ResultInvalidState;
+                    }
+                    if (result.IsSuccess()) {
+                        result = PumpOutput();
+                    }
                 }
             }
         }
-        LOG_DEBUG(Service_AM, "native video flush result={:#x}", result.raw);
+        if (result.IsError()) {
+            LOG_WARNING(Service_AM, "native video flush failed: {:#x}, codec={}, pending_inputs={}",
+                        result.raw, h264_context ? "H.264" : "AV1", pending_inputs.size());
+        } else {
+            LOG_DEBUG(Service_AM, "native video flush result={:#x}", result.raw);
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result.raw);
     }

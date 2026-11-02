@@ -141,3 +141,14 @@ atualizar o `upstream-patch` para o Duck912.
   O interpretador antigo vem do `git show <commit>:src/video_core/macro_turing.h`, renomeado de namespace.
 - Arquivos com CRLF: `texture_cache/texture_cache.h`, entre outros. Edite preservando as quebras de linha
   (Python com `newline=''`) e confira o `git diff --stat`.
+
+## Crash na seleção de personagem (2026-11-02)
+
+- Sintoma: `SetTerminateResult result=0x4201 (2001-0033)` + `svcBreak` aos ~66s, na tela dos obeliscos
+  (vídeo de fundo 2560x1440 por personagem, troca com L/R). Nenhum aviso antes: o `0x4201`
+  (`Kernel::ResultNotImplemented`) saía calado do `native_video_decoder.cpp`.
+- Suspeito principal: `Flush` só existia para H.264; com AV1 devolvia `ResultNotImplemented`. Implementado
+  (decodifica as entradas pendentes, `SignalEOS` no libgav1, `PumpOutput`). Flush que falha e `ReleaseImage`
+  com fence (outro caminho `0x4201`) agora logam em Warning.
+- PokeDinner/Eglantine não têm decodificador de vídeo nativo (outra arquitetura de Switch 2); não há o que portar.
+- Se continuar: filtro de log `*:Info Service.AM:Debug` e procurar `native video` antes do crash.
