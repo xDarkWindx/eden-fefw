@@ -138,3 +138,14 @@ Feitas no próprio `perf/compact-texture-tables` (branch da sessão), um commit 
   elemento a elemento (3000 rodadas), 0 falhas.
 - Falta: medir no jogo. Se a linha "Texture banks" mostrar muita invalidação por `generation`, o próximo passo é
   restringir os incrementos às imagens que estão em algum banco.
+
+### Primeira medição (praça, reuso ligado)
+
+- Verificação: 0 diferenças em ~38 mil conferências/s; views reusadas 99%, samplers 99,7%.
+- Reuso ligado: views 95-98%, descritores 45-60%, ~17 FPS (sem ganho claro; falta o A/B com `EDEN_NO_HEAP_REUSE=1`).
+- **Correção dos números anteriores:** antes deste commit, `compact_stats` era `static thread_local` dentro do
+  template `ConfigureImpl<Spec>`, ou seja, um contador por instanciação; os "~11 mil draws/s" eram de uma só. Agora
+  o contador é único: são **~45-52 mil draws/s**, dos quais só ~1,6-2,6 mil (3-5%) usam o banco. O banco não é o
+  gargalo principal; o custo está espalhado pelo overhead por draw. Snapshot de ~900-1400 bytes por banco: só
+  ~30-45 dos ~1000-1400 índices TIC do banco estão dentro do limite da tabela (o resto vira view nula).
+- Próximo passo: perfil por thread (thread de trás) com o reuso ligado, para ver o que domina por draw.
