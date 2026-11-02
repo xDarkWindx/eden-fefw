@@ -212,3 +212,25 @@ atualizar o `upstream-patch` para o Duck912.
   `FillImageViews`/`GetSamplerId` continuam rodando a cada draw (a tabela de descritores pode mudar sem aviso).
   Vetores do `ConfigureImpl` viraram `thread_local` reaproveitados. `g++ -fsyntax-only -Wall` limpo (VMA e
   Vulkan-Headers clonados). A versão agressiva (pular a reconstrução dos descritores) segue não iniciada.
+
+## Branch perf/compact-texture-tables: tabelas de texturas compactas (2026-11-02)
+
+- Revisão do gargalo (praça da cidade, 15 FPS, CPU): a thread de trás é o limite; `ConfigureImpl` é ~52% dela.
+  Draws vazios já são descartados (`ProcessDraw`, `!count`). Custo fixo por draw (validar/baixar a tabela de
+  handles) é pequeno. O grosso é por registro: centenas por draw, três passagens com memo (montagem,
+  `FillImageViews`, `PushImageDescriptors`; o memo deste último tem ~40 KB e não cabe no L1).
+- Causa de fundo: no Switch as texturas desses arrays são bindless (o shader lê a tabela); no Vulkan do Eden
+  cada draw monta um array de descritores do tamanho da tabela. Bindless de verdade = reescrever recompilador e
+  cache de texturas (fora de escala).
+- Feito: `video_core/texture_cache/compact_texture_table.h`. A tabela decodificada (já guardada por pipeline) vira
+  pares distintos (TIC, TSC, excluído) + o par de cada registro. Por draw: samplers resolvidos por TSC distinto,
+  views por TIC distinto (junto com as outras views, mesma ordem de primeiras ocorrências), descritores feitos por
+  par e copiados por registro. Nada é guardado entre draws além dos handles decodificados (que já eram).
+  O reaproveitamento agressivo de descritores entre draws foi descartado: depois disso pouparia pouco na thread
+  de trás e arrisca view apagada (crash de driver).
+- Verificação: harness fora da árvore (caminho antigo elemento a elemento x novo com as funções reais do header,
+  cache de texturas falso com repetição de passada): 20 mil draws aleatórios, 14 mi descritores idênticos, mesma
+  ordem de consultas; modo com colisões nas tabelas diretas idem (mesmas primeiras ocorrências). `g++
+  -fsyntax-only -Wall` de vk_graphics_pipeline.cpp e vk_compute_pipeline.cpp limpos.
+- Interruptores: `EDEN_NO_COMPACT_TEXTURE_TABLES=1` (caminho antigo, mesmo build, A/B);
+  `EDEN_TEXTURE_TABLE_STATS=1` (log a cada 4 s: draws/s, arrays reaproveitados, registros e pares por draw).

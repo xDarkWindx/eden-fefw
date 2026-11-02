@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
+#include "video_core/texture_cache/compact_texture_table.h"
 #include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -353,11 +354,21 @@ public:
     std::array<f32, 4> words{};
 };
 
+/// A draw's compact texture tables (see compact_texture_table.h), in binding order.
+struct CompactTextureBinding {
+    std::span<const VideoCommon::CompactTextureBlock> blocks;
+    const VideoCommon::ImageViewInOut* views_base{};
+    std::span<const VideoCommon::ImageViewId> view_ids;
+    std::span<const VideoCommon::SamplerId> sampler_ids;
+    size_t next{};
+};
+
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 CompactTextureBinding* compact = nullptr) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -371,21 +382,12 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     };
     const bool dedupe = VideoCommon::TextureLookupDedupeEnabled();
     static thread_local VideoCommon::LookupMemo<SampledImage, 1024, u64> memo;
+    static thread_local std::vector<SampledImage> pair_images;
     for (const auto& desc : info.texture_descriptors) {
-        bool is_rescaled{};
-        if (dedupe) {
-            memo.Reset("descriptors");
-        }
-        for (u32 index = 0; index < desc.count; ++index) {
-            const auto& guest_view = *views++;
-            const VideoCommon::ImageViewId image_view_id{guest_view.id};
-            const VideoCommon::SamplerId sampler_id{*(samplers++)};
-            const u64 memo_key = u64{image_view_id.index} | (u64{sampler_id.index} << 32);
-            if (const SampledImage* const known = dedupe ? memo.Find(memo_key) : nullptr) {
-                guest_descriptor_queue.AddSampledImage(known->view, known->sampler);
-                is_rescaled |= known->rescaled;
-                continue;
-            }
+        // The same handles per (view, sampler), whether made for an element or for a distinct pair.
+        const auto make_sampled = [&](VideoCommon::ImageViewId image_view_id,
+                                      VideoCommon::SamplerId sampler_id, u32 index,
+                                      u32 guest_index) -> SampledImage {
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (desc.buffer_source.enabled && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
@@ -401,7 +403,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                         "Buffer-backed texture entry {} (CB{}+{:#x}, field {:#x}) has format {}, expected type {}, view available {}, texture index {}, guest type {}, {}x{} layers {}; sampling a null view",
                         index, desc.cbuf_index, desc.cbuf_offset, desc.buffer_source.offset,
                         static_cast<u32>(image_view.format), static_cast<u32>(desc.type), vk_image_view != VK_NULL_HANDLE,
-                        guest_view.index, static_cast<u32>(image_view.type), image_view.size.width,
+                        guest_index, static_cast<u32>(image_view.type), image_view.size.width,
                         image_view.size.height, image_view.range.extent.layers);
                 }
                 vk_image_view = VK_NULL_HANDLE;
@@ -412,11 +414,46 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
             const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
-            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
-            is_rescaled |= element_rescaled;
+            return SampledImage{vk_image_view, vk_sampler, texture_cache.IsRescaling(image_view)};
+        };
+        // A compact table: one SampledImage per distinct pair, then one copy per element.
+        if (compact && desc.buffer_source.enabled && compact->next < compact->blocks.size() &&
+            compact->blocks[compact->next].first_view == static_cast<size_t>(views - compact->views_base) &&
+            compact->blocks[compact->next].table->element_tics.size() == desc.count) {
+            const auto& block = compact->blocks[compact->next++];
+            const bool is_rescaled = VideoCommon::PushCompactTextureBlock<SampledImage>(
+                block, compact->view_ids, compact->sampler_ids, pair_images,
+                [&](VideoCommon::ImageViewId image_view_id, VideoCommon::SamplerId sampler_id, u32 guest_index) {
+                    const SampledImage image = make_sampled(image_view_id, sampler_id, 0, guest_index);
+                    return std::pair{image, image.rescaled};
+                },
+                [&](const SampledImage& image) {
+                    guest_descriptor_queue.AddSampledImage(image.view, image.sampler);
+                });
+            views += desc.count;
+            samplers += desc.count;
+            rescaling.PushTexture(is_rescaled);
+            continue;
+        }
+        bool is_rescaled{};
+        if (dedupe) {
+            memo.Reset("descriptors");
+        }
+        for (u32 index = 0; index < desc.count; ++index) {
+            const auto& guest_view = *views++;
+            const VideoCommon::ImageViewId image_view_id{guest_view.id};
+            const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            const u64 memo_key = u64{image_view_id.index} | (u64{sampler_id.index} << 32);
+            if (const SampledImage* const known = dedupe ? memo.Find(memo_key) : nullptr) {
+                guest_descriptor_queue.AddSampledImage(known->view, known->sampler);
+                is_rescaled |= known->rescaled;
+                continue;
+            }
+            const SampledImage image = make_sampled(image_view_id, sampler_id, index, guest_view.index);
+            guest_descriptor_queue.AddSampledImage(image.view, image.sampler);
+            is_rescaled |= image.rescaled;
             if (dedupe) {
-                memo.Store(memo_key, SampledImage{vk_image_view, vk_sampler, element_rescaled});
+                memo.Store(memo_key, image);
             }
         }
         rescaling.PushTexture(is_rescaled);

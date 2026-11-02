@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/texture_cache/compact_texture_table.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCore {
@@ -203,8 +205,10 @@ private:
         std::vector<u8> bytes;
         std::vector<std::pair<u32, u32>> handles;
         std::vector<u8> excluded;
+        VideoCommon::CompactTextureTable compact; ///< handles/excluded as distinct pairs
     };
-    std::vector<BufferTextureHandles> buffer_texture_handles;
+    /// A deque: draws keep pointers to these (compact blocks) while other arrays are added.
+    std::deque<BufferTextureHandles> buffer_texture_handles;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};

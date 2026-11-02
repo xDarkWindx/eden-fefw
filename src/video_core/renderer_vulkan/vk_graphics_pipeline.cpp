@@ -437,6 +437,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     excluded_views.clear();
     samplers.clear();
     views.resize(num_image_elements);
+    // Buffer-backed texture arrays bound as compact tables (compact_texture_table.h): per array, its
+    // place in views/samplers and its resolved ids (one per distinct TIC and TSC).
+    static thread_local std::vector<VideoCommon::CompactTextureBlock> compact_blocks;
+    static thread_local std::vector<VideoCommon::ImageViewId> compact_view_ids;
+    static thread_local std::vector<VideoCommon::SamplerId> compact_sampler_ids;
+    static thread_local std::vector<VideoCommon::ImageViewInOut> compact_fill;
+    static thread_local std::vector<size_t> compact_positions;
+    static thread_local std::vector<size_t> compact_fill_offsets;
+    static thread_local VideoCommon::CompactTextureStats compact_stats;
+    compact_blocks.clear();
+    compact_view_ids.clear();
+    compact_sampler_ids.clear();
     size_t view_count{};
     const auto add_view{[&](const VideoCommon::ImageViewInOut& view) LAMBDA_FORCEINLINE {
         if (view_count < views.size()) {
@@ -453,6 +465,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const bool dedupe_samplers = VideoCommon::TextureLookupDedupeEnabled() &&
                                  !VideoCommon::NativeTextureRequestsEnabled();
+    // Compact tables rely on the lookups being deduplicated (the repeats are what they fold).
+    const bool compact_tables = dedupe_samplers && VideoCommon::CompactTextureTablesEnabled();
+    const bool stats = VideoCommon::CompactTextureStats::Enabled();
     static thread_local VideoCommon::LookupMemo<VideoCommon::SamplerId, 256> sampler_memo;
     if (dedupe_samplers) {
         sampler_memo.Reset("samplers");
@@ -599,7 +614,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 cached->count == desc.count && cached->via_header_index == via_header_index &&
                 cached->tic_limit == tic_limit && cached->tsc_limit == tsc_limit &&
                 cached->bytes == buffer_texture_bytes) {
+                if (stats) {
+                    ++compact_stats.reused;
+                }
                 return *cached;
+            }
+            if (stats) {
+                ++compact_stats.decoded;
             }
             BufferTextureHandles decoded;
             decoded.desc = &desc;
@@ -629,22 +650,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
             }
             decoded.bytes = buffer_texture_bytes;
+            if (compact_tables) {
+                decoded.compact.Build(decoded.handles, decoded.excluded);
+            }
             if (cached != buffer_texture_handles.end()) {
                 *cached = std::move(decoded);
                 return *cached;
             }
             return buffer_texture_handles.emplace_back(std::move(decoded));
         }};
-        const auto add_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
-            VideoCommon::SamplerId sampler;
+        const auto resolve_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
             if (const auto* const known = dedupe_samplers ? sampler_memo.Find(tsc_index) : nullptr) {
-                sampler = *known;
-            } else {
-                sampler = texture_cache.GetSamplerId(tsc_index, false);
-                if (dedupe_samplers) {
-                    sampler_memo.Store(tsc_index, sampler);
-                }
+                return *known;
             }
+            const VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(tsc_index, false);
+            if (dedupe_samplers) {
+                sampler_memo.Store(tsc_index, sampler);
+            }
+            return sampler;
+        }};
+        const auto add_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
+            const VideoCommon::SamplerId sampler = resolve_sampler(tsc_index);
             if (sampler_count < samplers.size()) {
                 samplers[sampler_count] = sampler;
             } else {
@@ -675,6 +701,32 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         for (const auto& desc : info.texture_descriptors) {
             if (desc.buffer_source.enabled && desc.count > 0) {
                 const BufferTextureHandles& decoded = buffer_handles(desc);
+                if (compact_tables && decoded.compact.element_tics.size() == desc.count) {
+                    // Samplers resolve here, in binding order, one per distinct TSC; views resolve with
+                    // the draw's other views (FillImageViews), one per distinct TIC; the elements are
+                    // written from those afterwards (ExpandViewLookups).
+                    const VideoCommon::CompactTextureTable& table = decoded.compact;
+                    compact_blocks.push_back(VideoCommon::CompactTextureBlock{
+                        .table = &table,
+                        .first_view = view_count,
+                        .first_sampler = sampler_count,
+                        .view_ids = compact_view_ids.size(),
+                        .sampler_ids = compact_sampler_ids.size(),
+                    });
+                    for (const u32 tsc_index : table.unique_tscs) {
+                        compact_sampler_ids.push_back(resolve_sampler(tsc_index));
+                    }
+                    compact_view_ids.resize(compact_view_ids.size() + table.unique_tics.size());
+                    view_count += desc.count;
+                    sampler_count += desc.count;
+                    if (views.size() < view_count) {
+                        views.resize(view_count);
+                    }
+                    if (samplers.size() < sampler_count) {
+                        samplers.resize(sampler_count);
+                    }
+                    continue;
+                }
                 for (u32 index = 0; index < desc.count; ++index) {
                     if (decoded.excluded[index]) {
                         excluded_views.push_back(view_count);
@@ -721,7 +773,32 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         samplers.resize(sampler_count);
     }
     ASSERT(samplers.size() == num_textures);
-    texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
+    if (compact_blocks.empty()) {
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
+    } else {
+        // Same lookups in the same order as for the elements (first occurrences), minus the repeats.
+        if (!VideoCommon::CompactViewLookups<VideoCommon::ImageViewInOut>(
+                views, compact_blocks, compact_fill, compact_positions, compact_fill_offsets)) {
+            throw Shader::RuntimeError("Compact texture table outside the draw's views");
+        }
+        texture_cache.FillImageViews(std::span(compact_fill.data(), compact_fill.size()), false,
+                                     Spec::has_images);
+        VideoCommon::ExpandViewLookups<VideoCommon::ImageViewInOut>(
+            views, samplers, compact_blocks, compact_fill, compact_positions, compact_fill_offsets,
+            compact_view_ids, compact_sampler_ids);
+    }
+    if (stats) {
+        ++compact_stats.draws;
+        if (!compact_blocks.empty()) {
+            ++compact_stats.table_draws;
+            for (const auto& block : compact_blocks) {
+                compact_stats.elements += block.table->element_tics.size();
+                compact_stats.pairs += block.table->pairs.size();
+                compact_stats.unique_views += block.table->unique_tics.size();
+            }
+        }
+        compact_stats.Report();
+    }
     // These slots cannot reach this operation under the shader's own branch
     // conditions. Preserve array indexing and use a correctly typed null view.
     for (const size_t index : excluded_views) views[index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
@@ -876,12 +953,19 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    CompactTextureBinding compact_binding{
+        .blocks = compact_blocks,
+        .views_base = views.data(),
+        .view_ids = compact_view_ids,
+        .sampler_ids = compact_sampler_ids,
+    };
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         buffer_cache.BindHostStageBuffers(stage);
         const auto* stage_views = views_it;
         try {
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
-                                 samplers_it, views_it);
+                                 samplers_it, views_it,
+                                 compact_blocks.empty() ? nullptr : &compact_binding);
         } catch (const Shader::Exception&) {
             static u32 diagnostic_count{};
             if (diagnostic_count++ < 8) {
