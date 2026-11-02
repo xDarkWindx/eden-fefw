@@ -486,13 +486,18 @@ private:
                             result = PumpOutput();
                         } else {
                             // Yoshi's second H.264 decoder releases images that were never handed out
-                            // (after its first Flush). Release hands the image back to the decoder with a
-                            // fresh fence that is only reached once a frame is written to it, like the
-                            // normal path; the game's buffer ring polls that fence and stops releasing
-                            // while it is unsatisfied. (Syncpoint is not advanced.)
-                            completion_value = ++next_completion_value;
-                            image->completion_value = completion_value;
-                            result = ResultSuccess;
+                            // (after its first Flush), and Fortune's Weave does it in a loop after
+                            // Flush/Start. The image already waits for a frame, so hand back the fence it
+                            // already has: it is reached once a frame is written to it, and the game's
+                            // buffer ring polls it. A fresh value would leave a hole in the sequence (each
+                            // written frame advances the syncpoint by one, in completion order), and
+                            // repeated idle releases pushed every fence out of reach, freezing the game.
+                            completion_value = image->completion_value;
+                            result = PumpOutput();
+                            if ((++idle_releases & 0xfff) == 1) {
+                                LOG_WARNING(Service_AM, "native video release of idle image={} (x{}), fence={}",
+                                            packet[2], idle_releases, completion_value);
+                            }
                             LOG_DEBUG(Service_AM, "native video release of idle image={}", packet[2]);
                         }
                     }
@@ -840,6 +845,7 @@ private:
     u64 next_submission_id{1};
     bool started{};
     bool flushed{}; // Flushed since the last Start: Start may resume decoding.
+    u64 idle_releases{}; // Releases of images the decoder already held (diagnostics).
     Kernel::KProcess* process;
     NativeVideoKind kind;
     Kernel::KTransferMemory* transfer_memory{};

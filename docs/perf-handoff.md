@@ -153,5 +153,9 @@ atualizar o `upstream-patch` para o Duck912.
 - Depois disso, `Start` logo após o `Flush` dava `0xfa01` (InvalidState, o decodificador já constava como
   iniciado); a thread do vídeo morria com PANIC e o jogo congelava ~5s depois. Agora um decodificador que
   passou por `Flush` aceita `Start` de novo (semântica do MediaCodec). `Start` que falha loga em Warning.
+- Depois, congelamento: após `Flush`/`Start` o jogo devolve em loop imagens que já estavam livres (`release of
+  idle image`). O caminho do Duck912 dava a cada uma uma fence nova (`++next_completion_value`) sem frame
+  correspondente, abrindo buracos na sequência; as fences foram a ~197 mil e nunca eram alcançadas. Agora a
+  imagem devolve a fence que já tinha (e roda `PumpOutput`); um Warning a cada 4096 dessas devoluções.
 - PokeDinner/Eglantine não têm decodificador de vídeo nativo (outra arquitetura de Switch 2); não há o que portar.
 - Se continuar: filtro de log `*:Info Service.AM:Debug` e procurar `native video` antes do crash.
