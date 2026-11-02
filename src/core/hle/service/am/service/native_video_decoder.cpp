@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <condition_variable>
+#include <optional>
+#include <stop_token>
+#include "common/thread.h"
 #include <vector>
 #include <deque>
 #include <cstring>
@@ -109,6 +113,10 @@ public:
     }
 private:
     void Reset() {
+        // Joins the decode worker (requests stop first), so nothing below races with it.
+        decode_worker = std::jthread{};
+        decode_busy = false;
+        decode_error.reset();
         pending_inputs.clear();
         pending_input_bytes = 0;
         output_properties.clear();
@@ -141,9 +149,12 @@ private:
         bool eos{};
         u64 submission_id;
         u64 timestamp;
+        std::chrono::steady_clock::duration decode_time{};
     };
 
     static constexpr size_t MaximumPendingInputs = 3;
+    // AV1 frames the decode worker may hold decoded ahead of the images the game hands back.
+    static constexpr size_t MaximumDecodedAhead = 2;
 
     struct PendingInput {
         std::vector<u8> bytes;
@@ -164,6 +175,7 @@ private:
                 result = Kernel::ResultInvalidSize;
                 if (input.size() <= configuration->input_capacity && (input.empty() == bool(packet[7] & 0xff))) {
                     result = Result{0x1c266f};
+                    std::unique_lock lock{decode_mutex};
                     if (pending_inputs.size() < MaximumPendingInputs &&
                         pending_input_bytes + input.size() <= transfer_memory->GetSize()) {
                         submission_id = next_submission_id++;
@@ -171,9 +183,12 @@ private:
                         consumed_size = input.size();
                         pending_input_bytes += input.size();
                         pending_inputs.push_back({std::vector<u8>{input.begin(), input.end()}, submission_id, timestamp, bool(packet[7] & 0xff)});
+                        lock.unlock();
+                        decode_cv.notify_all();
                         result = PumpOutput();
-                    } else if (submission_event) {
-                        submission_event->Clear(kernel);
+                    } else {
+                        lock.unlock();
+                        if (submission_event) submission_event->Clear(kernel);
                     }
                 }
             }
@@ -278,25 +293,28 @@ private:
         R_SUCCEED();
     }
 
+    // H.264 decodes synchronously, from PumpOutput. AV1 decodes on the decode worker.
     Result DecodePendingInput() {
         if (pending_inputs.empty()) R_SUCCEED();
-        if (h264_context) return DecodePendingH264();
-        const auto& input = pending_inputs.front();
+        return DecodePendingH264();
+    }
+
+    // Decodes one AV1 input on the decode worker (the only user of the libgav1 decoder while it
+    // runs; Stop and Flush wait for it to be idle before touching the decoder).
+    Result DecodeAv1(const PendingInput& input, std::optional<DecodedFrame>& out) {
         if (input.eos) {
             R_UNLESS(decoder->SignalEOS() == libgav1::kStatusOk, Kernel::ResultInvalidState);
             DecodedFrame frame{};
             frame.eos = true;
             frame.submission_id = input.submission_id;
             frame.timestamp = input.timestamp;
-            decoded_frames.push_back(std::move(frame));
-            pending_inputs.pop_front();
+            out = std::move(frame);
             R_SUCCEED();
         }
         const auto decode_start = std::chrono::steady_clock::now();
         const auto enqueue = decoder->EnqueueFrame(input.bytes.data(), input.bytes.size(), input.submission_id, nullptr);
         const libgav1::DecoderBuffer* output{};
         const auto dequeue = enqueue == libgav1::kStatusOk ? decoder->DequeueFrame(&output) : enqueue;
-        timing.decode += std::chrono::steady_clock::now() - decode_start;
         if (dequeue != libgav1::kStatusOk) {
             LOG_ERROR(Service_AM, "Native AV1 packet rejected: enqueue={}, dequeue={}", static_cast<int>(enqueue), static_cast<int>(dequeue));
             R_THROW(Kernel::ResultInvalidArgument);
@@ -318,26 +336,89 @@ private:
                     std::memcpy(frame.planes[plane].data() + row * row_bytes,
                         output->plane[plane] + row * output->stride[plane], row_bytes);
             }
+            frame.decode_time = std::chrono::steady_clock::now() - decode_start;
             LOG_DEBUG(Service_AM, "native AV1 decoded submission={}, dimensions={}x{}, depth={}, format={}, matrix={}, range={}",
                       frame.submission_id, frame.widths[0], frame.heights[0], frame.bitdepth, frame.format, frame.matrix, frame.full_range);
-            decoded_frames.push_back(std::move(frame));
+            out = std::move(frame);
         }
-        pending_input_bytes -= input.bytes.size();
-        pending_inputs.pop_front();
         R_SUCCEED();
     }
 
+    // AV1 decode worker: decodes submitted inputs ahead (up to MaximumDecodedAhead frames) so the
+    // game's IPC calls only convert and write a frame that is already decoded, instead of also
+    // spending ~13 ms per 1440p frame in libgav1.
+    void DecodeWorker(std::stop_token stop) {
+        Common::SetCurrentThreadName("NativeVideoDecode");
+        std::unique_lock lock{decode_mutex};
+        while (decode_cv.wait(lock, stop, [&] {
+            return !pending_inputs.empty() && !decode_error && decoded_frames.size() < MaximumDecodedAhead;
+        })) {
+            if (stop.stop_requested()) break;
+            PendingInput input = std::move(pending_inputs.front());
+            pending_inputs.pop_front();
+            pending_input_bytes -= input.bytes.size();
+            decode_busy = true;
+            lock.unlock();
+            std::optional<DecodedFrame> frame;
+            const Result result = DecodeAv1(input, frame);
+            lock.lock();
+            decode_busy = false;
+            if (result.IsError()) {
+                decode_error = result;
+            } else if (frame) {
+                decoded_frames.push_back(std::move(*frame));
+            }
+            decode_cv.notify_all();
+        }
+    }
+
+    // Stops AV1 decoding in flight: drops queued inputs and waits for the worker to finish the
+    // frame it is on, so the caller may use the libgav1 decoder. Holds the decode lock.
+    std::unique_lock<std::mutex> QuiesceAv1Decoding() {
+        std::unique_lock lock{decode_mutex};
+        pending_inputs.clear();
+        pending_input_bytes = 0;
+        decode_cv.wait(lock, [&] { return !decode_busy; });
+        decode_error.reset();
+        return lock;
+    }
+
     Result PumpOutput() {
-        while (!decoded_frames.empty() || !pending_inputs.empty()) {
+        while (true) {
             auto image = registered_images.end();
             for (auto it = registered_images.begin(); it != registered_images.end(); ++it)
                 if (it->available && (image == registered_images.end() || it->completion_value < image->completion_value)) image = it;
             if (image == registered_images.end()) break;
-            if (decoded_frames.empty()) {
-                R_TRY(DecodePendingInput());
-                if (decoded_frames.empty()) continue;
+            DecodedFrame frame;
+            if (h264_context) {
+                if (decoded_frames.empty()) {
+                    if (pending_inputs.empty()) break;
+                    R_TRY(DecodePendingInput());
+                    continue;
+                }
+                frame = std::move(decoded_frames.front());
+                decoded_frames.pop_front();
+            } else {
+                // The worker normally has the next frame ready. If it is still decoding it (or has
+                // inputs queued), wait: an image the game hands back must get its frame within this
+                // call, since the game then waits on the image's fence and may make no other call.
+                std::unique_lock lock{decode_mutex};
+                decode_cv.wait(lock, [&] {
+                    return !decoded_frames.empty() || decode_error || (pending_inputs.empty() && !decode_busy);
+                });
+                if (decode_error) {
+                    const Result error = *decode_error;
+                    decode_error.reset();
+                    decode_cv.notify_all();
+                    return error;
+                }
+                if (decoded_frames.empty()) break;
+                frame = std::move(decoded_frames.front());
+                decoded_frames.pop_front();
+                lock.unlock();
+                decode_cv.notify_all(); // Room to decode ahead again.
             }
-            const auto& frame = decoded_frames.front();
+            timing.decode += frame.decode_time;
             const auto& pool = *image->pool;
             const u32 pool_width = (pool.packed_dimensions & 0xffffU) + 1;
             const u32 pool_height = (pool.packed_dimensions >> 16) + 1;
@@ -477,11 +558,13 @@ private:
             system.Host1x().GetSyncpointManager().IncrementHost(*operation_syncpoint);
             LOG_DEBUG(Service_AM, "native AV1 output written image={}, dimensions={}x{}, threshold={}",
                       image->id, frame.widths[0], frame.heights[0], image->completion_value);
-            decoded_frames.pop_front();
         }
         if (submission_event) {
-            if (transfer_memory && pending_inputs.size() < MaximumPendingInputs &&
-                pending_input_bytes < transfer_memory->GetSize()) submission_event->Signal(kernel);
+            std::unique_lock lock{decode_mutex};
+            const bool room = transfer_memory && pending_inputs.size() < MaximumPendingInputs &&
+                              pending_input_bytes < transfer_memory->GetSize();
+            lock.unlock();
+            if (room) submission_event->Signal(kernel);
             else submission_event->Clear(kernel);
         }
         R_SUCCEED();
@@ -500,8 +583,11 @@ private:
                 result = ResultSuccess;
             }
         }
-        LOG_DEBUG(Service_AM, "native video output properties result={:#x}, image={}, eos={}, pending_frames={}, pending_inputs={}",
-                  result.raw, properties[0], properties[8], decoded_frames.size(), pending_inputs.size());
+        {
+            std::scoped_lock lock{decode_mutex};
+            LOG_DEBUG(Service_AM, "native video output properties result={:#x}, image={}, eos={}, pending_frames={}, pending_inputs={}",
+                      result.raw, properties[0], properties[8], decoded_frames.size(), pending_inputs.size());
+        }
         IPC::ResponseBuilder rb{ctx, 18};
         rb.Push(result.raw);
         for (u32 word : properties) rb.Push(word);
@@ -622,6 +708,8 @@ private:
                     DrainH264();
                     result = ResultSuccess;
                 } else {
+                    const auto lock = QuiesceAv1Decoding();
+                    decoded_frames.clear();
                     result = decoder->SignalEOS() == libgav1::kStatusOk ? ResultSuccess : Kernel::ResultInvalidState;
                 }
                 if (result.IsSuccess()) {
@@ -681,6 +769,7 @@ private:
                     // submitting and spin releasing images. Outputs written but not fetched give their
                     // image back to the decoder, at the end of the fence sequence (their old fence was
                     // already reached). libgav1 is reset so the next input may start a new sequence.
+                    const auto lock = QuiesceAv1Decoding();
                     for (const auto& properties : output_properties) {
                         const auto image = std::ranges::find(registered_images, properties[0], &RegisteredImage::id);
                         if (image != registered_images.end() && !image->available) {
@@ -860,6 +949,7 @@ private:
                                     transfer_memory = memory.GetPointerUnsafe();
                                     transfer_memory->Open(kernel);
                                     decoder = std::move(backend);
+                                    decode_worker = std::jthread{[this](std::stop_token stop) { DecodeWorker(stop); }};
                                     result = ResultSuccess;
                                 }
                             }
@@ -911,6 +1001,13 @@ private:
     KernelHelpers::ServiceContext context;
     Kernel::KEvent* submission_event{};
     std::shared_ptr<NativeVideoState> state;
+    // AV1 decode worker. decode_mutex guards pending_inputs, pending_input_bytes, decoded_frames,
+    // decode_busy and decode_error; the worker is the only user of the libgav1 decoder while busy.
+    std::mutex decode_mutex;
+    std::condition_variable_any decode_cv;
+    bool decode_busy{};
+    std::optional<Result> decode_error;
+    std::jthread decode_worker; // Last: stopped and joined first (Reset also joins it).
 };
 
 class INativeVideoContext final : public ServiceFramework<INativeVideoContext> {

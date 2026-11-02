@@ -173,5 +173,12 @@ atualizar o `upstream-patch` para o Duck912.
   4 threads; buffers RGBA/tiled reaproveitados entre frames (antes, ~30 MB alocados e zerados por frame). Harness
   fora do repositório: swizzle por faixas idêntico ao inteiro (9 tamanhos, 1-7 threads) e pipeline completo idêntico
   com reuso de buffers; swizzle 3,5 -> 1,2 ms aqui.
-- Próximos candidatos: decodificar adiantado numa thread (hoje bloqueia o jogo); a cópia DMA da imagem do vídeo
+- Resultado do usuário: "bastante tempo em 27 FPS", quedas a 20/15 menos frequentes.
+- Depois: decodificação AV1 numa thread própria (`DecodeWorker`), até 2 frames adiantados; a chamada do jogo só
+  converte/escreve, e espera a thread apenas se o próximo frame ainda estiver em decodificação (uma imagem devolvida
+  sempre recebe o frame na mesma chamada, senão o jogo poderia esperar a fence sem fazer outra chamada). `Flush`/`Stop`
+  esvaziam a fila e esperam a thread ficar ociosa antes de mexer no libgav1; `Reset` faz join. H.264 inalterado.
+  Verificado: `g++ -fsyntax-only -Wall` do arquivo (fmt 11 clonado) e um modelo do protocolo com TSan (300 rodadas
+  aleatórias com Flush e erros; sem corrida, deadlock ou frame fora de ordem).
+- Próximos candidatos: a cópia DMA da imagem do vídeo
   no lado da GPU (`SwizzleSubrectImpl<0,4>`/`<1,4>`, ~8,5% no perfil do usuário); threads do libgav1 (4).
