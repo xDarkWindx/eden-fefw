@@ -246,3 +246,13 @@ atualizar o `upstream-patch` para o Duck912.
   (teste: 23 mi handles idênticos, com e sem secundário, deslocamentos aleatórios) e reaproveitados enquanto os
   bytes não mudam, entrando na mesma tabela compacta. Fora: offsets que estouram 32 bits e a região do shim de
   syncpoints (onde `Read<u32>` não lê a memória). Decodificação no lugar (sem alocar por draw).
+- Resultado (praça): cbuf arrays reaproveitados 84,3% de ~13,7 mil/s; ~4,7 mil draws/s com tabelas; por draw
+  2970 elementos, 1390 pares, **1245 views únicas**. FPS inalterado. Conclusão: é um banco de texturas bindless
+  (~1250 texturas distintas, o mesmo de draw a draw). A compactação só corta pela metade; o custo restante é
+  resolver/preparar (`VisitImageView`/`PrepareImageView`) ~1250 views distintas por draw (~6 mi/s), que a versão
+  segura refaz por definição.
+- O que daria ganho: reaproveitar views e descritores entre draws com o mesmo banco, exigindo que o cache de
+  texturas garanta que nenhuma imagem foi criada/apagada/reescrita pela CPU/modificada como render target (hoje é o
+  `PrepareImageView` por draw que percebe isso) — risco de view apagada; ou um heap bindless persistente no Vulkan
+  (recompilador + cache de texturas). Ambos grandes. Branch não vai para o main sem A/B com ganho consistente
+  (`EDEN_NO_COMPACT_TEXTURE_TABLES=1` no mesmo build).
