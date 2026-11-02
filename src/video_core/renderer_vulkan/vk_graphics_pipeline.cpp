@@ -678,6 +678,78 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             ++sampler_count;
         }};
+        // Texture arrays indexed from a constant buffer (thousands of elements per draw in Fortune's
+        // Weave): the words are read in one block and the decoded handles reused while the words are
+        // unchanged, as for buffer-backed arrays. Decoding matches read_handle word for word.
+        static thread_local std::vector<u8> cbuf_words;
+        const auto cbuf_handles{[&](const Shader::TextureDescriptor& desc) -> const BufferTextureHandles* {
+            ASSERT(cbufs[desc.cbuf_index].enabled);
+            const u64 span = (u64{desc.count - 1} << desc.size_shift) + sizeof(u32);
+            const GPUVAddr primary = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
+            GPUVAddr secondary{};
+            if (desc.has_secondary) {
+                ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
+                secondary = cbufs[desc.secondary_cbuf_index].address + desc.secondary_cbuf_offset;
+            }
+            // read_handle computes offsets in 32 bits; keep to arrays where that cannot wrap, and away
+            // from the syncpoint shim (Read<u32> serves it from the syncpoint manager).
+            const u64 last_offset = u64{desc.cbuf_offset} + (u64{desc.count - 1} << desc.size_shift);
+            const u64 last_secondary = u64{desc.secondary_cbuf_offset} + (u64{desc.count - 1} << desc.size_shift);
+            if (last_offset > 0xffffffffull || (desc.has_secondary && last_secondary > 0xffffffffull) ||
+                gpu_memory->OverlapsSyncpointShim(primary, span) ||
+                (desc.has_secondary && gpu_memory->OverlapsSyncpointShim(secondary, span))) {
+                return nullptr;
+            }
+            cbuf_words.resize(desc.has_secondary ? span * 2 : span);
+            gpu_memory->ReadBlockUnsafe(primary, cbuf_words.data(), span);
+            if (desc.has_secondary) {
+                gpu_memory->ReadBlockUnsafe(secondary, cbuf_words.data() + span, span);
+            }
+            auto cached = std::ranges::find(buffer_texture_handles, &desc, &BufferTextureHandles::desc);
+            if (cached != buffer_texture_handles.end() && cached->cacheable &&
+                cached->count == desc.count && cached->via_header_index == via_header_index &&
+                cached->bytes == cbuf_words) {
+                if (stats) {
+                    ++compact_stats.cbuf_reused;
+                }
+                return &*cached;
+            }
+            if (stats) {
+                ++compact_stats.cbuf_decoded;
+            }
+            const auto word_at = [&](u64 offset) {
+                u32 word;
+                std::memcpy(&word, cbuf_words.data() + offset, sizeof(word));
+                return word;
+            };
+            // Decoded in place (nothing below throws), reusing the entry's storage: these arrays may
+            // change on every draw.
+            BufferTextureHandles& decoded = cached != buffer_texture_handles.end()
+                                                ? *cached
+                                                : buffer_texture_handles.emplace_back();
+            decoded.desc = &desc;
+            decoded.source = {};
+            decoded.count = desc.count;
+            decoded.via_header_index = via_header_index;
+            decoded.tic_limit = 0;
+            decoded.tsc_limit = 0;
+            decoded.cacheable = true;
+            decoded.handles.clear();
+            for (u32 index = 0; index < desc.count; ++index) {
+                const u64 offset = u64{index} << desc.size_shift;
+                if (desc.has_secondary) {
+                    const u32 lhs_raw{word_at(offset) << desc.shift_left};
+                    const u32 rhs_raw{word_at(span + offset) << desc.secondary_shift_left};
+                    decoded.handles.push_back(TexturePair(lhs_raw | rhs_raw, via_header_index));
+                } else {
+                    decoded.handles.push_back(TexturePair(word_at(offset), via_header_index));
+                }
+            }
+            decoded.excluded.assign(desc.count, 0);
+            decoded.bytes.assign(cbuf_words.begin(), cbuf_words.end());
+            decoded.compact.Build(decoded.handles, decoded.excluded);
+            return &decoded;
+        }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
@@ -699,6 +771,31 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         for (const auto& desc : info.texture_descriptors) {
+            if (compact_tables && !desc.buffer_source.enabled && desc.count >= 16) {
+                if (const BufferTextureHandles* const decoded = cbuf_handles(desc)) {
+                    const VideoCommon::CompactTextureTable& table = decoded->compact;
+                    compact_blocks.push_back(VideoCommon::CompactTextureBlock{
+                        .table = &table,
+                        .first_view = view_count,
+                        .first_sampler = sampler_count,
+                        .view_ids = compact_view_ids.size(),
+                        .sampler_ids = compact_sampler_ids.size(),
+                    });
+                    for (const u32 tsc_index : table.unique_tscs) {
+                        compact_sampler_ids.push_back(resolve_sampler(tsc_index));
+                    }
+                    compact_view_ids.resize(compact_view_ids.size() + table.unique_tics.size());
+                    view_count += desc.count;
+                    sampler_count += desc.count;
+                    if (views.size() < view_count) {
+                        views.resize(view_count);
+                    }
+                    if (samplers.size() < sampler_count) {
+                        samplers.resize(sampler_count);
+                    }
+                    continue;
+                }
+            }
             if (desc.buffer_source.enabled && desc.count > 0) {
                 const BufferTextureHandles& decoded = buffer_handles(desc);
                 if (compact_tables && decoded.compact.element_tics.size() == desc.count) {

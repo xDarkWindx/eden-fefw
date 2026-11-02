@@ -69,6 +69,13 @@ public:
     void Write(GPUVAddr addr, T data);
 
     [[nodiscard]] u8* GetPointer(GPUVAddr addr);
+
+    /// Whether [addr, addr + size) overlaps the native syncpoint shim, whose words Read<u32> returns
+    /// from the syncpoint manager rather than from memory.
+    [[nodiscard]] bool OverlapsSyncpointShim(GPUVAddr addr, u64 size) const noexcept {
+        const GPUVAddr shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        return shim != 0 && addr < shim + 192 * sizeof(u32) && shim < addr + size;
+    }
     [[nodiscard]] const u8* GetPointer(GPUVAddr addr) const;
 
     template <typename T>

@@ -417,7 +417,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             return SampledImage{vk_image_view, vk_sampler, texture_cache.IsRescaling(image_view)};
         };
         // A compact table: one SampledImage per distinct pair, then one copy per element.
-        if (compact && desc.buffer_source.enabled && compact->next < compact->blocks.size() &&
+        if (compact && compact->next < compact->blocks.size() &&
             compact->blocks[compact->next].first_view == static_cast<size_t>(views - compact->views_base) &&
             compact->blocks[compact->next].table->element_tics.size() == desc.count) {
             const auto& block = compact->blocks[compact->next++];

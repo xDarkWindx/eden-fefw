@@ -238,3 +238,11 @@ atualizar o `upstream-patch` para o Duck912.
   tem fatias de 0x80000 entradas por frame e o jogo escreve >1 mi; no estouro, `WaitWorker` (a thread de trás
   espera o worker do Vulkan esvaziar). Agora, logo após essa espera (nada aponta para a fila), a fatia dobra, até
   4x (~400 MB no total com 8 fatias de 24 B por entrada; antes ~100 MB). Só cresce em jogos que estouram.
+- Estatísticas na praça (`EDEN_TEXTURE_TABLE_STATS=1`): ~11 mil draws/s, só ~14/s com arrays em buffer (768
+  registros, 49 pares, 3 views únicas; 0% reaproveitados). O overflow sumiu com a fila maior, sem mudar o FPS.
+  O log de overflow mostrava `reserve=3112`: os pipelines comuns ligam ~3100 descritores por draw, de arrays de
+  textura indexados por constant buffer (não em buffer), que passavam pelo caminho elemento a elemento.
+- Estendido: arrays de constant buffer com 16+ elementos são lidos em bloco, decodificados como o `read_handle`
+  (teste: 23 mi handles idênticos, com e sem secundário, deslocamentos aleatórios) e reaproveitados enquanto os
+  bytes não mudam, entrando na mesma tabela compacta. Fora: offsets que estouram 32 bits e a região do shim de
+  syncpoints (onde `Read<u32>` não lê a memória). Decodificação no lugar (sem alocar por draw).

@@ -217,6 +217,8 @@ struct CompactTextureStats {
     u64 draws{};
     u64 decoded{};  ///< Buffer texture arrays decoded again (records changed)
     u64 reused{};   ///< Buffer texture arrays whose decoded handles were reused
+    u64 cbuf_decoded{}; ///< Constant buffer texture arrays decoded again
+    u64 cbuf_reused{};  ///< Constant buffer texture arrays whose decoded handles were reused
     u64 table_draws{};
     u64 elements{};
     u64 pairs{};
@@ -235,11 +237,14 @@ struct CompactTextureStats {
         }
         const double seconds = std::chrono::duration<double>(now - window).count();
         LOG_INFO(Render_Vulkan,
-                 "Texture tables: {:.0f} draws/s, {:.0f} with tables/s; arrays reused {:.1f}% of {:.0f}/s; "
-                 "per table draw {:.0f} elements, {:.1f} pairs, {:.1f} unique views",
+                 "Texture tables: {:.0f} draws/s, {:.0f} with tables/s; buffer arrays reused {:.1f}% of {:.0f}/s; "
+                 "cbuf arrays reused {:.1f}% of {:.0f}/s; per table draw {:.0f} elements, {:.1f} pairs, "
+                 "{:.1f} unique views",
                  draws / seconds, table_draws / seconds,
                  decoded + reused ? reused * 100.0 / double(decoded + reused) : 0.0,
                  (decoded + reused) / seconds,
+                 cbuf_decoded + cbuf_reused ? cbuf_reused * 100.0 / double(cbuf_decoded + cbuf_reused) : 0.0,
+                 (cbuf_decoded + cbuf_reused) / seconds,
                  table_draws ? double(elements) / table_draws : 0.0,
                  table_draws ? double(pairs) / table_draws : 0.0,
                  table_draws ? double(unique_views) / table_draws : 0.0);
