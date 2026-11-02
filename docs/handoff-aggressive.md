@@ -142,7 +142,8 @@ Feitas no próprio `perf/compact-texture-tables` (branch da sessão), um commit 
 ### Primeira medição (praça, reuso ligado)
 
 - Verificação: 0 diferenças em ~38 mil conferências/s; views reusadas 99%, samplers 99,7%.
-- Reuso ligado: views 95-98%, descritores 45-60%, ~17 FPS (sem ganho claro; falta o A/B com `EDEN_NO_HEAP_REUSE=1`).
+- Reuso ligado: views 95-98%, descritores 45-60%. No pior ponto da praça: **16-18 FPS, antes 13-14** (relato do
+  usuário; A/B com `EDEN_NO_HEAP_REUSE=1` no mesmo exe ainda não feito).
 - **Correção dos números anteriores:** antes deste commit, `compact_stats` era `static thread_local` dentro do
   template `ConfigureImpl<Spec>`, ou seja, um contador por instanciação; os "~11 mil draws/s" eram de uma só. Agora
   o contador é único: são **~45-52 mil draws/s**, dos quais só ~1,6-2,6 mil (3-5%) usam o banco. O banco não é o
