@@ -778,14 +778,37 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if (desc.has_secondary) {
                 gpu_memory->ReadBlockUnsafe(secondary, cbuf_words.data() + span, span);
             }
-            auto cached = std::ranges::find(buffer_texture_handles, &desc, &BufferTextureHandles::desc);
-            if (cached != buffer_texture_handles.end() && cached->cacheable &&
-                cached->count == desc.count && cached->via_header_index == via_header_index &&
-                cached->bytes == cbuf_words) {
+            // A few decoded variants per descriptor: draws of one pipeline often alternate between
+            // some arrays (same bank, other materials), and a rebuild also loses the table's written
+            // descriptors.
+            constexpr size_t MAX_VARIANTS = 3;
+            BufferTextureHandles* match{};
+            BufferTextureHandles* victim{};
+            size_t variants{};
+            u64 latest_use{};
+            for (auto& entry : buffer_texture_handles) {
+                if (entry.desc != &desc) {
+                    continue;
+                }
+                ++variants;
+                latest_use = (std::max)(latest_use, entry.last_use);
+                if (!match && entry.cacheable && entry.count == desc.count &&
+                    entry.via_header_index == via_header_index && entry.bytes == cbuf_words) {
+                    match = &entry;
+                }
+                if (!victim || entry.last_use < victim->last_use) {
+                    victim = &entry;
+                }
+            }
+            if (match) {
                 if (stats) {
                     ++compact_stats.cbuf_reused;
+                    if (match->last_use != latest_use) {
+                        ++compact_stats.cbuf_variant_reused;
+                    }
                 }
-                return &*cached;
+                match->last_use = ++buffer_texture_use;
+                return match;
             }
             if (stats) {
                 ++compact_stats.cbuf_decoded;
@@ -797,9 +820,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             };
             // Decoded in place (nothing below throws), reusing the entry's storage: these arrays may
             // change on every draw.
-            BufferTextureHandles& decoded = cached != buffer_texture_handles.end()
-                                                ? *cached
-                                                : buffer_texture_handles.emplace_back();
+            BufferTextureHandles& decoded = variants < MAX_VARIANTS || !victim
+                                                ? buffer_texture_handles.emplace_back()
+                                                : *victim;
+            decoded.last_use = ++buffer_texture_use;
             decoded.desc = &desc;
             decoded.source = {};
             decoded.count = desc.count;

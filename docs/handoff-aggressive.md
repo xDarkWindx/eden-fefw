@@ -161,3 +161,13 @@ Feitas no próprio `perf/compact-texture-tables` (branch da sessão), um commit 
   `PushImageDescriptors`, captura nativa, tabelas com exclusão). O caminho compacto dos descritores não lia essas
   cópias; o `CheckFeedbackLoop` recebe `compact_fill` + os ids distintos dos blocos (mesmo conjunto de ids).
   Harness: expansão adiada igual à imediata, conjunto de ids igual ao dos elementos.
+
+### Perfil depois do corte da expansão (+1 a 3 FPS confirmados)
+
+- `ConfigureImpl` 40,5%. `prepare_stage` 14,8% (`PushImageDescriptors` 8,5%, `BindHostStageBuffers` 6,3%),
+  `UpdateGraphicsBuffers` 6,9%, `Build` 3,8%, `vcruntime` 3,5%, `IsRegionGpuModified` 3,4% (chamado por
+  `InnerInvalidation`, `AccelerateInlineToMemory`, `OnCachedWrite`, `WriteMemory`: escritas inline/CPU, não por
+  draw), `ntdll` 3,3%, `GetSubmappedRange` 2,7%, `GpuToCpuAddress` 2,3%. Nada acima de ~8%: o custo está espalhado.
+- Corte seguinte: até 3 variantes decodificadas por descritor de array de cbuf (LRU), em vez de redecodificar e
+  refazer o `Build` (e perder os descritores escritos da tabela) sempre que o array alterna. Estatística nova:
+  "cbuf array variants served X% of reuses".

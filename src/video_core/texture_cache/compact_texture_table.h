@@ -289,6 +289,7 @@ struct CompactTextureStats {
     u64 reused{};   ///< Buffer texture arrays whose decoded handles were reused
     u64 cbuf_decoded{}; ///< Constant buffer texture arrays decoded again
     u64 cbuf_reused{};  ///< Constant buffer texture arrays whose decoded handles were reused
+    u64 cbuf_variant_reused{}; ///< ... from a variant other than the last one used
     u64 table_draws{};
     u64 elements{};
     u64 pairs{};
@@ -346,12 +347,12 @@ struct CompactTextureStats {
         const u64 view_lookups = view_hits + view_misses + view_stale_table + view_stale_generation +
                                  view_stale_memory;
         LOG_INFO(Render_Vulkan,
-                 "Texture banks: views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
+                 "Texture banks: cbuf array variants served {:.1f}% of reuses; views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
                  "generation {:.0f}/s, entries {:.0f}/s, unstored {:.0f}/s, retries {:.0f}/s); "
                  "samplers reused {:.1f}% of {:.0f}/s; descriptors reused {:.1f}% of {:.0f}/s; "
                  "{:.1f} unique samplers, {:.1f} alias prepares and {:.0f} snapshot bytes per reuse; "
                  "verify {:.0f}/s, mismatches {}",
-                 rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
+                 rate(cbuf_variant_reused, cbuf_reused), rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
                  per_second(view_stale_table), per_second(view_stale_generation),
                  per_second(view_stale_memory), per_second(view_unstored), per_second(view_retries),
                  rate(sampler_hits, sampler_hits + sampler_misses),

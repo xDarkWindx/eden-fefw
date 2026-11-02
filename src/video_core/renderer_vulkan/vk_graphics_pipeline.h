@@ -206,9 +206,11 @@ private:
         std::vector<std::pair<u32, u32>> handles;
         std::vector<u8> excluded;
         VideoCommon::CompactTextureTable compact; ///< handles/excluded as distinct pairs
+        u64 last_use{}; ///< Constant buffer arrays keep a few variants per descriptor (LRU)
     };
     /// A deque: draws keep pointers to these (compact blocks) while other arrays are added.
     std::deque<BufferTextureHandles> buffer_texture_handles;
+    u64 buffer_texture_use{};
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
