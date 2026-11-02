@@ -88,13 +88,14 @@ public:
             return;
         }
         if (MustDelaySignal()) {
-            // The guest could read GPU-written data once this signals: run it with the next
-            // fence, after the data is in guest memory (SmartFences).
-            uncommitted_operations.emplace_back(std::move(func));
-            uncommitted_delayed = true;
-        } else {
-            func();
+            // The guest could read GPU-written data once this signals: a fence of its own, which
+            // runs it after the data is in guest memory, as with the balanced behaviour
+            // (SmartFences). Holding it for a later fence instead left the guest GPU's own
+            // readers of the release (dependencies, conditional rendering) waiting: black screen.
+            SignalFence(std::move(func));
+            return;
         }
+        func();
         coalesced_pending = true;
         ++coalesced_count;
     }
@@ -117,12 +118,10 @@ public:
         // still waiting for its data, to keep the guest's order) waits for the data to reach
         // guest memory, as every signal does with the balanced behaviour.
         const bool smart_delay = !setting_delay && SmartFences() &&
-                                 (should_flush || uncommitted_delayed ||
-                                  delayed_batches.load(std::memory_order_acquire) != 0);
+                                 (should_flush || delayed_batches.load(std::memory_order_acquire) != 0);
         const bool delay_fence = setting_delay || smart_delay;
         if (smart_delay) {
             // Counted until this fence's operations ran: the last of them lowers it.
-            uncommitted_delayed = false;
             delayed_batches.fetch_add(1, std::memory_order_acq_rel);
             uncommitted_operations.emplace_back(std::move(func));
             func = [this] { delayed_batches.fetch_sub(1, std::memory_order_acq_rel); };
@@ -140,7 +139,6 @@ public:
         }
         pending_operations.emplace_back(std::move(uncommitted_operations));
         uncommitted_operations.clear();
-        uncommitted_delayed = false;
         QueueFence(new_fence);
         if (!delay_fence) {
             func();
@@ -163,10 +161,6 @@ public:
     }
 
     void WaitPendingFences([[maybe_unused]] bool force) {
-        if (uncommitted_delayed) {
-            // Signals the guest waits for are held for a fence: create it now.
-            SignalFence([] {});
-        }
         if (coalesced_pending) {
             // Every list end would otherwise cost a fence and a submit; sync points and the
             // regular fences cover whatever is still pending when they arrive.
@@ -342,12 +336,9 @@ private:
         if (!SmartFences()) {
             return false;
         }
-        return uncommitted_delayed || delayed_batches.load(std::memory_order_acquire) != 0 ||
-               ShouldFlush();
+        return delayed_batches.load(std::memory_order_acquire) != 0 || ShouldFlush();
     }
 
-    /// Operations waiting in uncommitted_operations for the next fence are signals.
-    bool uncommitted_delayed{};
     /// Fences whose signals wait for their GPU-written data, not released yet.
     std::atomic<u32> delayed_batches{};
 
