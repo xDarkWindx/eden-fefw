@@ -193,3 +193,14 @@ atualizar o `upstream-patch` para o Duck912.
   o FE usa o decodificador nativo: descartado.
 - Trazido do PokeDinner 63244330 (Takoroka): `KSpinLock` (trava do agendador emulado) vira trava futex de 3 estados
   com ~128 pausas antes de dormir, em vez de `std::mutex`. Teste de estresse (8 threads, TSan e -O2) ok.
+
+## Cena do palácio de Megaira (~20 FPS, muitos NPCs)
+
+- Perfil por thread: a de trás (`GpuSplit::Execute`) a 99%, com `ConfigureImpl<SimpleStorageSpec>` em 61%
+  (`FillImageViews` 11,9%, `PushImageDescriptors` 10,9%, leitura de descritores 7,6%, ~30% não identificado).
+  A da frente passava 75-90% em `Drain` girando com `SwitchToThread`.
+- "Sync Memory Operations" desligado: sem mudança (esperado; o limite é a thread de trás).
+- Feito: `Drain`/`WaitForSpace` giram um pouco e depois dormem em `consumed` (`atomic::wait`); a de trás acorda com
+  `StoreConsumed` se `front_waiting`. Par de Dekker seq_cst; modelo com TSan (200 mil esperas) ok. Objetivo: tirar a
+  frente do núcleo físico da de trás (SMT) e liberar CPU.
+- Próximo: Chamador/Receptor do `ConfigureImpl` na thread de trás para achar os ~30% restantes.

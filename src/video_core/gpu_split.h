@@ -155,6 +155,12 @@ private:
         }
     }
     void WaitForSpace(size_t words);
+    /// Front: spins up to spin_limit pauses, then sleeps until the back moves `consumed`, until
+    /// done() (which reads consumed_cache) holds.
+    template <typename Done>
+    void WaitForBack(u32 spin_limit, Done&& done);
+    /// Back: publishes its read position and wakes the front if it sleeps on it.
+    void StoreConsumed(u64 position);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -188,6 +194,8 @@ private:
     alignas(64) std::atomic<u64> published{};
     alignas(64) std::atomic<u64> consumed{};
     alignas(64) std::atomic<bool> back_waiting{};
+    // The front sleeps on `consumed` once Drain/WaitForSpace have spun a while; the back wakes it.
+    alignas(64) std::atomic<bool> front_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

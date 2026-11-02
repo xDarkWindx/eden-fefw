@@ -156,16 +156,38 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    WaitForBack(4096, [&] { return write_position + words - consumed_cache <= RingWords; });
+}
+
+template <typename Done>
+void GpuSplit::WaitForBack(u32 spin_limit, Done&& done) {
+    // Spin briefly (the back often catches up within microseconds), then sleep on `consumed`
+    // until the back moves it. Yield-spinning here kept a host thread busy for as long as the back
+    // took, often on the same physical core as the back thread itself, which is the bottleneck
+    // in draw-heavy scenes. front_waiting/consumed form a Dekker pair with the back's
+    // consumed-store/front_waiting-load (all seq_cst), so a wake-up is never missed.
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
-        if (write_position + words - consumed_cache <= RingWords) {
+        if (done()) {
             return;
         }
-        if (spins < 4096) {
+        if (spins < spin_limit) {
             Pause();
-        } else {
-            std::this_thread::yield();
+            continue;
         }
+        front_waiting.store(true, std::memory_order_seq_cst);
+        consumed_cache = consumed.load(std::memory_order_seq_cst);
+        if (!done()) {
+            consumed.wait(consumed_cache, std::memory_order_acquire);
+        }
+        front_waiting.store(false, std::memory_order_relaxed);
+    }
+}
+
+void GpuSplit::StoreConsumed(u64 position) {
+    consumed.store(position, std::memory_order_seq_cst);
+    if (front_waiting.load(std::memory_order_seq_cst)) {
+        consumed.notify_one();
     }
 }
 
@@ -191,18 +213,8 @@ void GpuSplit::Drain() {
         return;
     }
     Publish();
-    for (u32 spins = 0;; ++spins) {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        if (consumed_cache == write_position) {
-            publish_every = 8;
-            return;
-        }
-        if (spins < 16384) {
-            Pause();
-        } else {
-            std::this_thread::yield();
-        }
-    }
+    WaitForBack(16384, [&] { return consumed_cache == write_position; });
+    publish_every = 8;
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
@@ -331,11 +343,11 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
             if (read_position - last_store >= 4096 && read_position != available) {
-                consumed.store(read_position, std::memory_order_release);
+                StoreConsumed(read_position);
                 last_store = read_position;
             }
         }
-        consumed.store(read_position, std::memory_order_release);
+        StoreConsumed(read_position);
     }
 }
 
