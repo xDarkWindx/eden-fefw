@@ -427,10 +427,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                      state.enabled, state.coarse, maxwell3d->regs.reg_array[0x2cc / 4]);
     }
 
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
-    boost::container::small_vector<size_t, 64> excluded_views;
-    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
-    // Sized up front and written in place: buffer-backed arrays add hundreds of records per draw.
+    // Kept between draws (ConfigureImpl does not nest): buffer-backed arrays add hundreds of
+    // records per draw, past the inline capacity of a small_vector, which then allocated on the
+    // heap for every draw. Sized up front and written in place.
+    static thread_local std::vector<VideoCommon::ImageViewInOut> views;
+    static thread_local std::vector<size_t> excluded_views;
+    static thread_local std::vector<VideoCommon::SamplerId> samplers;
+    views.clear();
+    excluded_views.clear();
+    samplers.clear();
     views.resize(num_image_elements);
     size_t view_count{};
     const auto add_view{[&](const VideoCommon::ImageViewInOut& view) LAMBDA_FORCEINLINE {
@@ -580,6 +585,73 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             return TexturePair(read_handle_word(addr), via_header_index);
         }};
+        // Buffer-backed texture array: validates, downloads and reads the records (read_handle at
+        // index 0, as before), then reuses the handles and exclusions decoded at the last draw when
+        // the records and every other input are unchanged. Records outside the bytes read (a
+        // clipped span) are read from memory, so such arrays are always decoded again.
+        const auto buffer_handles{[&](const Shader::TextureDescriptor& desc) -> const BufferTextureHandles& {
+            const auto& source = desc.buffer_source;
+            const auto first = read_handle(desc, 0);
+            const u32 tic_limit = regs.tex_header.limit;
+            const u32 tsc_limit = regs.tex_sampler.limit;
+            auto cached = std::ranges::find(buffer_texture_handles, &desc, &BufferTextureHandles::desc);
+            if (cached != buffer_texture_handles.end() && cached->cacheable && cached->source == source &&
+                cached->count == desc.count && cached->via_header_index == via_header_index &&
+                cached->tic_limit == tic_limit && cached->tsc_limit == tsc_limit &&
+                cached->bytes == buffer_texture_bytes) {
+                return *cached;
+            }
+            BufferTextureHandles decoded;
+            decoded.desc = &desc;
+            decoded.source = source;
+            decoded.count = desc.count;
+            decoded.via_header_index = via_header_index;
+            decoded.tic_limit = tic_limit;
+            decoded.tsc_limit = tsc_limit;
+            decoded.cacheable = u64{desc.count} * source.stride + (std::max)(source.offset, source.stride) + 8 <=
+                                buffer_texture_bytes.size();
+            decoded.handles.reserve(desc.count);
+            decoded.handles.push_back(first);
+            for (u32 index = 1; index < desc.count; ++index) {
+                decoded.handles.push_back(read_handle(desc, index));
+            }
+            decoded.excluded.assign(desc.count, 0);
+            for (u32 index = 0; index < desc.count; ++index) {
+                for (const auto& exclusion : source.exclusions) {
+                    if (!exclusion.mask) continue;
+                    if (exclusion.offset > source.stride || source.stride - exclusion.offset < sizeof(u32))
+                        throw Shader::RuntimeError("Invalid buffer texture exclusion field");
+                    const u32 word = read_buffer_texture_word(u64{index} * source.stride + exclusion.offset);
+                    if (exclusion.Matches(word)) {
+                        decoded.excluded[index] = 1;
+                        break;
+                    }
+                }
+            }
+            decoded.bytes = buffer_texture_bytes;
+            if (cached != buffer_texture_handles.end()) {
+                *cached = std::move(decoded);
+                return *cached;
+            }
+            return buffer_texture_handles.emplace_back(std::move(decoded));
+        }};
+        const auto add_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
+            VideoCommon::SamplerId sampler;
+            if (const auto* const known = dedupe_samplers ? sampler_memo.Find(tsc_index) : nullptr) {
+                sampler = *known;
+            } else {
+                sampler = texture_cache.GetSamplerId(tsc_index, false);
+                if (dedupe_samplers) {
+                    sampler_memo.Store(tsc_index, sampler);
+                }
+            }
+            if (sampler_count < samplers.size()) {
+                samplers[sampler_count] = sampler;
+            } else {
+                samplers.push_back(sampler);
+            }
+            ++sampler_count;
+        }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
@@ -601,38 +673,21 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         for (const auto& desc : info.texture_descriptors) {
+            if (desc.buffer_source.enabled && desc.count > 0) {
+                const BufferTextureHandles& decoded = buffer_handles(desc);
+                for (u32 index = 0; index < desc.count; ++index) {
+                    if (decoded.excluded[index]) {
+                        excluded_views.push_back(view_count);
+                    }
+                    add_view({decoded.handles[index].first});
+                    add_sampler(decoded.handles[index].second);
+                }
+                continue;
+            }
             for (u32 index = 0; index < desc.count; ++index) {
                 const auto handle{read_handle(desc, index)};
-                if (desc.buffer_source.enabled) {
-                    const auto& source = desc.buffer_source;
-                    for (const auto& exclusion : source.exclusions) {
-                        if (!exclusion.mask) continue;
-                        if (exclusion.offset > source.stride || source.stride - exclusion.offset < sizeof(u32))
-                            throw Shader::RuntimeError("Invalid buffer texture exclusion field");
-                        const u32 word = read_buffer_texture_word(u64{index} * source.stride + exclusion.offset);
-                        if (exclusion.Matches(word)) {
-                            excluded_views.push_back(view_count);
-                            break;
-                        }
-                    }
-                }
                 add_view({handle.first});
-
-                VideoCommon::SamplerId sampler;
-                if (const auto* const known = dedupe_samplers ? sampler_memo.Find(handle.second) : nullptr) {
-                    sampler = *known;
-                } else {
-                    sampler = texture_cache.GetSamplerId(handle.second, false);
-                    if (dedupe_samplers) {
-                        sampler_memo.Store(handle.second, sampler);
-                    }
-                }
-                if (sampler_count < samplers.size()) {
-                    samplers[sampler_count] = sampler;
-                } else {
-                    samplers.push_back(sampler);
-                }
-                ++sampler_count;
+                add_sampler(handle.second);
             }
         }
         if constexpr (Spec::has_images) {

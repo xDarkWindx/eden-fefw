@@ -204,3 +204,11 @@ atualizar o `upstream-patch` para o Duck912.
   `StoreConsumed` se `front_waiting`. Par de Dekker seq_cst; modelo com TSan (200 mil esperas) ok. Objetivo: tirar a
   frente do núcleo físico da de trás (SMT) e liberar CPU.
 - Próximo: Chamador/Receptor do `ConfigureImpl` na thread de trás para achar os ~30% restantes.
+- Linha a linha no `ConfigureImpl` (palácio): `FillImageViews` 18%, leitura dos handles (lambdas) 33%,
+  `UpdateGraphicsBuffers` 8%, `views.resize` 3% (small_vector de 64 estourava e alocava no heap a cada draw).
+- Versão segura feita: por pipeline, os handles e exclusões decodificados de cada array de texturas em buffer ficam
+  guardados (`BufferTextureHandles`) e são reusados quando os bytes dos registros e as outras entradas (fonte, count,
+  via_header_index, limites TIC/TSC) não mudaram; spans cortados (leituras fora dos bytes) nunca são reusados.
+  `FillImageViews`/`GetSamplerId` continuam rodando a cada draw (a tabela de descritores pode mudar sem aviso).
+  Vetores do `ConfigureImpl` viraram `thread_local` reaproveitados. `g++ -fsyntax-only -Wall` limpo (VMA e
+  Vulkan-Headers clonados). A versão agressiva (pular a reconstrução dos descritores) segue não iniciada.

@@ -188,6 +188,23 @@ private:
     std::shared_ptr<const GraphicsShaderModules> spv_modules;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
+
+    /// Handles of a buffer-backed texture array as read at its last draw (see ConfigureImpl).
+    /// Pure function of the inputs kept here, so a draw whose handle records are byte-identical
+    /// reuses them; the texture and sampler lookups still run on every draw.
+    struct BufferTextureHandles {
+        const Shader::TextureDescriptor* desc{};
+        Shader::BufferTextureSource source{};
+        u32 count{};
+        bool via_header_index{};
+        u32 tic_limit{};
+        u32 tsc_limit{};
+        bool cacheable{};
+        std::vector<u8> bytes;
+        std::vector<std::pair<u32, u32>> handles;
+        std::vector<u8> excluded;
+    };
+    std::vector<BufferTextureHandles> buffer_texture_handles;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
     VideoCommon::UniformBufferSizes uniform_buffer_sizes{};
     u32 num_descriptor_entries{};
