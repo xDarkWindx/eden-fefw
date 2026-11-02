@@ -181,6 +181,10 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
+    /// As above, for the views plus more_ids (views bound without an element-by-element copy, see
+    /// compact_texture_table.h). Only which ids are bound matters, not how often.
+    void CheckFeedbackLoop(std::span<const ImageViewInOut> views, std::span<const ImageViewId> more_ids);
+
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
 

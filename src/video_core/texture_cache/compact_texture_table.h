@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -60,6 +61,7 @@ struct CompactTextureTable {
     std::vector<u32> unique_tscs;   ///< Distinct TSC indices, first-occurrence order
     std::vector<Pair> pairs;        ///< Distinct pairs, first-occurrence order
     std::vector<u32> element_pairs; ///< Pair of every element
+    bool has_excluded{};            ///< Some pair samples a null view (exclusion field)
     u64 tics_hash{};                ///< Of unique_tics (finds the resolved bank)
     u64 tscs_hash{};                ///< Of unique_tscs
 
@@ -111,6 +113,7 @@ struct CompactTextureTable {
             element_tics.push_back(tic);
             element_pairs.push_back(pair_slot);
         }
+        has_excluded = std::ranges::any_of(pairs, &Pair::excluded);
         tics_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_tics.data()),
                                        unique_tics.size() * sizeof(u32));
         tscs_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_tscs.data()),
@@ -199,9 +202,31 @@ template <typename View>
     return next_block == blocks.size();
 }
 
-/// After the lookup: gives back the ids of the views outside the blocks, keeps each block's resolved
-/// ids in view_ids, and writes every block element's view (excluded ones get the null view) and
-/// sampler, so views and samplers read as if bound element by element.
+/// Writes every block element's view (excluded ones get the null view) and sampler, so views and
+/// samplers read as if bound element by element. view_ids must hold the blocks' resolved ids.
+template <typename View>
+void ExpandBlockElements(std::span<View> views, std::span<SamplerId> samplers,
+                         std::span<const CompactTextureBlock> blocks,
+                         std::span<const ImageViewId> view_ids,
+                         std::span<const SamplerId> sampler_ids) {
+    for (const CompactTextureBlock& block : blocks) {
+        const CompactTextureTable& table = *block.table;
+        for (size_t element = 0; element < table.element_tics.size(); ++element) {
+            const auto& pair = table.pairs[table.element_pairs[element]];
+            views[block.first_view + element] = View{
+                .index = table.element_tics[element],
+                .blacklist = false,
+                .id = pair.excluded ? NULL_IMAGE_VIEW_ID : view_ids[block.view_ids + pair.tic_slot],
+            };
+            samplers[block.first_sampler + element] = sampler_ids[block.sampler_ids + pair.tsc_slot];
+        }
+    }
+}
+
+/// After the lookup: gives back the ids of the views outside the blocks and keeps each block's
+/// resolved ids in view_ids. With elements, also expands the blocks (ExpandBlockElements); without,
+/// the blocks' ranges of views and samplers are left as they were (the compact descriptor path does
+/// not read them; expand before anything else does).
 template <typename View>
 void ExpandViewLookups(std::span<View> views, std::span<SamplerId> samplers,
                               std::span<const CompactTextureBlock> blocks,
@@ -209,7 +234,7 @@ void ExpandViewLookups(std::span<View> views, std::span<SamplerId> samplers,
                               std::span<const size_t> positions,
                               std::span<const size_t> block_fill_offsets,
                               std::span<ImageViewId> view_ids,
-                              std::span<const SamplerId> sampler_ids) {
+                              std::span<const SamplerId> sampler_ids, bool elements = true) {
     size_t entry = 0;
     size_t position = 0;
     for (size_t block_index = 0; block_index <= blocks.size(); ++block_index) {
@@ -227,15 +252,9 @@ void ExpandViewLookups(std::span<View> views, std::span<SamplerId> samplers,
                 view_ids[block.view_ids + slot] = fill[entry++].id;
             }
         }
-        for (size_t element = 0; element < table.element_tics.size(); ++element) {
-            const auto& pair = table.pairs[table.element_pairs[element]];
-            views[block.first_view + element] = View{
-                .index = table.element_tics[element],
-                .blacklist = false,
-                .id = pair.excluded ? NULL_IMAGE_VIEW_ID : view_ids[block.view_ids + pair.tic_slot],
-            };
-            samplers[block.first_sampler + element] = sampler_ids[block.sampler_ids + pair.tsc_slot];
-        }
+    }
+    if (elements) {
+        ExpandBlockElements<View>(views, samplers, blocks, view_ids, sampler_ids);
     }
 }
 

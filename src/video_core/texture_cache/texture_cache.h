@@ -266,6 +266,12 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
 
 template <class P>
 void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
+    CheckFeedbackLoop(views, {});
+}
+
+template <class P>
+void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views,
+                                        std::span<const ImageViewId> more_ids) {
     if (!Settings::values.barrier_feedback_loops.GetValue()) {
         return;
     }
@@ -287,36 +293,38 @@ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
     const u32 depth_bit = 1u << NUM_RT;
     const bool depth_active = (rt_active_mask & depth_bit) != 0;
 
+    // True if sampling this view needs the barrier.
+    const auto needs_barrier = [&](ImageViewId view_id) {
+        if (!view_id) {
+            return false;
+        }
+        for (size_t i = 0; i < 8; ++i) {
+            if ((rt_active_mask & (1u << i)) && view_id == render_targets.color_buffer_ids[i]) {
+                return false;
+            }
+        }
+        if (depth_active && view_id == render_targets.depth_buffer_id) {
+            return false;
+        }
+        const ImageId view_image_id = slot_image_views[view_id].image_id;
+        for (size_t i = 0; i < 8; ++i) {
+            if ((rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i]) {
+                return false;
+            }
+        }
+        return depth_active && view_image_id == rt_depth_image_id;
+    };
     const bool requires_barrier = [&] {
         for (const auto& view : views) {
-            if (!view.id) {
-                continue;
-            }
-
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view.id == render_targets.color_buffer_ids[i];
-                if (is_continue)
-                    continue;
-            }
-
-            if (depth_active && view.id == render_targets.depth_buffer_id)
-                continue;
-
-            const ImageId view_image_id = slot_image_views[view.id].image_id;
-            {
-                bool is_continue = false;
-                for (size_t i = 0; i < 8; ++i)
-                    is_continue |= (rt_active_mask & (1u << i)) && view_image_id == rt_image_id[i];
-                if (is_continue)
-                    continue;
-            }
-            if (depth_active && view_image_id == rt_depth_image_id) {
+            if (needs_barrier(view.id)) {
                 return true;
             }
         }
-
+        for (const ImageViewId view_id : more_ids) {
+            if (needs_barrier(view_id)) {
+                return true;
+            }
+        }
         return false;
     }();
 

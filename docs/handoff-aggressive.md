@@ -150,3 +150,14 @@ Feitas no próprio `perf/compact-texture-tables` (branch da sessão), um commit 
   gargalo principal; o custo está espalhado pelo overhead por draw. Snapshot de ~900-1400 bytes por banco: só
   ~30-45 dos ~1000-1400 índices TIC do banco estão dentro do limite da tabela (o resto vira view nula).
 - Próximo passo: perfil por thread (thread de trás) com o reuso ligado, para ver o que domina por draw.
+
+### Perfil com o reuso ligado (praça) e o corte seguinte
+
+- `ConfigureImpl` 48% da thread de trás. Linha mais quente: `ExpandViewLookups` com **15,25%** (escrever as ~3000
+  views/samplers de cada bloco elemento a elemento). `PushImageDescriptors` 7,25%, `BindHostStageBuffers` ~5,4%,
+  `UpdateGraphicsBuffers` 5,1%, `CompactTextureTable::Build` 3,3%, `IsRegionGpuModified` 3% (chamador ainda
+  desconhecido), `TryReuseViewBank` 1,5%.
+- Corte: os elementos dos blocos não são mais escritos (`ExpandBlockElements` só sob demanda: diagnóstico no erro do
+  `PushImageDescriptors`, captura nativa, tabelas com exclusão). O caminho compacto dos descritores não lia essas
+  cópias; o `CheckFeedbackLoop` recebe `compact_fill` + os ids distintos dos blocos (mesmo conjunto de ids).
+  Harness: expansão adiada igual à imediata, conjunto de ids igual ao dos elementos.

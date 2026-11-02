@@ -450,6 +450,17 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     compact_view_ids.clear();
     compact_sampler_ids.clear();
     size_t view_count{};
+    // Whether views/samplers hold every compact block element (see ExpandBlockElements). Writing
+    // them cost ~15% of the GPU thread in the city plaza and only diagnostics read them; the
+    // feedback loop check takes the blocks' distinct ids instead.
+    bool blocks_expanded{true};
+    const auto expand_blocks{[&] {
+        if (!blocks_expanded) {
+            VideoCommon::ExpandBlockElements<VideoCommon::ImageViewInOut>(
+                views, samplers, compact_blocks, compact_view_ids, compact_sampler_ids);
+            blocks_expanded = true;
+        }
+    }};
     const auto add_view{[&](const VideoCommon::ImageViewInOut& view) LAMBDA_FORCEINLINE {
         if (view_count < views.size()) {
             views[view_count] = view;
@@ -924,6 +935,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 any_reused = true;
             }
         }
+        // A null element of a table with exclusions would be a distinct id of its own: those
+        // (buffer-backed arrays, rare) are expanded as before.
+        blocks_expanded = std::ranges::any_of(compact_blocks, [](const auto& block) {
+            return block.table->has_excluded;
+        });
         const auto resolve_views{[&] {
             // Same lookups in the same order as for the elements (first occurrences), minus the
             // repeats and the reused banks.
@@ -935,7 +951,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                          Spec::has_images);
             VideoCommon::ExpandViewLookups<VideoCommon::ImageViewInOut>(
                 views, samplers, compact_blocks, compact_fill, compact_positions, compact_fill_offsets,
-                compact_view_ids, compact_sampler_ids);
+                compact_view_ids, compact_sampler_ids, blocks_expanded);
         }};
         const u64 generation = texture_cache.BankGeneration();
         resolve_views();
@@ -1021,6 +1037,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                   (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
                   (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1],
                   maxwell3d->draw_manager.draw_state.vertex_buffer.count);
+    }
+    if (VideoCommon::NativeTextureRequestsEnabled()) {
+        expand_blocks(); // Native captures read the elements
     }
     const bool capture_draw = VideoCommon::NativeTextureRequestsEnabled() && WantDrawCapture(regs);
     if (texture_cache.CaptureNativeGpuTexture(std::span(views.data(), views.size())) || capture_draw) {
@@ -1170,6 +1189,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                  samplers_it, views_it,
                                  compact_blocks.empty() ? nullptr : &compact_binding);
         } catch (const Shader::Exception&) {
+            expand_blocks(); // The evidence below reads the elements
             static u32 diagnostic_count{};
             if (diagnostic_count++ < 8) {
                 if (std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) {
@@ -1260,8 +1280,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         buffer_cache.any_buffer_uploaded = false;
     }
     texture_cache.UpdateRenderTargets(false);
-    texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
-                                                                                 views.size()});
+    if (blocks_expanded) {
+        texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{views.data(),
+                                                                                     views.size()});
+    } else {
+        // The views outside the blocks and the blocks' lookups (compact_fill), plus every block's
+        // resolved ids (reused blocks are not in compact_fill): the same set of ids as the elements.
+        texture_cache.CheckFeedbackLoop(std::span<const VideoCommon::ImageViewInOut>{compact_fill.data(),
+                                                                                     compact_fill.size()},
+                                        compact_view_ids);
+    }
     if (IsBuilt() && !pipeline) {
         return false;
     }
