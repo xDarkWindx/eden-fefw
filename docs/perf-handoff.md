@@ -234,3 +234,7 @@ atualizar o `upstream-patch` para o Duck912.
   -fsyntax-only -Wall` de vk_graphics_pipeline.cpp e vk_compute_pipeline.cpp limpos.
 - Interruptores: `EDEN_NO_COMPACT_TEXTURE_TABLES=1` (caminho antigo, mesmo build, A/B);
   `EDEN_TEXTURE_TABLE_STATS=1` (log a cada 4 s: draws/s, arrays reaproveitados, registros e pares por draw).
+- Achado no log do usuário: `Payload overflow` 2x por frame (`vk_update_descriptor.cpp`). A fila de descritores
+  tem fatias de 0x80000 entradas por frame e o jogo escreve >1 mi; no estouro, `WaitWorker` (a thread de trás
+  espera o worker do Vulkan esvaziar). Agora, logo após essa espera (nada aponta para a fila), a fatia dobra, até
+  4x (~400 MB no total com 8 fatias de 24 B por entrada; antes ~100 MB). Só cresce em jogos que estouram.
