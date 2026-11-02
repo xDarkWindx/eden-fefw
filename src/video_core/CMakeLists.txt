@@ -100,6 +100,7 @@ add_library(video_core STATIC
     native_semaphore.h
     gpu_split.cpp
     gpu_split.h
+    gpu_written_pages.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
