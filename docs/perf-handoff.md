@@ -183,3 +183,13 @@ atualizar o `upstream-patch` para o Duck912.
 - Resultado do usuário com a thread de decodificação (c960d20): seleção de personagem em 30 FPS quase sempre.
 - Próximos candidatos: a cópia DMA da imagem do vídeo
   no lado da GPU (`SwizzleSubrectImpl<0,4>`/`<1,4>`, ~8,5% no perfil do usuário); threads do libgav1 (4).
+
+## Cena de diálogo (Hong Hua, campo vermelho): ~26-27 FPS e estalos no áudio (2026-11-02)
+
+- Perfil do usuário com símbolos da Microsoft: kernel 54%; `RtlpAcquireSRWLockExclusiveContended` 19%,
+  `RtlBackoff` 15%, `NtDelayExecution` 22%: disputa de trava e sono, não trabalho.
+- `EDEN_GPU_SPLIT=0` ficou um pouco pior: o split não é a causa (o `Drain` só mostra a frente esperando a de trás).
+- O sleep de 600 us em leituras de `IStorage` (`service.cpp`) só liga com `nvhost_nvdec` aberto (vídeo do Switch 1);
+  o FE usa o decodificador nativo: descartado.
+- Trazido do PokeDinner 63244330 (Takoroka): `KSpinLock` (trava do agendador emulado) vira trava futex de 3 estados
+  com ~128 pausas antes de dormir, em vez de `std::mutex`. Teste de estresse (8 threads, TSan e -O2) ok.
