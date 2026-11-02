@@ -164,3 +164,14 @@ atualizar o `upstream-patch` para o Duck912.
   cai a zero com o jogo rodando a 30 (não verificado).
 - PokeDinner/Eglantine não têm decodificador de vídeo nativo (outra arquitetura de Switch 2); não há o que portar.
 - Se continuar: filtro de log `*:Info Service.AM:Debug` e procurar `native video` antes do crash.
+
+## Vídeo da seleção de personagem: custo por frame (2026-11-02)
+
+- Medido no log (1440p AV1): decode 12,8 + conversão 5,4 + swizzle 4,4 + escrita 1,3 ms ≈ 24 ms por frame, tudo
+  síncrono dentro da chamada IPC do jogo (`ReleaseImage`/`Submit` -> `PumpOutput`).
+- Feito: conversão e swizzle juntos por faixas de 128 linhas (um bloco do block-linear é contínuo na imagem), nas
+  4 threads; buffers RGBA/tiled reaproveitados entre frames (antes, ~30 MB alocados e zerados por frame). Harness
+  fora do repositório: swizzle por faixas idêntico ao inteiro (9 tamanhos, 1-7 threads) e pipeline completo idêntico
+  com reuso de buffers; swizzle 3,5 -> 1,2 ms aqui.
+- Próximos candidatos: decodificar adiantado numa thread (hoje bloqueia o jogo); a cópia DMA da imagem do vídeo
+  no lado da GPU (`SwizzleSubrectImpl<0,4>`/`<1,4>`, ~8,5% no perfil do usuário); threads do libgav1 (4).

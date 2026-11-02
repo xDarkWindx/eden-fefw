@@ -373,35 +373,77 @@ private:
                     total += now - stage_start;
                     stage_start = now;
                 };
-                std::vector<u8> rgba(size_t{pool.layout.row_bytes} * pool_height);
+                // The RGBA and tiled buffers are kept between frames (two ~15 MB buffers per 1440p
+                // frame were allocated, zeroed and page-faulted in every time). They are cleared
+                // only when the frame or pool size changes, so padding stays zero as before.
+                const u32 row_bytes = pool.layout.row_bytes;
+                const size_t rgba_bytes = size_t{row_bytes} * pool_height;
+                const std::array<u32, 3> buffer_shape{frame.widths[0], frame.heights[0], pool.layout.image_bytes};
+                if (rgba_buffer.size() != rgba_bytes || tiled_buffer.size() != pool.layout.image_bytes ||
+                    buffer_shape != rgba_buffer_shape) {
+                    rgba_buffer.assign(rgba_bytes, 0);
+                    tiled_buffer.assign(pool.layout.image_bytes, 0);
+                    rgba_buffer_shape = buffer_shape;
+                }
+                std::vector<u8>& rgba = rgba_buffer;
+                std::vector<u8>& tiled = tiled_buffer;
                 const NativeVideoYuv709Table table{frame.full_range};
                 const auto convert_rows = [&](u32 first, u32 last) {
                     for (u32 y = first; y < last; ++y) {
                         const u8* luma = frame.planes[0].data() + size_t{y} * frame.widths[0];
                         const u8* cb = frame.planes[1].data() + size_t{y / 2} * frame.widths[1];
                         const u8* cr = frame.planes[2].data() + size_t{y / 2} * frame.widths[2];
-                        u8* out = rgba.data() + size_t{y} * pool.layout.row_bytes;
+                        u8* out = rgba.data() + size_t{y} * row_bytes;
                         for (u32 x = 0; x < frame.widths[0]; ++x)
                             table.Convert(luma[x], cb[x / 2], cr[x / 2], out + size_t{x} * 4);
                     }
                 };
-                // A 2560x1440 frame is ~3.7M pixels; split rows so conversion fits in a 30 fps frame.
+                // Block-linear rows come in blocks of 8 << 4 = 128 rows, and each block row is
+                // contiguous in the tiled image (row_bytes * 128 bytes), so bands of whole block
+                // rows convert and swizzle independently: each worker converts its rows and then
+                // swizzles them, and the swizzle no longer runs on one thread. Byte-identical to
+                // swizzling the whole image (checked for several sizes and thread counts).
                 constexpr u32 ConversionThreads = 4;
-                const u32 band = (frame.heights[0] + ConversionThreads - 1) / ConversionThreads;
-                {
+                constexpr u32 BlockHeightLog2 = 4;
+                constexpr u32 RowsPerBlock = 8U << BlockHeightLog2;
+                const u32 block_rows = (pool_height + RowsPerBlock - 1) / RowsPerBlock;
+                const size_t block_row_bytes = size_t{row_bytes} * RowsPerBlock;
+                const bool banded = row_bytes % Tegra::Texture::GOB_SIZE_X == 0 &&
+                                    size_t{block_rows} * block_row_bytes <= tiled.size();
+                const u32 blocks_per_worker = (block_rows + ConversionThreads - 1) / ConversionThreads;
+                const auto convert_and_swizzle = [&](u32 first_block, u32 last_block) {
+                    if (first_block >= last_block) return;
+                    const u32 first = first_block * RowsPerBlock;
+                    const u32 last = (std::min)(last_block * RowsPerBlock, pool_height);
+                    convert_rows((std::min)(first, frame.heights[0]), (std::min)(last, frame.heights[0]));
+                    Tegra::Texture::SwizzleTexture(
+                        std::span<u8>{tiled}.subspan(first_block * block_row_bytes),
+                        std::span<const u8>{rgba}.subspan(size_t{first} * row_bytes, size_t{last - first} * row_bytes),
+                        4, row_bytes / 4, last - first, 1, BlockHeightLog2, 0, 1, true);
+                };
+                if (banded) {
                     std::array<std::jthread, ConversionThreads - 1> workers;
                     for (u32 i = 1; i < ConversionThreads; ++i) {
-                        const u32 first = (std::min)(i * band, frame.heights[0]);
-                        const u32 last = (std::min)(first + band, frame.heights[0]);
-                        workers[i - 1] = std::jthread{convert_rows, first, last};
+                        workers[i - 1] = std::jthread{convert_and_swizzle,
+                                                      (std::min)(i * blocks_per_worker, block_rows),
+                                                      (std::min)((i + 1) * blocks_per_worker, block_rows)};
                     }
-                    convert_rows(0, (std::min)(band, frame.heights[0]));
+                    convert_and_swizzle(0, (std::min)(blocks_per_worker, block_rows));
+                } else {
+                    const u32 band = (frame.heights[0] + ConversionThreads - 1) / ConversionThreads;
+                    {
+                        std::array<std::jthread, ConversionThreads - 1> workers;
+                        for (u32 i = 1; i < ConversionThreads; ++i) {
+                            const u32 first = (std::min)(i * band, frame.heights[0]);
+                            const u32 last = (std::min)(first + band, frame.heights[0]);
+                            workers[i - 1] = std::jthread{convert_rows, first, last};
+                        }
+                        convert_rows(0, (std::min)(band, frame.heights[0]));
+                    }
+                    Tegra::Texture::SwizzleTexture(tiled, rgba, 4, row_bytes / 4, pool_height, 1,
+                                                   BlockHeightLog2, 0, 1, true);
                 }
                 lap(timing.convert);
-                std::vector<u8> tiled(pool.layout.image_bytes);
-                Tegra::Texture::SwizzleTexture(tiled, rgba, 4, pool.layout.row_bytes / 4,
-                                               pool_height, 1, 4, 0, 1, true);
-                lap(timing.swizzle);
                 const u64 offset = u64{image->index} * pool.layout.image_stride;
                 system.GPU().InvalidateRegion(pool.device_address + offset, tiled.size());
                 R_UNLESS(process->GetMemory().WriteBlock(pool.address + offset, tiled.data(), tiled.size()), Kernel::ResultInvalidAddress);
@@ -411,12 +453,11 @@ private:
                 using ms = std::chrono::duration<double, std::milli>;
                 const auto now = std::chrono::steady_clock::now();
                 LOG_INFO(Service_AM,
-                         "Native video {}x{}: {:.1f} ms/frame wall, decode {:.1f}, convert {:.1f}, "
-                         "swizzle {:.1f}, write {:.1f} (averages over 60 frames)",
+                         "Native video {}x{}: {:.1f} ms/frame wall, decode {:.1f}, convert+swizzle {:.1f}, "
+                         "write {:.1f} (averages over 60 frames)",
                          frame.widths[0], frame.heights[0],
                          ms(now - timing.window_start).count() / 60, ms(timing.decode).count() / 60,
-                         ms(timing.convert).count() / 60, ms(timing.swizzle).count() / 60,
-                         ms(timing.write).count() / 60);
+                         ms(timing.convert).count() / 60, ms(timing.write).count() / 60);
                 timing = {};
                 timing.window_start = now;
             }
@@ -842,9 +883,12 @@ private:
     };
     struct Timing {
         std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
-        std::chrono::steady_clock::duration decode{}, convert{}, swizzle{}, write{};
+        std::chrono::steady_clock::duration decode{}, convert{}, write{};
         u32 frames{};
     } timing;
+    std::vector<u8> rgba_buffer; // Reused between frames, see PumpOutput.
+    std::vector<u8> tiled_buffer;
+    std::array<u32, 3> rgba_buffer_shape{};
     std::optional<u32> operation_syncpoint;
     u64 next_completion_value{};
     std::vector<RegisteredImage> registered_images;
