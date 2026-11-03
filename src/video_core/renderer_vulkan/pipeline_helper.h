@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <optional>
 
 #include <boost/container/small_vector.hpp>
@@ -428,17 +430,55 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             constexpr size_t words_per_entry = sizeof(DescriptorUpdateEntry) / sizeof(u64);
             const u64 generation = texture_cache.BankGeneration();
             const bool reusable = block.view_stamp != 0 && block.sampler_stamp != 0;
-            const bool cached = reusable && cache.view_stamp == block.view_stamp &&
-                                cache.sampler_stamp == block.sampler_stamp &&
-                                cache.generation == generation &&
-                                cache.words.size() == size_t{desc.count} * words_per_entry;
+            const bool same_banks = reusable && cache.view_stamp == block.view_stamp &&
+                                    cache.sampler_stamp == block.sampler_stamp &&
+                                    cache.generation == generation &&
+                                    cache.words.size() == size_t{desc.count} * words_per_entry &&
+                                    cache.keys.size() == desc.count;
             auto& stats = VideoCommon::CompactTextureStats::Get();
-            if (cached) {
+            bool patched = false;
+            if (same_banks && !cache.current) {
+                // The array changed but not its banks: rewrite only the elements whose texture or
+                // sampler changed.
+                static thread_local std::vector<u8> pairs_made;
+                const size_t rewritten = VideoCommon::PatchCompactElements<SampledImage>(
+                    block, compact->view_ids, compact->sampler_ids, cache.keys, pair_images,
+                    pairs_made,
+                    [&](VideoCommon::ImageViewId image_view_id, VideoCommon::SamplerId sampler_id,
+                        u32 guest_index) {
+                        return make_sampled(image_view_id, sampler_id, 0, guest_index);
+                    },
+                    [&](size_t element, const SampledImage& image) {
+                        // As AddSampledImage writes it, padding zeroed.
+                        std::array<u64, words_per_entry> entry{};
+                        const VkDescriptorImageInfo info{
+                            .sampler = image.sampler,
+                            .imageView = image.view,
+                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                        };
+                        std::memcpy(entry.data(), &info.sampler, sizeof(info.sampler));
+                        std::memcpy(entry.data() + 1, &info.imageView, sizeof(info.imageView));
+                        std::memcpy(entry.data() + 2, &info.imageLayout, sizeof(info.imageLayout));
+                        std::memcpy(cache.words.data() + element * words_per_entry, entry.data(),
+                                    sizeof(entry));
+                        const u8 rescaled = image.rescaled ? 1 : 0;
+                        cache.rescaled_count = cache.rescaled_count - cache.rescaled_elements[element] + rescaled;
+                        cache.rescaled_elements[element] = rescaled;
+                    });
+                cache.rescaled = cache.rescaled_count != 0;
+                cache.current = true;
+                patched = true;
+                ++stats.descriptor_patches;
+                stats.patched_elements += rewritten;
+            }
+            if (same_banks) {
                 guest_descriptor_queue.AddEntries(cache.words.data(), desc.count);
                 views += desc.count;
                 samplers += desc.count;
                 rescaling.PushTexture(cache.rescaled);
-                ++stats.descriptor_hits;
+                if (!patched) {
+                    ++stats.descriptor_hits;
+                }
                 continue;
             }
             const DescriptorUpdateEntry* const first_entry = guest_descriptor_queue.Cursor();
@@ -456,12 +496,23 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             rescaling.PushTexture(is_rescaled);
             if (reusable) {
                 ++stats.descriptor_misses;
+                const auto& table = *block.table;
                 cache.view_stamp = block.view_stamp;
                 cache.sampler_stamp = block.sampler_stamp;
                 cache.generation = generation;
                 cache.rescaled = is_rescaled;
+                cache.current = true;
                 cache.words.resize(size_t{desc.count} * words_per_entry);
                 std::memcpy(cache.words.data(), first_entry, size_t{desc.count} * sizeof(DescriptorUpdateEntry));
+                cache.keys.resize(desc.count);
+                cache.rescaled_elements.resize(desc.count);
+                cache.rescaled_count = 0;
+                for (size_t element = 0; element < desc.count; ++element) {
+                    cache.keys[element] = table.ElementKey(element);
+                    const u8 rescaled = pair_images[table.element_pairs[element]].rescaled ? 1 : 0;
+                    cache.rescaled_elements[element] = rescaled;
+                    cache.rescaled_count += rescaled;
+                }
             }
             continue;
         }

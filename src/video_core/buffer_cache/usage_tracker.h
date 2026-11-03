@@ -110,7 +110,13 @@ private:
     static constexpr Range NO_RANGE{(std::numeric_limits<u64>::max)(), 0};
 
     std::vector<u64> pages;
-    std::array<Range, 4> recent{NO_RANGE, NO_RANGE, NO_RANGE, NO_RANGE};
+    /// A draw can bind more than four ranges of one buffer (storage buffers carved from one pool):
+    /// with too few slots each draw forgot the others and filled their pages again.
+    std::array<Range, 16> recent = [] {
+        std::array<Range, 16> ranges;
+        ranges.fill(NO_RANGE);
+        return ranges;
+    }();
     size_t recent_next{};
     size_t dirty_begin{(std::numeric_limits<size_t>::max)()};
     size_t dirty_end{};

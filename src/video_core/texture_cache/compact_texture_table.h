@@ -47,15 +47,29 @@ struct CompactTextureTable {
 
     /// The descriptors last written for this table, with what named them: the resolved banks
     /// (stamps, see texture_bank_reuse.h) and the texture cache generation. Raw bytes of the
-    /// backend's descriptor entries. Emptied by Build.
+    /// backend's descriptor entries. Build keeps them (current = false): when the array changes
+    /// but the banks do not, the elements whose key did not change keep their entries
+    /// (PatchCompactElements).
     struct DescriptorCache {
         u64 view_stamp{};
         u64 sampler_stamp{};
         u64 generation{};
         bool rescaled{};
+        bool current{}; ///< Written for the table as it is now
         std::vector<u64> words;
+        std::vector<u64> keys;             ///< ElementKey of every element the words were written for
+        std::vector<u8> rescaled_elements; ///< Whether each element's image is rescaled
+        u32 rescaled_count{};
     };
     mutable DescriptorCache descriptor_cache;
+
+    /// What an element's descriptor depends on once the banks are resolved: its TIC and TSC indices
+    /// (both well below 2^31, being handle fields) and whether it is excluded.
+    [[nodiscard]] u64 ElementKey(size_t element) const noexcept {
+        const Pair& pair = pairs[element_pairs[element]];
+        return u64{element_tics[element]} | (u64{unique_tscs[pair.tsc_slot]} << 32) |
+               (pair.excluded ? (u64{1} << 63) : 0);
+    }
 
     /// handles: (TIC, TSC) of every element; excluded: non-zero for excluded elements.
     /// Direct-mapped like the per-draw lookup memos, so a build costs about what binding the elements
@@ -98,9 +112,7 @@ struct CompactTextureTable {
                                        unique_tics.size() * sizeof(u32));
         tscs_hash = Common::CityHash64(reinterpret_cast<const char*>(unique_tscs.data()),
                                        unique_tscs.size() * sizeof(u32));
-        descriptor_cache.view_stamp = 0;
-        descriptor_cache.sampler_stamp = 0;
-        descriptor_cache.words.clear();
+        descriptor_cache.current = false;
     }
 
 private:
@@ -261,6 +273,41 @@ bool PushCompactTextureBlock(const CompactTextureBlock& block, std::span<const I
     return rescaled;
 }
 
+/// Brings a block's cached per-element results up to date with its table: for every element whose
+/// ElementKey differs from keys[element], write(element, image of its pair) runs and keys[element]
+/// is updated. make(view_id, sampler_id, guest_index) runs once per distinct pair needed, as in
+/// PushCompactTextureBlock. Only valid when keys were written for the same resolved banks (the
+/// same TIC and TSC indices then resolve to the same ids). Returns the elements rewritten.
+template <typename Image, typename Make, typename Write>
+size_t PatchCompactElements(const CompactTextureBlock& block, std::span<const ImageViewId> view_ids,
+                            std::span<const SamplerId> sampler_ids, std::span<u64> keys,
+                            std::vector<Image>& scratch, std::vector<u8>& made, Make&& make,
+                            Write&& write) {
+    const CompactTextureTable& table = *block.table;
+    scratch.resize(table.pairs.size());
+    made.assign(table.pairs.size(), 0);
+    size_t rewritten = 0;
+    for (size_t element = 0; element < table.element_tics.size(); ++element) {
+        const u64 key = table.ElementKey(element);
+        if (keys[element] == key) {
+            continue;
+        }
+        const u32 pair_index = table.element_pairs[element];
+        if (!made[pair_index]) {
+            const auto& pair = table.pairs[pair_index];
+            const ImageViewId view_id =
+                pair.excluded ? NULL_IMAGE_VIEW_ID : view_ids[block.view_ids + pair.tic_slot];
+            scratch[pair_index] = make(view_id, sampler_ids[block.sampler_ids + pair.tsc_slot],
+                                       table.unique_tics[pair.tic_slot]);
+            made[pair_index] = 1;
+        }
+        write(element, scratch[pair_index]);
+        keys[element] = key;
+        ++rewritten;
+    }
+    return rewritten;
+}
+
 /// EDEN_TEXTURE_TABLE_STATS: logs every 4 s how many draws used compact tables and how much they
 /// folded (elements bound vs distinct pairs prepared).
 struct CompactTextureStats {
@@ -269,7 +316,6 @@ struct CompactTextureStats {
     u64 reused{};   ///< Buffer texture arrays whose decoded handles were reused
     u64 cbuf_decoded{}; ///< Constant buffer texture arrays decoded again
     u64 cbuf_reused{};  ///< Constant buffer texture arrays whose decoded handles were reused
-    u64 cbuf_variant_reused{}; ///< ... from a variant other than the last one used
     u64 table_draws{};
     u64 elements{};
     u64 pairs{};
@@ -289,6 +335,8 @@ struct CompactTextureStats {
     u64 sampler_misses{};
     u64 descriptor_hits{};
     u64 descriptor_misses{};
+    u64 descriptor_patches{};     ///< Changed arrays whose unchanged elements kept their entries
+    u64 patched_elements{};       ///< Elements rewritten by those patches
     // Draw path (buffer cache and draw manager).
     u64 range_hits{};          ///< Virtual range lookups served from the cache
     u64 range_misses{};        ///< ... walked again (GetSubmappedRange)
@@ -330,17 +378,20 @@ struct CompactTextureStats {
         const u64 view_lookups = view_hits + view_misses + view_stale_table + view_stale_generation +
                                  view_stale_memory;
         LOG_INFO(Render_Vulkan,
-                 "Texture banks: cbuf array variants served {:.1f}% of reuses; views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
+                 "Texture banks: views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
                  "generation {:.0f}/s, entries {:.0f}/s, unstored {:.0f}/s, retries {:.0f}/s); "
-                 "samplers reused {:.1f}% of {:.0f}/s; descriptors reused {:.1f}% of {:.0f}/s; "
+                 "samplers reused {:.1f}% of {:.0f}/s; descriptors reused {:.1f}% of {:.0f}/s "
+                 "(patched {:.1f}%, {:.0f} elements rewritten per patch); "
                  "{:.1f} unique samplers, {:.1f} alias prepares and {:.0f} snapshot bytes per reuse",
-                 rate(cbuf_variant_reused, cbuf_reused), rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
+                 rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
                  per_second(view_stale_table), per_second(view_stale_generation),
                  per_second(view_stale_memory), per_second(view_unstored), per_second(view_retries),
                  rate(sampler_hits, sampler_hits + sampler_misses),
                  per_second(sampler_hits + sampler_misses),
-                 rate(descriptor_hits, descriptor_hits + descriptor_misses),
-                 per_second(descriptor_hits + descriptor_misses),
+                 rate(descriptor_hits, descriptor_hits + descriptor_misses + descriptor_patches),
+                 per_second(descriptor_hits + descriptor_misses + descriptor_patches),
+                 rate(descriptor_patches, descriptor_hits + descriptor_misses + descriptor_patches),
+                 descriptor_patches ? double(patched_elements) / descriptor_patches : 0.0,
                  table_draws ? double(unique_samplers) / table_draws : 0.0,
                  view_hits ? double(alias_prepares) / view_hits : 0.0,
                  view_hits ? double(snapshot_bytes) / view_hits : 0.0);
