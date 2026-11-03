@@ -23,7 +23,6 @@
 #include "core/device_memory.h"
 #include "core/hle/kernel/board/nintendo/nx/k_system_control.h"
 #include "core/device_memory_manager.h"
-#include "core/hle/dlss_trace.h"
 #include "core/memory.h"
 
 namespace Core {
@@ -379,7 +378,6 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
     if (!ptr) [[unlikely]] {
         return;
     }
-    Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::Write<T>", ptr, sizeof(T));
     std::memcpy(ptr, &value, sizeof(T));
 }
 
@@ -476,7 +474,6 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
                 current_vaddr, address, size);
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
-            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {
@@ -537,7 +534,6 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
                 current_vaddr, address, size);
         },
         [&](size_t copy_amount, u8* const dst_ptr) {
-            Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::WriteBlock", dst_ptr, copy_amount);
             std::memcpy(dst_ptr, src_pointer, copy_amount);
         },
         [&](const std::size_t copy_amount) {

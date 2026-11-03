@@ -18,7 +18,6 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
-#include "core/hle/dlss_trace.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -282,13 +281,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         streamer->SetAccumulationValue(query_base->value);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
-            Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer_timestamp, sizeof(timestamp));
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer, sizeof(query_base->value));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
             u32 value = static_cast<u32>(query_base->value);
-            Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer, sizeof(value));
             std::memcpy(pointer, &value, sizeof(value));
         }
         if (!is_synced) [[likely]] {
@@ -302,12 +298,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);
-                Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer_timestamp, sizeof(timestamp));
                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-                Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer, sizeof(value));
                 std::memcpy(pointer, &value, sizeof(value));
             } else {
-                Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer, sizeof(payload));
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
             streamer->Free(new_query_id);
@@ -575,12 +568,10 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
-            Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", ptr, sizeof(query_base->value));
             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
             return false;
         }
         u32 value_l = static_cast<u32>(query_base->value);
-        Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", ptr, sizeof(value_l));
         std::memcpy(ptr, &value_l, sizeof(value_l));
         return false;
     }

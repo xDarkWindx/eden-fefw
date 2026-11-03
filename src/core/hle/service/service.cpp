@@ -28,79 +28,6 @@
 
 namespace Service {
 
-namespace {
-struct DiagRequest {
-    u64 id;
-    std::string service;
-    u32 command;
-    u64 since_ms;
-    bool running;
-};
-std::mutex g_diag_mutex;
-std::vector<DiagRequest> g_diag_requests;
-std::atomic<u64> g_diag_next_id{1};
-
-bool DiagServiceEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_DIAG_SVC");
-        return value != nullptr && *value == '1';
-    }();
-    return enabled;
-}
-
-u64 DiagServiceNowMs() {
-    return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count());
-}
-
-// Registers a request while it waits for the service lock and while it runs. No-op when unset.
-class DiagRequestScope {
-public:
-    DiagRequestScope(std::string_view service, u32 command) {
-        if (!DiagServiceEnabled()) {
-            return;
-        }
-        m_id = g_diag_next_id++;
-        const std::scoped_lock lock{g_diag_mutex};
-        g_diag_requests.push_back({m_id, std::string{service}, command, DiagServiceNowMs(), false});
-    }
-    ~DiagRequestScope() {
-        if (m_id == 0) {
-            return;
-        }
-        const std::scoped_lock lock{g_diag_mutex};
-        std::erase_if(g_diag_requests, [this](const DiagRequest& r) { return r.id == m_id; });
-    }
-    void Acquired() {
-        if (m_id == 0) {
-            return;
-        }
-        const std::scoped_lock lock{g_diag_mutex};
-        for (auto& r : g_diag_requests) {
-            if (r.id == m_id) {
-                r.running = true;
-                r.since_ms = DiagServiceNowMs();
-            }
-        }
-    }
-
-private:
-    u64 m_id{};
-};
-} // namespace
-
-std::string DescribeInFlightRequests() {
-    std::string text;
-    const std::scoped_lock lock{g_diag_mutex};
-    const u64 now = DiagServiceNowMs();
-    for (const auto& r : g_diag_requests) {
-        text += fmt::format("hle request {} cmd={} {} for {} ms\n", r.service, r.command,
-                            r.running ? "RUNNING" : "waiting for service lock", now - r.since_ms);
-    }
-    return text;
-}
-
 /// @brief Creates a function string for logging, complete with the name (or header code, depending
 /// on what's passed in) the port name, and all the cmd_buf arguments.
 [[maybe_unused]] static std::string MakeFunctionString(std::string_view name, std::string_view port_name, const u32* cmd_buf) {
@@ -211,9 +138,7 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
 
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
-    DiagRequestScope diag_request{GetServiceName(), ctx.GetCommand()};
     const auto guard = LockService();
-    diag_request.Acquired();
 
     Result result = ResultSuccess;
 

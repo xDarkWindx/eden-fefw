@@ -16,7 +16,6 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
-#include "core/hle/dlss_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -303,7 +302,6 @@ template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
-        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::Write<T>", page_pointer, sizeof(T));
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -460,7 +458,6 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
         u8* physical = memory.GetPointer<u8>(dev_addr_base);
-        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
         std::memcpy(physical, src_buffer, copy_amount);
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -473,7 +470,6 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         } else {
             u8* physical = memory.GetPointer<u8>(dev_addr_base);
-            Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
         std::memcpy(physical, src_buffer, copy_amount);
         }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;

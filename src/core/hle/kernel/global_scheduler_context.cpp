@@ -52,22 +52,8 @@ void GlobalSchedulerContext::PreemptThreads(KernelCore& kernel) noexcept {
         59,
     };
     ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
-    // Experiment (EDEN_PREEMPT_ALL=1, read once): the console gives applications more cores than the four
-    // emulated ones, so pinned workers that spin on each other (a barrier) end up sharing a core and the
-    // spinners starve the thread they wait for. Rotate the application priority levels too.
-    static const bool preempt_all = [] {
-        const char* value = std::getenv("EDEN_PREEMPT_ALL");
-        return value != nullptr && *value == '1';
-    }();
     for (u32 core_id = 0; core_id < per_core.size(); core_id++) {
         KScheduler::RotateScheduledQueue(kernel, core_id, per_core[core_id]);
-        if (preempt_all) {
-            for (s32 priority = 28; priority <= 62; priority++) {
-                if (static_cast<u32>(priority) != per_core[core_id]) {
-                    KScheduler::RotateScheduledQueue(kernel, core_id, priority);
-                }
-            }
-        }
     }
 }
 

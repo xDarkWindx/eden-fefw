@@ -347,10 +347,6 @@ add_library(core STATIC
     hle/kernel/physical_core.cpp
     hle/kernel/physical_core.h
     hle/kernel/slab_helpers.h
-    hle/dlss_trace.cpp
-    hle/dlss_trace.h
-    hle/guest_hooks.cpp
-    hle/guest_hooks.h
     hle/kernel/svc.cpp
     hle/kernel/svc.h
     hle/kernel/svc/svc_activity.cpp

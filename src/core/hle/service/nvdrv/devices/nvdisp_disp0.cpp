@@ -98,56 +98,6 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
         }
     }
 
-    const char* capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE");
-    const bool sequence = std::getenv("EDEN_NATIVE_FRAME_SEQUENCE") != nullptr;
-    const bool on_demand = std::getenv("EDEN_NATIVE_FRAME_ON_DEMAND") != nullptr;
-    const bool requested = on_demand && !output_layers.empty() &&
-        !diagnostic_frame_pending->load() && std::filesystem::exists("native-frame.request");
-    if (requested) std::filesystem::remove("native-frame.request");
-    const bool sample_frame = requested || (capture && std::string_view{capture} == "1" && !output_layers.empty() &&
-        diagnostic_frame_count < (sequence ? 36000U : 3840U) && ++diagnostic_frame_count != 0 &&
-        (sequence ? (diagnostic_frame_count == 1 || diagnostic_frame_count % 120 == 0)
-                  : !diagnostic_visible_frame->load()));
-    if (sample_frame && !diagnostic_frame_pending->exchange(true)) {
-        for (const auto& fence : output_fences) {
-            LOG_INFO(Service_NVDRV, "Native composite waits for syncpoint={}/{}, current={}", fence.id, fence.value,
-                     system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(fence.id));
-        }
-        LOG_INFO(Service_NVDRV, "Native composite submitted: layers={}, address={:#x}", output_layers.size(), output_layers.front().address);
-        const auto layout = Layout::DefaultFrameLayout(1920, 1080);
-        auto pixels = std::make_shared<std::vector<u8>>(layout.width * layout.height * 4);
-        const bool first = diagnostic_frame_count == 1;
-        auto pending = diagnostic_frame_pending;
-        auto visible = diagnostic_visible_frame;
-        system.GPU().Renderer().RequestScreenshot(pixels->data(), [pixels, layout, first, pending, visible, sequence, on_demand](bool invert_y) {
-            std::array<u8, 18> header{};
-            header[2] = 2;
-            header[12] = static_cast<u8>(layout.width & 255);
-            header[13] = static_cast<u8>(layout.width >> 8);
-            header[14] = static_cast<u8>(layout.height & 255);
-            header[15] = static_cast<u8>(layout.height >> 8);
-            header[16] = 32;
-            header[17] = invert_y ? 8 : 0x28;
-            bool nonblack{};
-            for (size_t i = 0; i < pixels->size(); i += 4) {
-                if ((*pixels)[i] || (*pixels)[i + 1] || (*pixels)[i + 2]) {
-                    nonblack = true;
-                    break;
-                }
-            }
-            const auto save = [&](const char* path) {
-                std::ofstream out(path, std::ios::binary);
-                out.write(reinterpret_cast<const char*>(header.data()), header.size());
-                out.write(reinterpret_cast<const char*>(pixels->data()), pixels->size());
-                return out.good();
-            };
-            if (first) save("native-first-frame.tga");
-            const bool saved = (first || nonblack || sequence || on_demand) ? save("native-latest-frame.tga") : true;
-            if (nonblack && !visible->load() && save("native-visible-frame.tga")) visible->store(true);
-            LOG_INFO(Service_NVDRV, "Captured composited frame: {}x{}, saved={}, nonblack={}", layout.width, layout.height, saved, nonblack);
-            pending->store(false);
-        }, layout);
-    }
     system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
     Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());

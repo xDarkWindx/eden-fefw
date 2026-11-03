@@ -383,40 +383,16 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             const bool mapped = channel_state->memory_manager && bytes &&
                 channel_state->memory_manager->IsFullyMappedRange(entry.addr, bytes);
             if (mapped) { channel_state->memory_manager->ReadBlockUnsafe(entry.addr, words.data(), bytes); }
-            if (mapped && entry.size > 1000 && std::getenv("EDEN_NATIVE_FRAME_CAPTURE")) {
-                std::vector<u32> contents(static_cast<size_t>(entry.size));
-                channel_state->memory_manager->ReadBlockUnsafe(entry.addr, contents.data(), contents.size() * sizeof(u32));
-                std::ofstream dump("native-init-channel-" + std::to_string(channel_state->bind_id) + "-" + std::to_string(i) + ".bin", std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(contents.data()), contents.size() * sizeof(u32));
-            }
             LOG_DEBUG(Service_NVDRV, "native pushbuffer entry={} raw={:#x}, address={:#x}, words={}, mapped={}, data={:08x}",
                       i, entry.raw, static_cast<u64>(entry.addr), static_cast<u64>(entry.size),
                       mapped, fmt::join(words, ","));
         }
     }
 
-    static const bool frame_capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
-    if (UsesNativeAbi() && frame_capture && native_submit_logs < 100) {
-        for (size_t i = 0; i < entries.command_lists.size(); ++i) {
-            const auto& entry = entries.command_lists[i];
-            const auto bytes = static_cast<size_t>(entry.size) * sizeof(u32);
-            if (!bytes || bytes > 0x100000 || !channel_state->memory_manager->IsFullyMappedRange(entry.addr, bytes)) continue;
-            std::vector<u32> contents(static_cast<size_t>(entry.size));
-            channel_state->memory_manager->ReadBlockUnsafe(entry.addr, contents.data(), bytes);
-            std::ofstream dump("native-submit-" + std::to_string(channel_state->bind_id) + "-" + std::to_string(native_submit_logs) + "-" + std::to_string(i) + ".bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(contents.data()), bytes);
-        }
-    }
-
     // A game running ahead of the GPU thread (waiting only for the display) refills command
     // memory it has already submitted, so executing from memory later can run the next frame's
-    // words. Keep the words as submitted (from Eglantine PR #28). EDEN_NX2_PB_SNAPSHOT=0: execute
-    // from memory.
-    static const bool pb_snapshot = [] {
-        const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (pb_snapshot && UsesNativeAbi() && channel_state->memory_manager) {
+    // words. Keep the words as submitted (from Eglantine PR #28).
+    if (UsesNativeAbi() && channel_state->memory_manager) {
         size_t words = 0;
         for (const auto& entry : entries.command_lists) {
             words += entry.size;

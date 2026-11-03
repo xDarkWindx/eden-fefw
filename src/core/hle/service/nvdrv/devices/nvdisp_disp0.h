@@ -46,9 +46,6 @@ public:
     Kernel::KEvent* QueryEvent(u32 event_id) override;
 
 private:
-    u32 diagnostic_frame_count{};
-    std::shared_ptr<std::atomic_bool> diagnostic_frame_pending{std::make_shared<std::atomic_bool>(false)};
-    std::shared_ptr<std::atomic_bool> diagnostic_visible_frame{std::make_shared<std::atomic_bool>(false)};
     NvCore::Container& container;
     NvCore::NvMap& nvmap;
 };

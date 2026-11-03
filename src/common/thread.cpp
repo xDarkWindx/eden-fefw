@@ -15,7 +15,6 @@
 #include "common/logging.h"
 #include "common/assert.h"
 #include "common/thread.h"
-#include "common/host_sampler.h"
 #ifdef __APPLE__
 #include <mach/mach.h>
 #elif defined(__HAIKU__)
@@ -538,7 +537,6 @@ void SetCurrentThreadName(const char* name) {
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
-    HostSampler::RegisterCurrentThread(name);
 }
 
 void SetCurrentThreadToPerformanceCores() {

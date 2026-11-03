@@ -573,15 +573,9 @@ class IVi2Session final : public ServiceFramework<IVi2Session> {
     // clear and redraw an image that older queued presentations still show (black frames).
     // Offering at most `depth` outstanding presentations (one per window image) means an image
     // is only rewritten after its previous presentation retired, i.e. after its composite was
-    // enqueued ahead of the rewrite. EDEN_NATIVE_PRESENT_DEPTH overrides (0 = unlimited).
+    // enqueued ahead of the rewrite.
     static u64 ReportedAvailability(const ClientState& state) {
-        static const u32 depth = [] {
-            const char* v = std::getenv("EDEN_NATIVE_PRESENT_DEPTH");
-            const u32 value = v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 2U;
-            LOG_INFO(Service_AM, "Native present depth {}", value);
-            return value;
-        }();
-        if (depth == 0) return state.available;
+        constexpr u32 depth = 2;
         const u32 outstanding = OutstandingPresents(state);
         u64 mask = state.available;
         u64 reported{};
@@ -885,12 +879,7 @@ private:
                 if (state.producer->DetachReleasedBuffer(*state.queued[slot]) != android::Status::NoError) continue;
                 state.queued[slot].reset();
                 state.available |= u64{1} << slot;
-                if (static const bool trace = std::getenv("EDEN_NATIVE_WINDOW_TRACE") != nullptr; trace) {
-                    LOG_INFO(Service_AM, "Native display buffer retired: slot={}, mask={:#x}, reported={:#x}, outstanding={}",
-                             slot, state.available, ReportedAvailability(state), OutstandingPresents(state));
-                } else {
-                    LOG_DEBUG(Service_AM, "Native display buffer retired: slot={}, mask={:#x}", slot, state.available);
-                }
+                LOG_DEBUG(Service_AM, "Native display buffer retired: slot={}, mask={:#x}", slot, state.available);
                 changed = true;
             }
             if (changed) {
@@ -901,19 +890,6 @@ private:
         if (m_images->module) m_images->DrainRetiredMemories();
     }
     Result QueueNativeImage(ClientState& state, const u32* packet) {
-        if (static const bool log_packets = std::getenv("EDEN_LOG_PRESENT_PACKET") != nullptr; log_packets) {
-            // Diagnostic: log present packet words that change (slot, image and fence value excluded).
-            static std::array<u32, 32> previous{};
-            static bool first = true;
-            std::string changes;
-            for (size_t i = 0; i < previous.size(); ++i) {
-                if (i == 4 || i == 5 || i == 24) continue;
-                if (first || packet[i] != previous[i]) changes += fmt::format(" [{}]={:#x}", i, packet[i]);
-                previous[i] = packet[i];
-            }
-            first = false;
-            if (!changes.empty()) LOG_WARNING(Service_AM, "Native present packet changed:{}", changes);
-        }
         const u32 slot = GraphicsSupervisorProtocol::DecodeBufferSlot(packet[4]);
         R_UNLESS(!state.player_display, Kernel::ResultNotImplemented);
         R_UNLESS(state.layer && state.display && slot < 15 && !state.queued[slot], Kernel::ResultInvalidState);
@@ -978,11 +954,7 @@ private:
         // Word 12 is (swap interval << 16) | refresh rate (0x1003c, then 0x2003c once the game
         // is past its boot logos). Fortune's Weave runs at interval 2 (30 fps); forcing 1 made
         // it run at double speed.
-        static const u32 forced_interval = [] {
-            const char* v = std::getenv("EDEN_NATIVE_SWAP_INTERVAL");
-            return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 0U;
-        }();
-        const u32 swap_interval = forced_interval ? forced_interval : std::clamp<u32>(packet[12] >> 16, 1, 4);
+        const u32 swap_interval = std::clamp<u32>(packet[12] >> 16, 1, 4);
         if (static u32 last_interval{}; swap_interval != std::exchange(last_interval, swap_interval)) {
             LOG_INFO(Service_AM, "Native present swap interval {} (word 12 = {:#x})", swap_interval, packet[12]);
         }
@@ -1255,10 +1227,8 @@ private:
                     // Observed with Fortune's Weave: mode 1 -> 1280x720 output, 2 -> 1920x1080,
                     // 4 and 8 -> 2560x1440 (its highest); 0, 3 and 5 fall back to 720p. The vi
                     // display always reports 1280x720, so pick the mode from the docked setting
-                    // (the Switch 2 screen is 1080p). EDEN_VI2_MAX_RESOLUTION_MODE=<n> overrides.
-                    static const char* forced = std::getenv("EDEN_VI2_MAX_RESOLUTION_MODE");
-                    resolution = forced ? std::strtoull(forced, nullptr, 0)
-                                        : Settings::IsDockedMode() ? 4 : 2;
+                    // (the Switch 2 screen is 1080p).
+                    resolution = Settings::IsDockedMode() ? 4 : 2;
                 }
             }
         }

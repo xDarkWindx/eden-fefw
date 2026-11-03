@@ -27,10 +27,6 @@ class ServiceThread;
 
 namespace Service {
 
-/// Diagnostic (EDEN_DIAG_SVC=1): the HLE service requests being handled or waiting for the service
-/// lock right now, for the thread dump.
-std::string DescribeInFlightRequests();
-
 namespace FileSystem {
 class FileSystemController;
 }
