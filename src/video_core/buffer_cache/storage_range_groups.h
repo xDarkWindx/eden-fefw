@@ -16,8 +16,11 @@ struct StorageRangeGroup {
 };
 // Overlapping virtual views must share one backing allocation so writes through
 // one descriptor remain visible through every alias in the same dispatch.
-inline std::vector<StorageRangeGroup> GroupStorageRanges(std::span<const StorageAddressRange> ranges) {
-    std::vector<size_t> order;
+/// Groups into groups[0, returned count), reusing the storage of order and groups (and of the
+/// groups' member lists) from earlier calls: this runs on every draw.
+inline size_t GroupStorageRanges(std::span<const StorageAddressRange> ranges, std::vector<size_t>& order,
+                                 std::vector<StorageRangeGroup>& groups) {
+    order.clear();
     for (size_t i = 0; i < ranges.size(); ++i) {
         if (!ranges[i].address || !ranges[i].size) continue;
         if (ranges[i].address > std::numeric_limits<u64>::max() - ranges[i].size)
@@ -25,15 +28,29 @@ inline std::vector<StorageRangeGroup> GroupStorageRanges(std::span<const Storage
         order.push_back(i);
     }
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return ranges[a].address < ranges[b].address; });
-    std::vector<StorageRangeGroup> groups;
+    size_t count = 0;
     for (size_t i : order) {
         const u64 address = ranges[i].address, end = address + ranges[i].size;
-        if (groups.empty() || address >= groups.back().end) groups.push_back({address, end, {i}});
-        else {
-            groups.back().end = std::max(groups.back().end, end);
-            groups.back().members.push_back(i);
+        if (count == 0 || address >= groups[count - 1].end) {
+            if (count == groups.size()) groups.emplace_back();
+            StorageRangeGroup& group = groups[count++];
+            group.address = address;
+            group.end = end;
+            group.members.clear();
+            group.members.push_back(i);
+        } else {
+            StorageRangeGroup& group = groups[count - 1];
+            group.end = std::max(group.end, end);
+            group.members.push_back(i);
         }
     }
+    return count;
+}
+
+inline std::vector<StorageRangeGroup> GroupStorageRanges(std::span<const StorageAddressRange> ranges) {
+    std::vector<size_t> order;
+    std::vector<StorageRangeGroup> groups;
+    groups.resize(GroupStorageRanges(ranges, order, groups));
     return groups;
 }
 } // namespace VideoCommon

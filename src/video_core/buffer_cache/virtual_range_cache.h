@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -27,7 +28,7 @@ using VirtualSegments = boost::container::small_vector<VirtualSegment, 8>;
 
 class VirtualRangeCache {
 public:
-    static constexpr size_t MAX_ENTRIES = 8192;
+    static constexpr size_t MAX_ENTRIES = 16384;
     static constexpr size_t MAX_DEFERRED = 4096;
 
     const VirtualSegments* Query(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, u32 size) {
@@ -38,12 +39,14 @@ public:
             entries.clear();
         }
         const size_t as_id = memory.GetID();
-        const u64 key = MakeKey(as_id, gpu_addr);
+        const u64 key = MakeKey(as_id, gpu_addr, size);
         const auto it = entries.find(key);
         if (it != entries.end() && it->second.as_id == as_id &&
             it->second.gpu_addr == gpu_addr && it->second.size == size) {
+            ++hits;
             return &it->second.segments;
         }
+        ++misses;
         Entry entry{};
         entry.as_id = as_id;
         entry.gpu_addr = gpu_addr;
@@ -77,6 +80,11 @@ public:
         }
         const auto result = entries.insert_or_assign(key, std::move(entry));
         return &result.first->second.segments;
+    }
+
+    /// Lookups served from the cache and walked again since the last call (statistics).
+    std::pair<u64, u64> TakeCounts() noexcept {
+        return {std::exchange(hits, 0), std::exchange(misses, 0)};
     }
 
     void Unmap(size_t as_id, GPUVAddr gpu_addr, u64 size) {
@@ -121,8 +129,11 @@ private:
         u64 size;
     };
 
-    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr) {
-        return (static_cast<u64>(as_id) << 48) ^ gpu_addr;
+    /// The size is part of the key: grouped storage bindings at one address often differ in size
+    /// from draw to draw, and with the address alone each one evicted the other (every draw then
+    /// walked the mapping again: GetSubmappedRange and GpuToCpuAddress per segment).
+    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr, u32 size) {
+        return ((static_cast<u64>(as_id) << 48) ^ gpu_addr) ^ (u64{size} * 0x9E3779B97F4A7C15ULL);
     }
 
     void ApplyDeferred() {
@@ -168,6 +179,8 @@ private:
     std::mutex deferred_mutex;
     std::atomic<bool> has_deferred{false};
     bool deferred_overflow{};
+    u64 hits{};
+    u64 misses{};
 };
 
 } // namespace VideoCommon

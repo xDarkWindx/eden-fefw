@@ -3179,6 +3179,12 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
 
+    /// The current draws run under host conditional rendering (the host GPU discards them if the
+    /// condition fails; they are still prepared).
+    bool HostConditionalRendering() const {
+        return host_conditional;
+    }
+
     bool ShouldExecute() const {
         return execute_on;
     }
@@ -3317,6 +3323,7 @@ private:
     Upload::State upload_state;
 
     bool execute_on{true};
+    bool host_conditional{};
 
     std::vector<std::pair<GPUVAddr, size_t>> macro_segments;
     bool current_macro_dirty{};

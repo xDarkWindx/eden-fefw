@@ -136,12 +136,20 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
         offset = 0;
         size = 0;
     }
-    const auto it{std::ranges::find_if(views, [offset, size, format](const BufferView& view) {
+    // Draws usually bind the view they bound last: check it before searching the list (which
+    // grows with every distinct range of a large buffer).
+    const auto matches = [offset, size, format](const BufferView& view) {
         return offset == view.offset && size == view.size && format == view.format;
-    })};
+    };
+    if (last_view < views.size() && matches(views[last_view])) {
+        return *views[last_view].handle;
+    }
+    const auto it{std::ranges::find_if(views, matches)};
     if (it != views.end()) {
+        last_view = static_cast<size_t>(it - views.begin());
         return *it->handle;
     }
+    last_view = views.size();
     views.push_back({
         .offset = offset,
         .size = size,

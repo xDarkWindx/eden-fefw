@@ -30,6 +30,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -234,6 +235,11 @@ public:
 
     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
                                std::span<const MultiRangeSegment> pool);
+
+    /// Virtual range lookups served from the cache and walked again since the last call.
+    std::pair<u64, u64> TakeVirtualRangeCounts() noexcept {
+        return virtual_ranges.TakeCounts();
+    }
 
     void PrepareGroupedStorage(std::span<const std::pair<Binding*, bool>> bindings,
                                std::vector<MultiRangeSegment>& pool);
@@ -573,6 +579,12 @@ private:
     };
     Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
     VirtualRangeCache virtual_ranges;
+    // Scratch of the grouped storage path, kept between draws instead of allocated on each.
+    std::vector<std::pair<Binding*, bool>> grouped_bindings;
+    std::vector<StorageAddressRange> grouped_ranges;
+    std::vector<size_t> grouped_order;
+    std::vector<StorageRangeGroup> grouped_groups;
+    std::vector<std::pair<VirtualSegments, bool>> grouped_physical;
     std::vector<MultiRangeSegment> graphics_segments;
     std::vector<MultiRangeSegment> compute_segments;
     u64 frame_tick = 0;

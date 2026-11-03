@@ -1049,8 +1049,8 @@ template <class P>
 void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, bool>> bindings,
                                            std::vector<MultiRangeSegment>& pool) {
     if constexpr (requires { runtime.UseGroupedStorage(); }) {
-        std::vector<StorageAddressRange> ranges;
-        ranges.reserve(bindings.size());
+        std::vector<StorageAddressRange>& ranges = grouped_ranges;
+        ranges.clear();
         for (const auto& [binding, written] : bindings) {
             if (binding->gpu_addr > std::numeric_limits<u64>::max() - binding->size)
                 throw Shader::RuntimeError("Storage address range overflow");
@@ -1058,8 +1058,12 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
             binding->segment_count = binding->segment_offset = binding->segment_size = 0;
             binding->segment_written = false;
         }
-        std::vector<std::pair<VirtualSegments, bool>> physical_groups;
-        for (const auto& group : GroupStorageRanges(ranges)) {
+        // physical_groups[0, num_physical): reused entries (their segment lists keep their storage).
+        std::vector<std::pair<VirtualSegments, bool>>& physical_groups = grouped_physical;
+        size_t num_physical = 0;
+        const size_t num_groups = GroupStorageRanges(ranges, grouped_order, grouped_groups);
+        for (size_t group_index = 0; group_index < num_groups; ++group_index) {
+            const StorageRangeGroup& group = grouped_groups[group_index];
             const u64 size = group.end - group.address;
             if (size > std::numeric_limits<u32>::max())
                 throw Shader::RuntimeError("Grouped storage range exceeds supported size");
@@ -1067,13 +1071,17 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
             if (!found || found->empty()) throw Shader::RuntimeError("Unmapped grouped storage range");
             const bool written = std::any_of(group.members.begin(), group.members.end(),
                 [&](size_t member) { return bindings[member].second; });
-            for (const auto& [previous, previous_written] : physical_groups) {
+            for (size_t previous_index = 0; previous_index < num_physical; ++previous_index) {
+                const auto& [previous, previous_written] = physical_groups[previous_index];
                 if (!written && !previous_written) continue;
                 for (const auto& a : previous) for (const auto& b : *found)
                     if (a.device_addr < b.device_addr + b.size && b.device_addr < a.device_addr + a.size)
                         throw Shader::RuntimeError("Writable storage aliases across disjoint virtual views");
             }
-            physical_groups.emplace_back(*found, written);
+            if (num_physical == physical_groups.size()) physical_groups.emplace_back();
+            physical_groups[num_physical].first = *found;
+            physical_groups[num_physical].second = written;
+            ++num_physical;
             if (found->size() == 1) {
                 for (size_t member : group.members) {
                     auto& binding = *bindings[member].first;
@@ -1428,7 +1436,8 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
         }
         if constexpr (requires { runtime.UseGroupedStorage(); }) {
             if (runtime.UseGroupedStorage()) {
-                std::vector<std::pair<Binding*, bool>> bindings;
+                std::vector<std::pair<Binding*, bool>>& bindings = grouped_bindings;
+                bindings.clear();
                 for (size_t stage = 0; stage < NUM_STAGES; ++stage)
                     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
                         bindings.emplace_back(&channel_state->storage_buffers[stage][index],
@@ -1450,7 +1459,8 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
         UpdateComputeTextureBuffers();
         if constexpr (requires { runtime.UseGroupedStorage(); }) {
             if (runtime.UseGroupedStorage()) {
-                std::vector<std::pair<Binding*, bool>> bindings;
+                std::vector<std::pair<Binding*, bool>>& bindings = grouped_bindings;
+                bindings.clear();
                 ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
                     bindings.emplace_back(&channel_state->compute_storage_buffers[index],
                         ((channel_state->written_compute_storage_buffers >> index) & 1) != 0);

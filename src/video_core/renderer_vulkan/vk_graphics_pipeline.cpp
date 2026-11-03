@@ -879,6 +879,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     if (stats) {
+        const auto [range_hits, range_misses] = buffer_cache.TakeVirtualRangeCounts();
+        compact_stats.range_hits += range_hits;
+        compact_stats.range_misses += range_misses;
         ++compact_stats.draws;
         if (!compact_blocks.empty()) {
             ++compact_stats.table_draws;

@@ -85,6 +85,7 @@ private:
     Scheduler* scheduler{};
     vk::Buffer buffer;
     std::vector<BufferView> views;
+    size_t last_view{}; ///< Index of the view View returned last
     VideoCommon::UsageTracker tracker;
     VkDeviceAddress device_address{};
     u64 last_usage_tick{};
@@ -233,8 +234,11 @@ public:
                                                   VK_FORMAT_UNDEFINED);
             return;
         }
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
+        // A descriptor buffer takes the address, not a buffer view: none is created then.
+        const VkBufferView view = guest_descriptor_queue.UsesDescriptorBuffer()
+                                      ? VK_NULL_HANDLE
+                                      : buffer.View(offset, size, format);
+        guest_descriptor_queue.AddTexelBuffer(view, buffer.DeviceAddress(), offset, size,
                                               TexelBufferFormat(format));
     }
 
