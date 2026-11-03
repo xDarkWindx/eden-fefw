@@ -624,7 +624,7 @@ struct Memory::Impl {
     template <typename T>
     inline T Read(Common::ProcessAddress vaddr) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [this, addr]() {
+        if (auto const ptr = GetPointerImpl(addr, [addr]() {
             LOG_ERROR(HW_Memory, "Unmapped Read{} @ {:#016x}", sizeof(T) * 8, addr);
         }, [&]() {
             HandleRasterizerDownload(addr, sizeof(T));
@@ -645,7 +645,7 @@ struct Memory::Impl {
     template <typename T>
     inline void Write(Common::ProcessAddress vaddr, const T data) noexcept requires(std::is_trivially_copyable_v<T>) {
         const u64 addr = GetInteger(vaddr);
-        if (auto const ptr = GetPointerImpl(addr, [this, addr, data]() {
+        if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
         }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
