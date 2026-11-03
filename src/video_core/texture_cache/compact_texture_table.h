@@ -18,31 +18,11 @@
 
 namespace VideoCommon {
 
-/// EDEN_NO_COMPACT_TEXTURE_TABLES disables the compact binding of buffer-backed texture arrays
-/// (they are then bound element by element, as before; for A/B comparisons).
-inline bool CompactTextureTablesEnabled() {
-    static const bool enabled = std::getenv("EDEN_NO_COMPACT_TEXTURE_TABLES") == nullptr;
-    return enabled;
-}
-
 /// EDEN_NO_HEAP_REUSE disables the reuse of resolved texture banks between draws
-/// (texture_bank_reuse.h) and, with it, the reuse of their descriptors.
+/// (texture_bank_reuse.h) and, with it, the reuse of their descriptors. Kept as a safety switch
+/// for isolating wrong textures.
 inline bool HeapReuseEnabled() {
     static const bool enabled = std::getenv("EDEN_NO_HEAP_REUSE") == nullptr;
-    return enabled;
-}
-
-/// EDEN_HEAP_REUSE_VERIFY: every reusable bank (and descriptor block) is resolved again as without
-/// reuse, the fresh result is the one bound, and differences are logged. For finding a missed
-/// invalidation while playing, without the wrong textures it would cause.
-inline bool HeapReuseVerify() {
-    static const bool enabled = std::getenv("EDEN_HEAP_REUSE_VERIFY") != nullptr;
-    return enabled;
-}
-
-/// EDEN_NO_DESCRIPTOR_REUSE keeps the bank reuse but writes the descriptors element by element.
-inline bool DescriptorReuseEnabled() {
-    static const bool enabled = HeapReuseEnabled() && std::getenv("EDEN_NO_DESCRIPTOR_REUSE") == nullptr;
     return enabled;
 }
 
@@ -309,8 +289,6 @@ struct CompactTextureStats {
     u64 sampler_misses{};
     u64 descriptor_hits{};
     u64 descriptor_misses{};
-    u64 verify_checks{};
-    u64 verify_mismatches{};
     std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
 
     static bool Enabled() {
@@ -350,8 +328,7 @@ struct CompactTextureStats {
                  "Texture banks: cbuf array variants served {:.1f}% of reuses; views reused {:.1f}% of {:.0f}/s (new {:.0f}/s, table {:.0f}/s, "
                  "generation {:.0f}/s, entries {:.0f}/s, unstored {:.0f}/s, retries {:.0f}/s); "
                  "samplers reused {:.1f}% of {:.0f}/s; descriptors reused {:.1f}% of {:.0f}/s; "
-                 "{:.1f} unique samplers, {:.1f} alias prepares and {:.0f} snapshot bytes per reuse; "
-                 "verify {:.0f}/s, mismatches {}",
+                 "{:.1f} unique samplers, {:.1f} alias prepares and {:.0f} snapshot bytes per reuse",
                  rate(cbuf_variant_reused, cbuf_reused), rate(view_hits, view_lookups), per_second(view_lookups), per_second(view_misses),
                  per_second(view_stale_table), per_second(view_stale_generation),
                  per_second(view_stale_memory), per_second(view_unstored), per_second(view_retries),
@@ -361,8 +338,7 @@ struct CompactTextureStats {
                  per_second(descriptor_hits + descriptor_misses),
                  table_draws ? double(unique_samplers) / table_draws : 0.0,
                  view_hits ? double(alias_prepares) / view_hits : 0.0,
-                 view_hits ? double(snapshot_bytes) / view_hits : 0.0, per_second(verify_checks),
-                 verify_mismatches);
+                 view_hits ? double(snapshot_bytes) / view_hits : 0.0);
         *this = {};
         window = now;
     }

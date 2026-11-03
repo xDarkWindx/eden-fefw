@@ -650,39 +650,6 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return pipeline.get();
 }
 
-ComputePipeline* PipelineCache::CurrentTwinComputePipeline(int frontend_mode) {
-    const ShaderInfo* const shader{ComputeShader()};
-    if (!shader) {
-        return nullptr;
-    }
-    const auto& qmd{kepler_compute->launch_description};
-    const ComputePipelineCacheKey key{
-        .unique_hash = shader->unique_hash ^ (0x7477696e00000000ULL + static_cast<u64>(frontend_mode) + 1),
-        .shared_memory_size = qmd.shared_alloc,
-        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
-    };
-    const auto [pair, is_new]{compute_cache.try_emplace(key)};
-    if (!is_new) {
-        return pair->second.get();
-    }
-    const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
-    Shader::Ampere::SetFrontendOverride(frontend_mode);
-    try {
-        // Only the default (lowering) twin can reuse the registered program's lowering.
-        ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
-                               frontend_mode == 0 ? shader->lowered_native : nullptr};
-        // The twin's program may be sized differently from the registered one (native vs lowered).
-        env.SetCachedSize(frontend_mode == 0 ? shader->size_bytes : env.CachedSizeBytes());
-        main_pools.ReleaseContents();
-        pair->second = CreateComputePipeline(main_pools, key, env, nullptr, true);
-    } catch (...) {
-        Shader::Ampere::SetFrontendOverride(-1);
-        throw;
-    }
-    Shader::Ampere::SetFrontendOverride(-1);
-    return pair->second.get();
-}
-
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     if (title_id == 0) {

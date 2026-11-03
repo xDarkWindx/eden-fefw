@@ -174,10 +174,6 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
-    bool CaptureNativeGpuTexture(std::span<const ImageViewInOut> views);
-
-    void CaptureNativeRenderTarget();
-
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
@@ -294,9 +290,6 @@ public:
     std::recursive_mutex mutex;
 
 private:
-    void CaptureNativePresentationImage(ImageId image_id, PixelFormat view_format,
-                                        const char* request_path, const char* prefix_label);
-
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
@@ -500,8 +493,6 @@ private:
     template <typename Table>
     bool CaptureBank(TextureBankKey& entry, u64 hash, std::span<const u32> indices, const Table& table);
 
-    /// EDEN_HEAP_REUSE_VERIFY: logs bank images the skipped preparation would have changed.
-    void VerifyViewBankImages(const ViewBankEntry& entry);
 
     u64 bank_generation = 1;
     u64 bank_stamp = 0;

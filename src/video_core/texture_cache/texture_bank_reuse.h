@@ -28,8 +28,7 @@
 //  - for views, images with aliases are still prepared on every reuse (alias synchronization
 //    depends on render target writes, which happen on every draw), and the LRU ticks of the bank's
 //    images are refreshed once per frame (what the per-draw preparation kept fresh).
-// EDEN_NO_HEAP_REUSE disables it; EDEN_HEAP_REUSE_VERIFY resolves every reused bank again, binds
-// the fresh result and logs any difference (see compact_texture_table.h for the switches).
+// EDEN_NO_HEAP_REUSE disables it (compact_texture_table.h).
 
 namespace VideoCommon {
 

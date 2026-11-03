@@ -380,7 +380,6 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
         VkSampler sampler{};
         bool rescaled{};
     };
-    const bool dedupe = VideoCommon::TextureLookupDedupeEnabled();
     static thread_local VideoCommon::LookupMemo<SampledImage, 1024, u64> memo;
     static thread_local std::vector<SampledImage> pair_images;
     for (const auto& desc : info.texture_descriptors) {
@@ -428,14 +427,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             static_assert(sizeof(DescriptorUpdateEntry) % sizeof(u64) == 0);
             constexpr size_t words_per_entry = sizeof(DescriptorUpdateEntry) / sizeof(u64);
             const u64 generation = texture_cache.BankGeneration();
-            const bool reusable = VideoCommon::DescriptorReuseEnabled() && block.view_stamp != 0 &&
-                                  block.sampler_stamp != 0;
+            const bool reusable = block.view_stamp != 0 && block.sampler_stamp != 0;
             const bool cached = reusable && cache.view_stamp == block.view_stamp &&
                                 cache.sampler_stamp == block.sampler_stamp &&
                                 cache.generation == generation &&
                                 cache.words.size() == size_t{desc.count} * words_per_entry;
             auto& stats = VideoCommon::CompactTextureStats::Get();
-            if (cached && !VideoCommon::HeapReuseVerify()) {
+            if (cached) {
                 guest_descriptor_queue.AddEntries(cache.words.data(), desc.count);
                 views += desc.count;
                 samplers += desc.count;
@@ -457,32 +455,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             samplers += desc.count;
             rescaling.PushTexture(is_rescaled);
             if (reusable) {
-                if (cached) {
-                    // EDEN_HEAP_REUSE_VERIFY: written as without reuse, compared with the copy.
-                    ++stats.verify_checks;
-                    size_t differing{};
-                    for (u32 index = 0; index < desc.count; ++index) {
-                        VkDescriptorImageInfo kept;
-                        std::memcpy(&kept, cache.words.data() + index * words_per_entry, sizeof(kept));
-                        const VkDescriptorImageInfo& fresh = first_entry[index].image;
-                        if (kept.sampler != fresh.sampler || kept.imageView != fresh.imageView ||
-                            kept.imageLayout != fresh.imageLayout) {
-                            ++differing;
-                        }
-                    }
-                    if (differing != 0 || cache.rescaled != is_rescaled) {
-                        ++stats.verify_mismatches;
-                        static u32 logged{};
-                        if (logged++ < 32) {
-                            LOG_WARNING(Render_Vulkan,
-                                        "Texture bank reuse check: {} of {} reused descriptors differ "
-                                        "from the written ones (rescaled {} vs {})",
-                                        differing, desc.count, cache.rescaled, is_rescaled);
-                        }
-                    }
-                } else {
-                    ++stats.descriptor_misses;
-                }
+                ++stats.descriptor_misses;
                 cache.view_stamp = block.view_stamp;
                 cache.sampler_stamp = block.sampler_stamp;
                 cache.generation = generation;
@@ -493,15 +466,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             continue;
         }
         bool is_rescaled{};
-        if (dedupe) {
-            memo.Reset("descriptors");
-        }
+        memo.Reset();
         for (u32 index = 0; index < desc.count; ++index) {
             const auto& guest_view = *views++;
             const VideoCommon::ImageViewId image_view_id{guest_view.id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
             const u64 memo_key = u64{image_view_id.index} | (u64{sampler_id.index} << 32);
-            if (const SampledImage* const known = dedupe ? memo.Find(memo_key) : nullptr) {
+            if (const SampledImage* const known = memo.Find(memo_key)) {
                 guest_descriptor_queue.AddSampledImage(known->view, known->sampler);
                 is_rescaled |= known->rescaled;
                 continue;
@@ -509,9 +480,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             const SampledImage image = make_sampled(image_view_id, sampler_id, index, guest_view.index);
             guest_descriptor_queue.AddSampledImage(image.view, image.sampler);
             is_rescaled |= image.rescaled;
-            if (dedupe) {
-                memo.Store(memo_key, image);
-            }
+            memo.Store(memo_key, image);
         }
         rescaling.PushTexture(is_rescaled);
     }

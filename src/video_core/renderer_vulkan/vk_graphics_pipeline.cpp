@@ -4,13 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "shader_recompiler/frontend/ampere/program_capture.h"
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 #include <iostream>
-#include <set>
 #include <span>
 #include <string>
 
@@ -254,32 +251,6 @@ ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& m
                     DefaultSpec>(modules, infos);
 }
 
-// native-draw-ps.request = <pixel shader address> [rt0 address] (hex): true for the next such draw,
-// whose state ConfigureImpl then dumps. Shader addresses move between runs, so a value below
-// 0x10000 is the pixel shader's offset from the vertex shader instead. Shared by every
-// ConfigureImpl instantiation.
-bool WantDrawCapture(const Tegra::Engines::Maxwell3D::Regs& regs) {
-    static u64 wanted_ps{};
-    static u64 wanted_rt0{};
-    std::ifstream request;
-    if (VideoCommon::NativeRequestPending()) request.open("native-draw-ps.request");
-    if (request.is_open()) {
-        wanted_rt0 = 0;
-        request >> std::hex >> wanted_ps >> wanted_rt0;
-        request.close();
-        std::error_code error;
-        std::filesystem::remove("native-draw-ps.request", error);
-    }
-    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-    const bool ps_match = wanted_ps < 0x10000 ? ps - vs == wanted_ps : ps == wanted_ps;
-    if (wanted_ps == 0 || !ps_match || (wanted_rt0 != 0 && regs.rt[0].Address() != wanted_rt0)) {
-        return false;
-    }
-    wanted_ps = 0;
-    LOG_ERROR(Render_Vulkan, "Draw capture for ps={:x} rt0={:x}", ps, regs.rt[0].Address());
-    return true;
-}
 } // Anonymous namespace
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
@@ -320,12 +291,6 @@ GraphicsPipeline::GraphicsPipeline(
         fragment_store_mask = 0;
         for (size_t rt = 0; rt < frag.stores_frag_color.size(); ++rt) {
             fragment_store_mask |= frag.stores_frag_color[rt] ? 1u << rt : 0u;
-        }
-        if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-            LOG_ERROR(Render_Vulkan,
-                      "FragStores pipeline={:016X} rt_store_mask={:02X} depth={} vs={:016x} fs={:016x}",
-                      key.Hash(), fragment_store_mask, frag.stores_frag_depth, key.unique_hashes[1],
-                      key.unique_hashes[5]);
         }
     }
 
@@ -421,20 +386,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (!state.AllowsFullRate(writes))
             throw Shader::RuntimeError("Native VPRS full-rate fallback is unsafe: enabled={:#x}, coarse={:#x}, unsupported={:#x}, fragment_writes={}",
                                        state.enabled, state.coarse, state.unsupported, writes);
-        static thread_local u32 traces{};
-        if (VideoCommon::NativeDrawDiagnosticsEnabled() && traces++ < 8)
-            LOG_INFO(Render_Vulkan, "Native VPRS uses full pixel rate: enabled_tables={:#x}, coarse_tables={:#x}, select={:#x}",
-                     state.enabled, state.coarse, maxwell3d->regs.reg_array[0x2cc / 4]);
     }
 
     // Kept between draws (ConfigureImpl does not nest): buffer-backed arrays add hundreds of
     // records per draw, past the inline capacity of a small_vector, which then allocated on the
     // heap for every draw. Sized up front and written in place.
     static thread_local std::vector<VideoCommon::ImageViewInOut> views;
-    static thread_local std::vector<size_t> excluded_views;
     static thread_local std::vector<VideoCommon::SamplerId> samplers;
     views.clear();
-    excluded_views.clear();
     samplers.clear();
     views.resize(num_image_elements);
     // Buffer-backed texture arrays bound as compact tables (compact_texture_table.h): per array, its
@@ -451,16 +410,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     compact_sampler_ids.clear();
     size_t view_count{};
     // Whether views/samplers hold every compact block element (see ExpandBlockElements). Writing
-    // them cost ~15% of the GPU thread in the city plaza and only diagnostics read them; the
-    // feedback loop check takes the blocks' distinct ids instead.
+    // them cost ~15% of the GPU thread in the city plaza and the compact descriptor path does not
+    // read them; the feedback loop check takes the blocks' distinct ids instead.
     bool blocks_expanded{true};
-    const auto expand_blocks{[&] {
-        if (!blocks_expanded) {
-            VideoCommon::ExpandBlockElements<VideoCommon::ImageViewInOut>(
-                views, samplers, compact_blocks, compact_view_ids, compact_sampler_ids);
-            blocks_expanded = true;
-        }
-    }};
     const auto add_view{[&](const VideoCommon::ImageViewInOut& view) LAMBDA_FORCEINLINE {
         if (view_count < views.size()) {
             views[view_count] = view;
@@ -474,19 +426,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     texture_cache.SynchronizeDescriptors(false);
 
-    const bool dedupe_samplers = VideoCommon::TextureLookupDedupeEnabled() &&
-                                 !VideoCommon::NativeTextureRequestsEnabled();
-    // Compact tables rely on the lookups being deduplicated (the repeats are what they fold).
-    const bool compact_tables = dedupe_samplers && VideoCommon::CompactTextureTablesEnabled();
     const bool stats = VideoCommon::CompactTextureStats::Enabled();
-    // Resolved banks reused between draws (texture_bank_reuse.h); verification resolves them again.
-    const bool heap_reuse = compact_tables && VideoCommon::HeapReuseEnabled();
-    const bool heap_verify = heap_reuse && VideoCommon::HeapReuseVerify();
-    static thread_local std::vector<VideoCommon::SamplerId> verify_sampler_ids;
+    // Resolved banks reused between draws (texture_bank_reuse.h).
+    const bool heap_reuse = VideoCommon::HeapReuseEnabled();
     static thread_local VideoCommon::LookupMemo<VideoCommon::SamplerId, 256> sampler_memo;
-    if (dedupe_samplers) {
-        sampler_memo.Reset("samplers");
-    }
+    sampler_memo.Reset();
 
     buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
 
@@ -555,30 +499,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                 const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
                                 if (range_address != expected || !range_size || !device_address)
                                     throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
-                                if (VideoCommon::StackTraceEnabled() &&
-                                    buffer_cache.IsRegionGpuModified(*device_address, range_size)) {
-                                    VideoCommon::WatchStackTraceRange(*device_address, range_size);
-                                    VideoCommon::NoteStackTrace("HandleDownload");
-                                }
                                 buffer_cache.DownloadMemory(*device_address, range_size);
                                 expected += range_size;
                             }
                             if (expected != base + source.size)
                                 throw Shader::RuntimeError("Incomplete texture-handle buffer mapping");
-                            static const bool dump_buffer_textures = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
-                            if (dump_buffer_textures) {
-                                // Written once per name: rewriting it on every draw slowed
-                                // diagnostic runs to about 1 fps.
-                                static std::set<std::string> dumped;
-                                std::string name = fmt::format("native-buffer-textures-{}-{}-{:x}-{:x}.bin", stage,
-                                    desc.cbuf_index, desc.cbuf_offset, source.offset);
-                                if (dumped.insert(name).second) {
-                                    std::vector<u8> bytes(source.size);
-                                    gpu_memory->ReadBlock(base, bytes.data(), bytes.size());
-                                    std::ofstream dump(name, std::ios::binary);
-                                    dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                                }
-                            }
                         }
                         buffer_texture_desc = &desc;
                         buffer_texture_base = base;
@@ -665,9 +590,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 }
             }
             decoded.bytes = buffer_texture_bytes;
-            if (compact_tables) {
-                decoded.compact.Build(decoded.handles, decoded.excluded);
-            }
+            decoded.compact.Build(decoded.handles, decoded.excluded);
             if (cached != buffer_texture_handles.end()) {
                 *cached = std::move(decoded);
                 return *cached;
@@ -675,13 +598,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             return buffer_texture_handles.emplace_back(std::move(decoded));
         }};
         const auto resolve_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
-            if (const auto* const known = dedupe_samplers ? sampler_memo.Find(tsc_index) : nullptr) {
+            if (const auto* const known = sampler_memo.Find(tsc_index)) {
                 return *known;
             }
             const VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(tsc_index, false);
-            if (dedupe_samplers) {
-                sampler_memo.Store(tsc_index, sampler);
-            }
+            sampler_memo.Store(tsc_index, sampler);
             return sampler;
         }};
         const auto add_sampler{[&](u32 tsc_index) LAMBDA_FORCEINLINE {
@@ -708,29 +629,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             const std::span<VideoCommon::SamplerId> ids(compact_sampler_ids.data() + block.sampler_ids,
                                                         num_samplers);
             u64 stamp = heap_reuse ? texture_cache.TryReuseSamplerBank(table.tscs_hash, table.unique_tscs, ids) : 0;
-            const bool verify = stamp != 0 && heap_verify;
-            if (verify) {
-                verify_sampler_ids.assign(ids.begin(), ids.end());
-            }
-            if (stamp == 0 || verify) {
+            if (stamp == 0) {
                 for (size_t slot = 0; slot < num_samplers; ++slot) {
                     ids[slot] = resolve_sampler(table.unique_tscs[slot]);
-                }
-            }
-            if (verify) {
-                ++compact_stats.verify_checks;
-                if (!std::ranges::equal(verify_sampler_ids, ids)) {
-                    ++compact_stats.verify_mismatches;
-                    static u32 logged{};
-                    if (logged++ < 32) {
-                        size_t differing{};
-                        for (size_t slot = 0; slot < num_samplers; ++slot) {
-                            differing += verify_sampler_ids[slot] != ids[slot] ? 1 : 0;
-                        }
-                        LOG_WARNING(Render_Vulkan, "Texture bank reuse check: {} of {} reused samplers "
-                                    "differ from the resolved ones", differing, num_samplers);
-                    }
-                    stamp = 0;
                 }
             }
             if (stamp == 0 && heap_reuse) {
@@ -868,7 +769,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         for (const auto& desc : info.texture_descriptors) {
-            if (compact_tables && !desc.buffer_source.enabled && desc.count >= 16) {
+            if (!desc.buffer_source.enabled && desc.count >= 16) {
                 if (const BufferTextureHandles* const decoded = cbuf_handles(desc)) {
                     add_compact_block(decoded->compact, desc.count);
                     continue;
@@ -876,20 +777,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
             if (desc.buffer_source.enabled && desc.count > 0) {
                 const BufferTextureHandles& decoded = buffer_handles(desc);
-                if (compact_tables && decoded.compact.element_tics.size() == desc.count) {
-                    // Samplers resolve here, in binding order, one per distinct TSC; views resolve with
-                    // the draw's other views (FillImageViews), one per distinct TIC; the elements are
-                    // written from those afterwards (ExpandViewLookups).
-                    add_compact_block(decoded.compact, desc.count);
-                    continue;
-                }
-                for (u32 index = 0; index < desc.count; ++index) {
-                    if (decoded.excluded[index]) {
-                        excluded_views.push_back(view_count);
-                    }
-                    add_view({decoded.handles[index].first});
-                    add_sampler(decoded.handles[index].second);
-                }
+                // Samplers resolve here, in binding order, one per distinct TSC; views resolve with
+                // the draw's other views (FillImageViews), one per distinct TIC.
+                add_compact_block(decoded.compact, desc.count);
                 continue;
             }
             for (u32 index = 0; index < desc.count; ++index) {
@@ -933,25 +823,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);
     } else {
         // Banks resolved at an earlier draw and still valid skip their lookups.
-        static thread_local std::vector<std::pair<size_t, u64>> verify_blocks;
-        static thread_local std::vector<VideoCommon::ImageViewId> verify_view_ids;
-        verify_blocks.clear();
-        verify_view_ids.clear();
         bool any_reused = false;
         if (heap_reuse) {
-            for (size_t block_index = 0; block_index < compact_blocks.size(); ++block_index) {
-                auto& block = compact_blocks[block_index];
+            for (auto& block : compact_blocks) {
                 const auto& table = *block.table;
                 const std::span<VideoCommon::ImageViewId> ids(compact_view_ids.data() + block.view_ids,
                                                               table.unique_tics.size());
                 const u64 stamp = texture_cache.TryReuseViewBank(table.tics_hash, table.unique_tics, ids);
                 if (stamp == 0) {
-                    continue;
-                }
-                if (heap_verify) {
-                    // Resolved below as without reuse; compared afterwards.
-                    verify_blocks.emplace_back(block_index, stamp);
-                    verify_view_ids.insert(verify_view_ids.end(), ids.begin(), ids.end());
                     continue;
                 }
                 block.views_reused = true;
@@ -989,43 +868,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             resolve_views();
         }
         if (heap_reuse) {
-            size_t verify_index = 0;
-            size_t verify_offset = 0;
-            for (size_t block_index = 0; block_index < compact_blocks.size(); ++block_index) {
-                auto& block = compact_blocks[block_index];
+            for (auto& block : compact_blocks) {
                 if (block.views_reused) {
                     continue;
                 }
                 const auto& table = *block.table;
                 const std::span<const VideoCommon::ImageViewId> ids(
                     compact_view_ids.data() + block.view_ids, table.unique_tics.size());
-                if (verify_index < verify_blocks.size() && verify_blocks[verify_index].first == block_index) {
-                    const u64 stamp = verify_blocks[verify_index++].second;
-                    const auto reused = std::span(verify_view_ids).subspan(verify_offset, ids.size());
-                    verify_offset += ids.size();
-                    ++compact_stats.verify_checks;
-                    if (std::ranges::equal(reused, ids)) {
-                        block.view_stamp = stamp;
-                        continue;
-                    }
-                    ++compact_stats.verify_mismatches;
-                    static u32 logged{};
-                    if (logged++ < 32) {
-                        size_t differing{};
-                        size_t first{ids.size()};
-                        for (size_t slot = 0; slot < ids.size(); ++slot) {
-                            if (reused[slot] != ids[slot]) {
-                                first = (std::min)(first, slot);
-                                ++differing;
-                            }
-                        }
-                        LOG_WARNING(Render_Vulkan,
-                                    "Texture bank reuse check: {} of {} reused views differ from the "
-                                    "resolved ones (first: TIC {} reused id {} resolved id {})",
-                                    differing, ids.size(), table.unique_tics[first],
-                                    reused[first].index, ids[first].index);
-                    }
-                }
                 block.view_stamp = texture_cache.StoreViewBank(table.tics_hash, table.unique_tics, ids);
             }
         }
@@ -1041,91 +890,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
         compact_stats.Report();
-    }
-    // These slots cannot reach this operation under the shader's own branch
-    // conditions. Preserve array indexing and use a correctly typed null view.
-    for (const size_t index : excluded_views) views[index].id = VideoCommon::NULL_IMAGE_VIEW_ID;
-    // Armed by native-dispatch-trace.request: give each traced draw's targets and shaders, so the
-    // DispatchTrace line that follows (its texture bindings) reads as one frame-order record.
-    if (auto& budget = VideoCommon::NativeDispatchDimsBudget(); budget > 0) {
-        --budget;
-        std::string targets;
-        for (u32 rt = 0; rt < regs.rt_control.count; ++rt) {
-            const u32 slot = regs.rt_control.Map(rt);
-            targets += fmt::format(" rt{}={:x}:{:#x}:{}x{}", slot, regs.rt[slot].Address(),
-                                   static_cast<u32>(regs.rt[slot].format), regs.rt[slot].width,
-                                   regs.rt[slot].height);
-        }
-        LOG_ERROR(Render_Vulkan, "DrawTarget{} zeta={:x} blend0={} vs={:x} ps={:x} count={}", targets,
-                  regs.zeta_enable ? regs.zeta.Address() : 0, regs.blend.enable[0],
-                  (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
-                  (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1],
-                  maxwell3d->draw_manager.draw_state.vertex_buffer.count);
-    }
-    if (VideoCommon::NativeTextureRequestsEnabled()) {
-        expand_blocks(); // Native captures read the elements
-    }
-    const bool capture_draw = VideoCommon::NativeTextureRequestsEnabled() && WantDrawCapture(regs);
-    if (texture_cache.CaptureNativeGpuTexture(std::span(views.data(), views.size())) || capture_draw) {
-        std::ofstream capture("native-gpu-texture-shaders.txt");
-        std::ofstream cbuf_layout("native-gpu-texture-cbuf-layout.txt");
-        for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage)
-            capture << stage << ' ' << std::hex << key.unique_hashes[stage] << '\n';
-        VideoCommon::NativeTextureCapture::Write("native-gpu-texture-registers.bin", &regs, sizeof(regs));
-        const auto& draw = maxwell3d->draw_manager.draw_state;
-        capture << "draw " << std::dec << draw.vertex_buffer.first << ' ' << draw.vertex_buffer.count
-                << ' ' << draw.base_index << ' ' << draw.index_buffer.first << ' ' << draw.index_buffer.count << '\n';
-        for (u32 stream = 0; stream < 4; ++stream) {
-            const auto& config = regs.vertex_streams[stream];
-            if (!config.IsEnabled()) continue;
-            const GPUVAddr address = config.Address();
-            capture << "vertex " << stream << ' ' << std::hex << address << '\n';
-            if (!gpu_memory->IsFullyMappedRange(address, 1024)) continue;
-            std::array<u8, 1024> data{};
-            gpu_memory->ReadBlock(address, data.data(), data.size());
-            VideoCommon::NativeTextureCapture::Write("native-gpu-texture-vertex-" + std::to_string(stream) + ".bin", data.data(), data.size());
-        }
-        for (u32 stage : {1U, 5U}) {
-            const auto& config = regs.pipelines[stage];
-            const GPUVAddr address = (u64{config.reserved[0] & 0xff} << 32) | config.reserved[1];
-            if (!gpu_memory->IsFullyMappedRange(address, 128)) continue;
-            capture << "program " << stage << ' ' << std::hex << address << '\n';
-            std::vector<u8> source(128);
-            gpu_memory->ReadBlock(address, source.data(), source.size());
-            Shader::Ampere::ProgramCaptureState state;
-            for (u32 index = 0; index < 4096; ++index) {
-                Shader::Ampere::Instruction instruction;
-                const GPUVAddr pc = address + 128 + index * sizeof(instruction);
-                if (!gpu_memory->IsFullyMappedRange(pc, sizeof(instruction))) break;
-                gpu_memory->ReadBlock(pc, &instruction, sizeof(instruction));
-                const auto* bytes = reinterpret_cast<const u8*>(&instruction);
-                source.insert(source.end(), bytes, bytes + sizeof(instruction));
-                const auto status = state.Observe(instruction, index);
-                if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) break;
-                if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) {
-                    VideoCommon::NativeTextureCapture::Write("native-gpu-texture-shader-" + std::to_string(stage) + ".bin", source.data(), source.size());
-                    break;
-                }
-            }
-            const auto& constants = maxwell3d->state.shader_stages[stage == 1 ? 0 : 4].const_buffers;
-            for (u32 bank = 0; bank < constants.size(); ++bank) {
-                if (Tegra::NativeRootTables::IsBank(bank)) {
-                    const auto& words = maxwell3d->native_root_tables.Data(bank);
-                    cbuf_layout << stage << ' ' << bank << " 1 root 100\n";
-                    VideoCommon::NativeTextureCapture::Write("native-gpu-texture-cbuf-" + std::to_string(stage) + "-" + std::to_string(bank) + ".bin", words.data(), sizeof(words));
-                    continue;
-                }
-                const auto& buffer = constants[bank];
-                cbuf_layout << stage << ' ' << bank << ' ' << buffer.enabled << ' '
-                            << std::hex << buffer.address << ' ' << buffer.size << std::dec << '\n';
-                const size_t capture_size = std::min<size_t>(buffer.size, 65536);
-                if (!buffer.enabled || !capture_size ||
-                    !gpu_memory->IsFullyMappedRange(buffer.address, capture_size)) continue;
-                std::vector<u8> data(capture_size);
-                gpu_memory->ReadBlock(buffer.address, data.data(), data.size());
-                VideoCommon::NativeTextureCapture::Write("native-gpu-texture-cbuf-" + std::to_string(stage) + "-" + std::to_string(bank) + ".bin", data.data(), data.size());
-            }
-        }
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
@@ -1207,76 +971,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     };
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         buffer_cache.BindHostStageBuffers(stage);
-        const auto* stage_views = views_it;
-        try {
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
-                                 samplers_it, views_it,
-                                 compact_blocks.empty() ? nullptr : &compact_binding);
-        } catch (const Shader::Exception&) {
-            expand_blocks(); // The evidence below reads the elements
-            static u32 diagnostic_count{};
-            if (diagnostic_count++ < 8) {
-                if (std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) {
-                    const auto& config = regs.pipelines[stage == 4 ? 5 : 1];
-                    const GPUVAddr address = (GPUVAddr{config.reserved[0] & 0xff} << 32) | config.reserved[1];
-                    size_t length{};
-                    while (length < 0x20000 && gpu_memory->IsFullyMappedRange(address + length, 0x1000))
-                        length += 0x1000;
-                    std::vector<u8> bytes(length);
-                    gpu_memory->ReadBlock(address, bytes.data(), bytes.size());
-                    std::ofstream shader(fmt::format("native-binding-error-shader-{}-{:x}.bin", stage, address), std::ios::binary);
-                    shader.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                    for (u32 bank = 0; bank < 18; ++bank) {
-                        const auto& cb = maxwell3d->state.shader_stages[stage].const_buffers[bank];
-                        if (!cb.enabled || !cb.size || cb.size > 65536 ||
-                            !gpu_memory->IsFullyMappedRange(cb.address, cb.size)) continue;
-                        bytes.resize(cb.size);
-                        gpu_memory->ReadBlock(cb.address, bytes.data(), bytes.size());
-                        std::ofstream file(fmt::format("native-binding-error-cbuf-{}-{}.bin", stage, bank), std::ios::binary);
-                        file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                    }
-                }
-                const auto& info = stage_infos[stage];
-                const auto* texture_views = stage_views +
-                    Shader::NumDescriptors(info.texture_buffer_descriptors) +
-                    Shader::NumDescriptors(info.image_buffer_descriptors);
-                for (const auto& desc : info.texture_descriptors) {
-                    for (u32 index = 0; index < desc.count; ++index) {
-                        const auto& view = *texture_views++;
-                        if (!desc.buffer_source.enabled || view.id == VideoCommon::NULL_IMAGE_VIEW_ID)
-                            continue;
-                        auto& cached = texture_cache.GetImageView(view.id);
-                        if (!VideoCore::Surface::IsPixelFormatInteger(cached.format) &&
-                            cached.Handle(desc.type) != VK_NULL_HANDLE)
-                            continue;
-                        const auto tic_address = regs.tex_header.Address() +
-                            u64{view.index} * sizeof(Tegra::Texture::TICEntry);
-                        Tegra::Texture::TICEntry tic{};
-                        gpu_memory->ReadBlock(tic_address, &tic, sizeof(tic));
-                        const auto& cbuf = maxwell3d->state.shader_stages[stage].const_buffers[desc.cbuf_index];
-                        const auto base = gpu_memory->Read<u64>(cbuf.address + desc.cbuf_offset);
-                        const auto size = gpu_memory->Read<u64>(cbuf.address + desc.cbuf_offset + 8);
-                        LOG_ERROR(Render_Vulkan,
-                            "Texture binding evidence: stage {} entry {} TIC {} at {:#x} raw {:016x} {:016x} {:016x} {:016x}; cached type {} format {}; CB{}+{:#x} base {:#x} size {:#x} stride {:#x} field {:#x}",
-                            stage, index, view.index, tic_address, tic.raw[0], tic.raw[1], tic.raw[2], tic.raw[3],
-                            static_cast<u32>(cached.type), static_cast<u32>(cached.format),
-                            desc.cbuf_index, desc.cbuf_offset, base, size,
-                            desc.buffer_source.stride, desc.buffer_source.offset);
-                        if (std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND") &&
-                            size == desc.buffer_source.size && size <= 16 * 1024 * 1024 &&
-                            base && base + size >= base && gpu_memory->IsFullyMappedRange(base, size)) {
-                            std::vector<u8> bytes(size);
-                            gpu_memory->ReadBlock(base, bytes.data(), bytes.size());
-                            std::ofstream dump(fmt::format("native-binding-error-{}-{}-{:x}-{:x}-{:x}.bin",
-                                stage, desc.cbuf_index, desc.cbuf_offset, base, desc.buffer_source.offset),
-                                std::ios::binary);
-                            dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                        }
-                    }
-                }
-            }
-            throw;
-        }
+        PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
+                             samplers_it, views_it, compact_blocks.empty() ? nullptr : &compact_binding);
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
             render_area.uses_render_area = true;

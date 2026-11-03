@@ -123,7 +123,6 @@ public:
 
     /// Diagnostic: a second build of the current compute shader with the given frontend
     /// (Shader::Ampere::FrontendMode as int); never written to the disk cache.
-    [[nodiscard]] ComputePipeline* CurrentTwinComputePipeline(int frontend_mode);
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);

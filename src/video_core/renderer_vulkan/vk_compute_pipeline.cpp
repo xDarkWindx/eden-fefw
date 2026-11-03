@@ -14,7 +14,6 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
-#include "video_core/native_diagnostics.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -217,21 +216,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     for (const auto& desc : info.texture_descriptors) {
         for (u32 index = 0; index < desc.count; ++index) {
             const auto handle{read_handle(desc, index)};
-            if (handle.first == 0 && VideoCommon::NativeDrawDiagnosticsEnabled()) {
-                static std::atomic<u32> null_logs{};
-                if (null_logs++ < 60) {
-                    const u32 offset{desc.cbuf_offset + (index << desc.size_shift)};
-                    const GPUVAddr base{cbufs[desc.cbuf_index].Address()};
-                    std::array<u32, 8> words{};
-                    gpu_memory.ReadBlockUnsafe(base + (offset & ~0x1fU), words.data(), sizeof(words));
-                    LOG_ERROR(HW_GPU,
-                              "NullTexture handle=0 cbuf={} offset={:#x} addr={:#x} secondary={} "
-                              "grid={}x{}x{} words@{:#x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                              desc.cbuf_index, offset, base + offset, desc.has_secondary,
-                              qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z, offset & ~0x1fU,
-                              words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-                }
-            }
             views.push_back({handle.first});
 
             VideoCommon::SamplerId sampler = texture_cache.GetSamplerId(handle.second, true);
@@ -242,9 +226,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
-    // Opt-in diagnostic readback of compute-bound images (e.g. DLSS inputs/history).
-    // Gated by EDEN_NATIVE_DRAW_DIAGNOSTICS and a native-gpu-texture.request file.
-    texture_cache.CaptureNativeGpuTexture(std::span(views.data(), views.size()));
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t index{};
