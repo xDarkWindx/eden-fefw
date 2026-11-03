@@ -40,8 +40,6 @@ enum class FrontendMode {
 
 // EDEN_NATIVE_FRONTEND=lower|ampere|auto|compare, default lower.
 [[nodiscard]] FrontendMode SelectedFrontendMode();
-// Diagnostic: forces the frontend chosen on this thread (-1 restores the environment's choice).
-void SetFrontendOverride(int mode);
 
 // Salt mixed into the pipeline cache identity of native-translated programs. Bump it whenever the
 // native translation changes so cached results of an older translator are never reused.

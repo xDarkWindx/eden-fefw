@@ -19,25 +19,6 @@
 
 namespace Shader::Ampere {
 
-// EDEN_NATIVE_LOWER_DISABLE=<group>[,<group>...] switches individual lowering fixes back to the
-// previous behaviour (rejecting or ignoring the form) so a visual regression can be bisected.
-// Groups: audit_fsel, audit_f2i, cube3d_lod, array2d_bias, byte_sel306. Unset leaves behaviour unchanged.
-inline bool LowerGroupDisabled(std::string_view group) {
-    static const std::string list = [] {
-        const char* value = std::getenv("EDEN_NATIVE_LOWER_DISABLE");
-        return std::string{value ? value : ""};
-    }();
-    if (list.empty()) return false;
-    std::string_view rest = list;
-    while (!rest.empty()) {
-        const size_t comma = rest.find(',');
-        if (rest.substr(0, comma) == group) return true;
-        if (comma == std::string_view::npos) break;
-        rest.remove_prefix(comma + 1);
-    }
-    return false;
-}
-
 struct LoweredProgram {
     std::vector<u64> instructions;
     std::vector<u32> source_instruction_offsets;
@@ -692,9 +673,6 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         }
         case 0x83b: { // LDSM.16.M88.2/.4: distribute 8x8 matrices across the warp.
-            // Diagnostic switch: reject the tensor forms as if unsupported.
-            if (std::getenv("EDEN_NATIVE_DISABLE_TENSOR"))
-                return fail(index, "native tensor instructions disabled");
             u32 address = insn.Bits(24, 8);
             const bool transpose = insn.Bits(78, 1);
             const u32 mode = insn.words[2] & ~0x08004000U;
@@ -732,9 +710,6 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         }
         case 0x23c: { // HMMA.1688/.16816.F16, rounding after each eight-product step.
-            // Diagnostic switch: reject the tensor forms as if unsupported.
-            if (std::getenv("EDEN_NATIVE_DISABLE_TENSOR"))
-                return fail(index, "native tensor instructions disabled");
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
             const u32 mode = insn.words[2] & ~0xffU;
             const u32 depth = mode == 0 ? 8U : 16U;
@@ -1749,7 +1724,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, insn.Bits(62, 1) != 0 && !LowerGroupDisabled("audit_f2i"), insn.Bits(63, 1) != 0 && !LowerGroupDisabled("audit_f2i")) // [merge-audit-f2i]
+            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, insn.Bits(62, 1) != 0, insn.Bits(63, 1) != 0) // [merge-audit-f2i]
                                      : insn.Bits(32, 8);
             if (half) {
                 extract_half({source, 2, false, false}, 0, 252);
@@ -2275,7 +2250,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                      (u64{1} << 50) | (u64{7} << 51) | (u64{lod} << 55));
                 break;
             }
-            if (dimension == 5 && lod == 2 && !LowerGroupDisabled("array2d_bias")) { // [merge-tex-array2d-bias]
+            if (dimension == 5 && lod == 2) { // [merge-tex-array2d-bias]
                 // Array2D bias samples split {array, x} and {y, bias} across the two sources.
                 if (half || !insn.Bits(60, 1) || depth_compare || mask != 15 || !split ||
                     insn.Bits(76, 2) || insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
@@ -2304,7 +2279,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 copy(second_dest + 1, 253);
                 break;
             }
-            if ((dimension == 3 && (lod == 0 || lod == 1 || lod == 3)) || (dimension == 2 && (lod <= 1 || (lod == 2 && !LowerGroupDisabled("cube3d_lod"))))) {
+            if ((dimension == 3 && (lod == 0 || lod == 1 || lod == 3)) || (dimension == 2 && lod <= 2)) {
                 // [merge-tex-3d-bias] 3D bias (lod 2) takes the bias value from the register after Z, like cube explicit LOD.
                 const bool lod_register = (dimension == 3 && lod == 3) || (dimension == 2 && lod == 2);
                 const u32 components = static_cast<u32>(std::popcount(mask));
@@ -2687,8 +2662,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             // Bits 60-61 select the source byte or half-word (Maxwell I2F bits 41-42).
             const u32 size = insn.Bits(84, 2), selector = insn.Bits(60, 2);
             if ((insn.words[2] & ~0x0030c400U) != 0x1000 || (insn.words[1] & ~0x300000ffU) ||
-                size == 3 || (size == 1 && selector > 1) || (size == 2 && selector != 0) ||
-                (insn.words[2] != 0x1000 && LowerGroupDisabled("byte_sel306")))
+                size == 3 || (size == 1 && selector > 1) || (size == 2 && selector != 0))
                 return fail(index, "native byte-to-float conversion mode");
             emit(base(0x5cb8000000000000ULL) | (u64{2} << 8) | (u64{size} << 10) |
                  (u64{insn.Bits(74, 1)} << 13) | (u64{insn.Bits(78, 2)} << 39) |
@@ -2709,7 +2683,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
             // FSEL applies floating operand modifiers before selecting the result. Dropping the
             // negation collapses procedurally generated cube vertices to the same positive corner.
-            const bool floating = (opcode & 0x1ff) == 0x8 && !LowerGroupDisabled("audit_fsel");
+            const bool floating = (opcode & 0x1ff) == 0x8;
             const u32 a = operand(0, floating), b = operand(1, floating);
             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));

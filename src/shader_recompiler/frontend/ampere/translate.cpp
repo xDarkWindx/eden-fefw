@@ -21,16 +21,7 @@
 
 namespace Shader::Ampere {
 
-namespace {
-thread_local int frontend_override = -1;
-} // namespace
-
-void SetFrontendOverride(int mode) {
-    frontend_override = mode;
-}
-
 FrontendMode SelectedFrontendMode() {
-    if (frontend_override >= 0) return static_cast<FrontendMode>(frontend_override);
     static const FrontendMode mode = [] {
         const char* const value = std::getenv("EDEN_NATIVE_FRONTEND");
         if (!value) return FrontendMode::Lower;
@@ -178,11 +169,6 @@ ProgramInfo ValidateProgramImpl(Environment& env, std::span<const Instruction> p
         layout.predicate_slot = layout.gpr_limit;
         layout.register_base = layout.gpr_limit + (probe_info.uses_up ? 1 : 0);
         const u32 slots = probe_info.uses_any_ur ? probe_info.max_ur + 1 : 0;
-        if (std::getenv("EDEN_NATIVE_LAYOUT_DEBUG")) {
-            std::fprintf(stderr, "native layout: max_gpr=%u max_ur=%u uses_up=%d -> base=%u slots=%u\n",
-                         probe_info.max_gpr, probe_info.max_ur, probe_info.uses_up ? 1 : 0,
-                         layout.register_base, slots);
-        }
         if (layout.register_base + slots > 255 || (probe_info.uses_up && layout.predicate_slot >= 255)) {
             // Not enough room above the highest GPR: keep every GPR where it is and place the uniform
             // file in the extra SSA variables above RZ.
@@ -190,9 +176,6 @@ ProgramInfo ValidateProgramImpl(Environment& env, std::span<const Instruction> p
             layout.gpr_limit = 255;
             layout.predicate_slot = 256;
             layout.register_base = 257;
-            if (std::getenv("EDEN_NATIVE_LAYOUT_DEBUG")) {
-                std::fprintf(stderr, "native layout: extended file, %u slots\n", slots);
-            }
         }
         {
             std::scoped_lock lock{layout_mutex};
