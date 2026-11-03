@@ -430,16 +430,20 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             constexpr size_t words_per_entry = sizeof(DescriptorUpdateEntry) / sizeof(u64);
             const u64 generation = texture_cache.BankGeneration();
             const bool reusable = block.view_stamp != 0 && block.sampler_stamp != 0;
-            const bool same_banks = reusable && cache.view_stamp == block.view_stamp &&
-                                    cache.sampler_stamp == block.sampler_stamp &&
-                                    cache.generation == generation &&
-                                    cache.words.size() == size_t{desc.count} * words_per_entry &&
-                                    cache.keys.size() == desc.count;
+            // Entries written in this generation for this many elements: patchable element by
+            // element (same view and sampler ids, same descriptor), and reusable as they are when
+            // the table did not change and the banks are the same.
+            const bool patchable = cache.generation == generation &&
+                                   cache.words.size() == size_t{desc.count} * words_per_entry &&
+                                   cache.keys.size() == desc.count;
+            const bool same_banks = patchable && cache.current && reusable &&
+                                    cache.view_stamp == block.view_stamp &&
+                                    cache.sampler_stamp == block.sampler_stamp;
             auto& stats = VideoCommon::CompactTextureStats::Get();
             bool patched = false;
-            if (same_banks && !cache.current) {
-                // The array changed but not its banks: rewrite only the elements whose texture or
-                // sampler changed.
+            if (patchable && !same_banks) {
+                // The array or its banks changed: rewrite only the elements whose view or sampler
+                // changed.
                 static thread_local std::vector<u8> pairs_made;
                 const size_t rewritten = VideoCommon::PatchCompactElements<SampledImage>(
                     block, compact->view_ids, compact->sampler_ids, cache.keys, pair_images,
@@ -467,11 +471,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                     });
                 cache.rescaled = cache.rescaled_count != 0;
                 cache.current = true;
+                cache.view_stamp = block.view_stamp;
+                cache.sampler_stamp = block.sampler_stamp;
                 patched = true;
                 ++stats.descriptor_patches;
                 stats.patched_elements += rewritten;
             }
-            if (same_banks) {
+            if (same_banks || patched) {
                 guest_descriptor_queue.AddEntries(cache.words.data(), desc.count);
                 views += desc.count;
                 samplers += desc.count;
@@ -494,7 +500,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             views += desc.count;
             samplers += desc.count;
             rescaling.PushTexture(is_rescaled);
-            if (reusable) {
+            {
                 ++stats.descriptor_misses;
                 const auto& table = *block.table;
                 cache.view_stamp = block.view_stamp;
@@ -508,7 +514,8 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                 cache.rescaled_elements.resize(desc.count);
                 cache.rescaled_count = 0;
                 for (size_t element = 0; element < desc.count; ++element) {
-                    cache.keys[element] = table.ElementKey(element);
+                    cache.keys[element] = VideoCommon::CompactElementKey(
+                        block, element, compact->view_ids, compact->sampler_ids);
                     const u8 rescaled = pair_images[table.element_pairs[element]].rescaled ? 1 : 0;
                     cache.rescaled_elements[element] = rescaled;
                     cache.rescaled_count += rescaled;

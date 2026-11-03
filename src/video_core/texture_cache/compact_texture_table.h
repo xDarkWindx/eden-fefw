@@ -48,8 +48,8 @@ struct CompactTextureTable {
     /// The descriptors last written for this table, with what named them: the resolved banks
     /// (stamps, see texture_bank_reuse.h) and the texture cache generation. Raw bytes of the
     /// backend's descriptor entries. Build keeps them (current = false): when the array changes
-    /// but the banks do not, the elements whose key did not change keep their entries
-    /// (PatchCompactElements).
+    /// within one generation, the elements that resolve to the same view and sampler keep their
+    /// entries (PatchCompactElements).
     struct DescriptorCache {
         u64 view_stamp{};
         u64 sampler_stamp{};
@@ -57,19 +57,12 @@ struct CompactTextureTable {
         bool rescaled{};
         bool current{}; ///< Written for the table as it is now
         std::vector<u64> words;
-        std::vector<u64> keys;             ///< ElementKey of every element the words were written for
+        std::vector<u64> keys;             ///< CompactElementKey of every element the words were written for
         std::vector<u8> rescaled_elements; ///< Whether each element's image is rescaled
         u32 rescaled_count{};
     };
     mutable DescriptorCache descriptor_cache;
 
-    /// What an element's descriptor depends on once the banks are resolved: its TIC and TSC indices
-    /// (both well below 2^31, being handle fields) and whether it is excluded.
-    [[nodiscard]] u64 ElementKey(size_t element) const noexcept {
-        const Pair& pair = pairs[element_pairs[element]];
-        return u64{element_tics[element]} | (u64{unique_tscs[pair.tsc_slot]} << 32) |
-               (pair.excluded ? (u64{1} << 63) : 0);
-    }
 
     /// handles: (TIC, TSC) of every element; excluded: non-zero for excluded elements.
     /// Direct-mapped like the per-draw lookup memos, so a build costs about what binding the elements
@@ -273,11 +266,24 @@ bool PushCompactTextureBlock(const CompactTextureBlock& block, std::span<const I
     return rescaled;
 }
 
+/// What an element's descriptor is made from: the view it samples (null if excluded) and its
+/// sampler, as resolved for this draw. Within one texture cache generation the same ids make the
+/// same descriptor, whichever bank or table they came from.
+[[nodiscard]] inline u64 CompactElementKey(const CompactTextureBlock& block, size_t element,
+                                           std::span<const ImageViewId> view_ids,
+                                           std::span<const SamplerId> sampler_ids) noexcept {
+    const CompactTextureTable& table = *block.table;
+    const auto& pair = table.pairs[table.element_pairs[element]];
+    const ImageViewId view_id =
+        pair.excluded ? NULL_IMAGE_VIEW_ID : view_ids[block.view_ids + pair.tic_slot];
+    return u64{view_id.index} | (u64{sampler_ids[block.sampler_ids + pair.tsc_slot].index} << 32);
+}
+
 /// Brings a block's cached per-element results up to date with its table: for every element whose
-/// ElementKey differs from keys[element], write(element, image of its pair) runs and keys[element]
-/// is updated. make(view_id, sampler_id, guest_index) runs once per distinct pair needed, as in
-/// PushCompactTextureBlock. Only valid when keys were written for the same resolved banks (the
-/// same TIC and TSC indices then resolve to the same ids). Returns the elements rewritten.
+/// CompactElementKey differs from keys[element], write(element, image of its pair) runs and
+/// keys[element] is updated. make(view_id, sampler_id, guest_index) runs once per distinct pair
+/// needed, as in PushCompactTextureBlock. Only valid when keys were written in the same texture
+/// cache generation (the same ids then make the same images). Returns the elements rewritten.
 template <typename Image, typename Make, typename Write>
 size_t PatchCompactElements(const CompactTextureBlock& block, std::span<const ImageViewId> view_ids,
                             std::span<const SamplerId> sampler_ids, std::span<u64> keys,
@@ -288,7 +294,7 @@ size_t PatchCompactElements(const CompactTextureBlock& block, std::span<const Im
     made.assign(table.pairs.size(), 0);
     size_t rewritten = 0;
     for (size_t element = 0; element < table.element_tics.size(); ++element) {
-        const u64 key = table.ElementKey(element);
+        const u64 key = CompactElementKey(block, element, view_ids, sampler_ids);
         if (keys[element] == key) {
             continue;
         }
