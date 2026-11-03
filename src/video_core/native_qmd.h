@@ -37,9 +37,8 @@ public:
     template <typename Read, typename Release, typename Dispatch>
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
-        // Outside EDEN_NATIVE_STRICT, a dispatch the backend cannot run is skipped but still
-        // completes, so its semaphore releases and dependent QMDs do not leave the game waiting.
-        static const bool strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
+        // A dispatch the backend cannot run is skipped but still completes, so its semaphore
+        // releases and dependent QMDs do not leave the game waiting.
         bool dispatch_skipped = false;
         std::array<Pending, 256> pending{};
         std::size_t count = 1;
@@ -98,7 +97,6 @@ public:
                 }
             }
             if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff) && !dispatch(qmd)) {
-                if (strict) return "native shader dispatch required";
                 dispatch_skipped = true;
             }
             state.completed = true;

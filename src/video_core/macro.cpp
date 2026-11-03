@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/native_diagnostics.h"
 #include <cstdlib>
 #include <unordered_set>
 #include <cstring>
@@ -1345,13 +1344,6 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                           std::span<const u32> parameters) {
     if (native_turing) {
         maxwell3d.RefreshParameters();
-        const auto context = reinterpret_cast<std::uintptr_t>(this);
-        static std::unordered_set<std::uintptr_t> captured_contexts;
-        if (VideoCommon::NativeFrameCaptureEnabled() && captured_contexts.insert(context).second) {
-            std::ofstream dump("native-graphics-mme-" + std::to_string(context) + ".bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(native_code.data()), sizeof(native_code));
-        }
-        LOG_TRACE(HW_GPU, "Native MME context={:#x}", context);
         LOG_TRACE(HW_GPU, "Native MME start={:#x}, parameters={}, data={:08x}", method, parameters.size(), fmt::join(parameters, ","));
         auto& interpreter = maxwell3d.GetNativeMacroInterpreter();
         const auto read = [&](u32 address) {

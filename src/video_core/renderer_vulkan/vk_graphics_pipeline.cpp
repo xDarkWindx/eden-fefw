@@ -29,7 +29,6 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_notify.h"
 #include "video_core/native_vprs.h"
-#include "video_core/stack_trace_diagnostics.h"
 #include "video_core/texture_cache/lookup_memo.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"

@@ -8,7 +8,6 @@
 #include <fstream>
 #include <cstring>
 #include "common/assert.h"
-#include "common/timeline.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
@@ -365,7 +364,6 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
               params.num_entries, params.flags.raw);
 
     auto& gpu = system.GPU();
-    Common::Timeline::Mark("gpfifo", params.num_entries, params.flags.raw);
 
     std::scoped_lock lock(channel_mutex);
 

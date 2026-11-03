@@ -18,7 +18,6 @@
 #include <queue>
 
 #include "common/common_types.h"
-#include "common/timeline.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -78,11 +77,9 @@ public:
     /// drives the asynchronous flushes. Each fence costs a queue submit, and a game that releases a
     /// semaphore after every tiny dispatch then spends its frame in vkQueueSubmit, so the fence is
     /// deferred to the end of the command list (or to the next regular fence) instead.
-    /// EDEN_NO_FENCE_COALESCING=1 restores one fence per signal.
     void SignalFenceCoalesced(std::function<void()>&& func) {
-        static const bool disabled = std::getenv("EDEN_NO_FENCE_COALESCING") != nullptr;
         const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
-        if (disabled || delay_fence) {
+        if (delay_fence) {
             SignalFence(std::move(func));
             return;
         }
@@ -162,11 +159,9 @@ public:
                 wait_cv.notify_all();
             });
             SignalFence(std::move(func));
-            Common::Timeline::Mark("fence_wait_b", 0, reinterpret_cast<u64>(EDEN_RETURN_ADDRESS()));
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
-            Common::Timeline::Mark("fence_wait_e");
         }
     }
 
@@ -256,7 +251,6 @@ private:
                 WaitFence(current_fence);
             }
             PopAsyncFlushes();
-            Common::Timeline::Mark("fence_release", current_operations.size());
             for (auto& operation : current_operations) {
                 operation();
             }

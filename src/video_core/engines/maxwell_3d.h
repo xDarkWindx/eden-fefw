@@ -3327,7 +3327,6 @@ private:
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
-    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     /// The split stopped mid-session: macros run here again (on the single GPU thread).
     void LeaveFront();
     /// What ProcessMacro and CallMacroMethod do after a macro, run on the back.

@@ -618,13 +618,8 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
     });
     // Only later GPU work reads the decoded image, ordered by the barrier above, and the staging
     // buffer and descriptor sets are recycled by tick, so the CPU does not have to wait. Waiting
-    // here stalled emulation once per streamed ASTC texture. EDEN_ASTC_GPU_FINISH restores it.
-    static const bool finish = std::getenv("EDEN_ASTC_GPU_FINISH") != nullptr;
-    if (finish) {
-        scheduler.Finish();
-    } else {
-        scheduler.Flush();
-    }
+    // here stalled emulation once per streamed ASTC texture.
+    scheduler.Flush();
 }
 
 constexpr u32 BL3D_BINDING_INPUT_BUFFER  = 0;

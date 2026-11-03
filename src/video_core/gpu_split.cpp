@@ -56,10 +56,7 @@ void GpuSplit::ClearNativeFailures(Tegra::Engines::EngineInterface* engine) {
 
 void GpuSplit::MaybeStart(Core::System& system_) {
     const char mode = SplitMode();
-    // EDEN_NATIVE_STRICT stalls a channel on failed native work, which the front checks after
-    // every method against flags the back sets: keep one thread then.
-    static const bool native_strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
-    if ((mode != '1' && mode != '2') || native_strict ||
+    if ((mode != '1' && mode != '2') ||
         !native_channel_seen.load(std::memory_order_relaxed)) {
         return;
     }

@@ -15,7 +15,6 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
-#include "common/timeline.h"
 
 #include "common/settings.h"
 #include "common/thread.h"
@@ -27,7 +26,6 @@
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
-#include "video_core/stack_trace_diagnostics.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -52,9 +50,6 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
 
-    if (thread_check_enabled) {
-        LOG_ERROR(Render_Vulkan, "SchedulerThread check enabled");
-    }
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
@@ -62,73 +57,7 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 
 Scheduler::~Scheduler() = default;
 
-namespace {
-/// EDEN_GPU_PROFILE: counts submits per caller (return address), reported every 4 s. Resolve the
-/// printed offsets with `nm -C` / `addr2line` against the binary (offset is relative to NoteSubmit).
-void NoteSubmit(const char* kind, void* caller) {
-    static const bool enabled = std::getenv("EDEN_GPU_PROFILE") != nullptr;
-    if (!enabled) {
-        return;
-    }
-    static std::mutex mutex;
-    static std::map<std::pair<const char*, void*>, u64> counts;
-    static auto window_start = std::chrono::steady_clock::now();
-    std::scoped_lock lock{mutex};
-    ++counts[{kind, caller}];
-    const auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration<double>(now - window_start).count() < 4.0) {
-        return;
-    }
-    const auto base = reinterpret_cast<intptr_t>(&NoteSubmit);
-    for (const auto& [key, count] : counts) {
-        LOG_ERROR(Render_Vulkan, "SubmitCaller {} n={} ret_minus_NoteSubmit={}", key.first, count,
-                  reinterpret_cast<intptr_t>(key.second) - base);
-    }
-    counts.clear();
-    window_start = now;
-}
-
-#ifdef _MSC_VER
-extern "C" char __ImageBase;
-#endif
-
-/// Caller address as an image-relative offset (MSVC: resolve with llvm-symbolizer
-/// --relative-address), elsewhere relative to NoteSubmit.
-intptr_t CallerOffset(void* caller) {
-#ifdef _MSC_VER
-    const auto base = reinterpret_cast<intptr_t>(&__ImageBase);
-#else
-    const auto base = reinterpret_cast<intptr_t>(&NoteSubmit);
-#endif
-    return reinterpret_cast<intptr_t>(caller) - base;
-}
-} // namespace
-
-const bool Scheduler::thread_check_enabled = std::getenv("EDEN_SCHEDULER_THREAD_CHECK") != nullptr;
-
-void Scheduler::CheckRecordThread(const char* kind, void* caller) {
-    // EDEN_SCHEDULER_THREAD_CHECK: the scheduler is single-producer. Log whenever the producing
-    // thread changes, with the caller of the call that switched threads.
-    if (!caller) {
-        // Called from the inlined Record template: our return address is in its caller.
-        caller = EDEN_RETURN_ADDRESS();
-    }
-    static std::atomic<u32> lines{0};
-    const std::thread::id self = std::this_thread::get_id();
-    const std::thread::id previous = last_record_thread.exchange(self, std::memory_order_relaxed);
-    if (previous == self || lines.fetch_add(1, std::memory_order_relaxed) >= 400) {
-        return;
-    }
-    LOG_ERROR(Render_Vulkan, "SchedulerThread {} thread={} previous={} caller_rva={:#x}", kind,
-              std::hash<std::thread::id>{}(self), std::hash<std::thread::id>{}(previous),
-              CallerOffset(caller));
-}
-
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
-    NoteSubmit("Flush", EDEN_RETURN_ADDRESS());
-    if (thread_check_enabled) [[unlikely]] {
-        CheckRecordThread("Flush", EDEN_RETURN_ADDRESS());
-    }
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
     AllocateNewContext();
@@ -136,8 +65,6 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
 }
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
-    NoteSubmit("Finish", EDEN_RETURN_ADDRESS());
-    VideoCommon::NoteStackTrace("Finish");
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitExecution(signal_semaphore, wait_semaphore);
@@ -149,7 +76,6 @@ void Scheduler::WaitWorker() {
     DispatchWork();
 
     // Ensure the queue is drained.
-    Common::Timeline::Mark("worker_wait_b", 0, reinterpret_cast<u64>(EDEN_RETURN_ADDRESS()));
     {
         std::unique_lock ql{queue_mutex};
         event_cv.wait(ql, [this] { return work_queue.empty(); });
@@ -157,7 +83,6 @@ void Scheduler::WaitWorker() {
 
     // Now wait for execution to finish.
     std::scoped_lock el{execution_mutex};
-    Common::Timeline::Mark("worker_wait_e");
 }
 
 void Scheduler::DispatchWork() {

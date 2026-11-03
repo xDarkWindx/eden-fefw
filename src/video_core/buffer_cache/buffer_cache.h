@@ -19,9 +19,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
-#include "video_core/stack_trace_diagnostics.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
-#include "video_core/native_diagnostics.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/util.h"
@@ -258,10 +256,6 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads) {
-        if (VideoCommon::StackTraceEnabled() &&
-            VideoCommon::InWatchedStackTraceRange(*cpu_dest_address, amount)) {
-            VideoCommon::NoteStackTrace("HandleWrite");
-        }
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
@@ -1088,25 +1082,6 @@ void BufferCache<P>::PrepareGroupedStorage(std::span<const std::pair<Binding*, b
                 continue;
             }
             const VirtualSegments segments = *found;
-            if (static const bool log_splits = std::getenv("EDEN_LOG_STORAGE_SPLITS") != nullptr;
-                log_splits) {
-                static std::unordered_set<u64> logged;
-                if (logged.size() < 64 && logged.insert(group.address).second) {
-                    std::string text;
-                    for (const VirtualSegment& segment : segments) {
-                        text += fmt::format(" [gpu={:#x} dev={:#x} size={:#x}]", segment.gpu_addr,
-                                            segment.device_addr, segment.size);
-                    }
-                    for (size_t member : group.members) {
-                        text += fmt::format(" m(+{:#x},{:#x},{})",
-                                            bindings[member].first->gpu_addr - group.address,
-                                            bindings[member].first->size,
-                                            bindings[member].second ? "w" : "r");
-                    }
-                    LOG_WARNING(HW_GPU, "Split grouped storage gpu={:#x} size={:#x} members={} written={}:{}",
-                                group.address, size, group.members.size(), written, text);
-                }
-            }
             const u32 first = static_cast<u32>(pool.size());
             for (const VirtualSegment& segment : segments) {
                 const BufferId id = FindBuffer(segment.device_addr, segment.size, runtime.PrefersSparseSources());
@@ -1165,19 +1140,6 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
             return;
         }
         const VirtualSegments segments = *found;
-        if (static const bool log_splits = std::getenv("EDEN_LOG_STORAGE_SPLITS") != nullptr;
-            log_splits) {
-            static std::unordered_set<GPUVAddr> logged;
-            if (logged.size() < 64 && logged.insert(binding.gpu_addr).second) {
-                std::string text;
-                for (const VirtualSegment& segment : segments) {
-                    text += fmt::format(" [gpu={:#x} dev={:#x} size={:#x}]", segment.gpu_addr,
-                                        segment.device_addr, segment.size);
-                }
-                LOG_WARNING(HW_GPU, "Split storage binding gpu={:#x} size={:#x} written={}:{}",
-                            binding.gpu_addr, binding.size, is_written, text);
-            }
-        }
         const u32 first = static_cast<u32>(pool.size());
         const bool prefer_sparse = runtime.PrefersSparseSources();
         for (const VirtualSegment& segment : segments) {
@@ -1732,10 +1694,6 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
-    if (VideoCommon::StackTraceEnabled() &&
-        VideoCommon::InWatchedStackTraceRange(device_addr, size)) {
-        VideoCommon::NoteStackTrace("HandleWrite");
-    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -1950,10 +1908,6 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     const DAddr device_addr_end = device_addr_begin + size;
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
-    if (static const bool check_pages = std::getenv("EDEN_BUFFER_PAGE_CHECK") != nullptr;
-        check_pages) [[unlikely]] {
-        CheckPageTableChange<insert>(buffer_id, page_begin, page_end);
-    }
     if (insert) {
         total_used_memory += Common::AlignUp(size, 1024);
         buffer.setLRUID(lru_cache.Insert(buffer_id, frame_tick));
@@ -1969,67 +1923,6 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
             page_table[page] = buffer_id;
         } else if (page_table[page] == buffer_id) {
             page_table[page] = BufferId{};
-        }
-    }
-}
-
-template <class P>
-template <bool insert>
-void BufferCache<P>::CheckPageTableChange(BufferId buffer_id, u64 page_begin, u64 page_end) {
-    static u32 logs = 0;
-    const auto report = [&](std::string_view what, u64 page, BufferId other) {
-        if (logs >= 64) {
-            return;
-        }
-        ++logs;
-        const Buffer& buffer = slot_buffers[buffer_id];
-        const bool other_live = other && slot_buffers.contains(other);
-        LOG_ERROR(HW_GPU,
-                  "Buffer page check ({}): {} buffer_id={} range={:#x}+{:#x} page_addr={:#x} "
-                  "other_id={} other_live={} other_range={:#x}+{:#x}",
-                  insert ? "register" : "unregister", what, buffer_id.index, buffer.CpuAddr(),
-                  buffer.SizeBytes(), page << CACHING_PAGEBITS, other.index, other_live,
-                  other_live ? slot_buffers[other].CpuAddr() : 0,
-                  other_live ? slot_buffers[other].SizeBytes() : 0);
-    };
-    // The cache is meant to be mutated from one thread at a time; a change of thread hints at
-    // a path that bypasses the cache mutex.
-    static std::thread::id last_thread{};
-    static u32 thread_logs = 0;
-    const std::thread::id this_thread = std::this_thread::get_id();
-    if (last_thread != std::thread::id{} && last_thread != this_thread && thread_logs < 8) {
-        ++thread_logs;
-        LOG_ERROR(HW_GPU, "Buffer page check: mutating thread changed at buffer_id={} ({})",
-                  buffer_id.index, insert ? "register" : "unregister");
-    }
-    last_thread = this_thread;
-    if constexpr (insert) {
-        // ResolveOverlaps unregistered every overlap, so the new range must be empty.
-        for (u64 page = page_begin; page != page_end; ++page) {
-            if (page_table[page]) {
-                report("overwrites a page entry", page, page_table[page]);
-            }
-        }
-        // Entries for this id outside the range are left over from the slot's previous buffer.
-        for (u64 page = 0; page != page_table.size(); ++page) {
-            if (page_table[page] == buffer_id && (page < page_begin || page >= page_end)) {
-                report("reused slot already in the page table", page, buffer_id);
-            }
-        }
-    } else {
-        if (slot_buffers[buffer_id].getLRUID() == SIZE_MAX) {
-            report("buffer was never registered", page_begin, BufferId{});
-        }
-        for (u64 page = page_begin; page != page_end; ++page) {
-            if (page_table[page] != buffer_id) {
-                report("page not owned by the buffer", page, page_table[page]);
-            }
-        }
-        // Any entry for this buffer outside its range survives the unregister and goes stale.
-        for (u64 page = 0; page != page_table.size(); ++page) {
-            if (page_table[page] == buffer_id && (page < page_begin || page >= page_end)) {
-                report("entry outside the buffer's range", page, buffer_id);
-            }
         }
     }
 }
@@ -2360,20 +2253,12 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
     const u64 following_word = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
     u32 size = StorageBufferSize(mapped_size, following_word, native_pointer);
-    static const bool no_device_clamp = std::getenv("EDEN_SSBO_NO_DEVICE_CLAMP") != nullptr;
-    if (native_pointer && size && !no_device_clamp) {
+    if (native_pointer && size) {
         // A bare pointer's size is a guess (up to 8 MiB of mapped GPU VA). NVN buffers live in one
         // memory pool, which is one device-contiguous allocation, so the guess must not run into
         // the next pool: a binding spanning two device ranges forces a whole-range gather/scatter
         // around every dispatch.
         size = static_cast<u32>(gpu_memory->DeviceContiguousSize(gpu_addr, size));
-    } else if (native_pointer && size && !gpu_memory->IsFullyMappedRange(gpu_addr, size)) {
-        u32 mapped_prefix = 0;
-        for (const auto& [address, length] : gpu_memory->GetSubmappedRange(gpu_addr, size)) {
-            if (address != gpu_addr + mapped_prefix) break;
-            mapped_prefix += static_cast<u32>(length);
-        }
-        size = mapped_prefix;
     }
 
     // Alignment only applies to the offset of the buffer
@@ -2395,15 +2280,6 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
     if (is_written) {
         binding_size = aligned_size;
-    }
-    if (native_pointer && NativeDrawDiagnosticsEnabled()) {
-        static std::mutex log_mutex;
-        static std::set<std::pair<GPUVAddr, u32>> logged;
-        std::scoped_lock log_lock{log_mutex};
-        if (logged.size() < 400 && logged.emplace(gpu_addr, binding_size).second) {
-            LOG_ERROR(HW_GPU, "NativeSSBO gpu={:#x} mapped_size={:#x} size={:#x} binding={:#x} written={}",
-                      gpu_addr, mapped_size, size, binding_size, is_written);
-        }
     }
     const Binding binding{
         .device_addr = *aligned_device_addr,

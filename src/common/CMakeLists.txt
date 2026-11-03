@@ -120,8 +120,6 @@ add_library(
     swap.h
     thread.cpp
     thread.h
-    timeline.cpp
-    timeline.h
     host_sampler.cpp
     host_sampler.h
     adpf.cpp

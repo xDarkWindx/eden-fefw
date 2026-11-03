@@ -104,9 +104,6 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
-        if (thread_check_enabled) [[unlikely]] {
-            CheckRecordThread("Record", nullptr);
-        }
         if (chunk->Record(command)) {
             return;
         }
@@ -315,9 +312,6 @@ private:
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
 
-    void CheckRecordThread(const char* kind, void* caller);
-    static const bool thread_check_enabled;
-    std::atomic<std::thread::id> last_record_thread{};
 
     State state;
 

@@ -5,12 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
-#include "video_core/native_diagnostics.h"
 #include <bitset>
 #include <cstdlib>
-#include <fstream>
-#include <filesystem>
-#include <unordered_set>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
@@ -19,7 +15,6 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_query_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 #ifdef ARCHITECTURE_x86_64
@@ -91,17 +86,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             static u32 diagnostic_writes{};
             if (diagnostic_writes++ < 4096) LOG_DEBUG(HW_GPU, "Native compute MME emit method={:#x}, value={:#x}", address, value);
             if (address >= 0xe00) return false;
-            // Macros stream inline data one word at a time. EDEN_MACRO_UPLOAD_BATCH=1 buffers
-            // the words and flushes them as one write before any other method (or at the end
-            // of the macro), instead of one AccelerateInlineToMemory per word. Opt-in: the
-            // saved battle then reaches 60 fps, which exposes a black-output race (see
-            // plans/codex-handoff.md); at <=56 fps the batched output is correct.
-            static const bool batch = std::getenv("EDEN_MACRO_UPLOAD_BATCH") != nullptr;
-            const bool streams_upload = batch &&
-                                        address == KEPLER_COMPUTE_REG_INDEX(data_upload) &&
-                                        upload_state.DefersPartialFlush();
-            if (!streams_upload) upload_state.FlushPartial();
-            CallMethod(system, address, value, !streams_upload);
+            upload_state.FlushPartial();
+            CallMethod(system, address, value, true);
             return true;
         };
         const auto result = [&] {
@@ -125,8 +111,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         upload_state.FlushPartial();
         if (!result.success) {
             native_macro->native_execution_failed = true;
-            std::ofstream dump("native-compute-mme.bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(native_macro->native_code.data()), sizeof(native_macro->native_code));
             LOG_ERROR(HW_GPU, "Native MME failed: compute start={:#x}, pc={:#x}, consumed={}/{}, error={}, parameters={:08x}",
                 native_macro_positions[entry], result.pc, result.consumed, native_parameters.size(), result.error,
                 fmt::join(native_parameters, ","));
@@ -135,32 +119,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         return true;
     }
     native_registers[method] = argument;
-    if (method == 0x5a || (method >= 0xc6 && method <= 0x108)) {
-        VideoCommon::TraceNativeQuery(12, memory_manager.GetID(), method, 0, 0, argument, 0);
-    }
     if (method == 0x107) {
         const GPUVAddr address = ((GPUVAddr{native_registers[0xc6]} << 32) |
             native_registers[0xc7]) << 8;
-        const GPUVAddr program = (GPUVAddr{native_registers[0xc8 + 49] & 0x1ffff} << 32) |
-            native_registers[0xc8 + 48];
         const u32 control = native_registers[0xa7];
-        LOG_TRACE(HW_GPU, "Native inline QMD: address={:#x}, program={:#x}, control={:#x}, grid={}/{}/{}",
-            address, program, control, native_registers[0xc8 + 12],
-            native_registers[0xc8 + 13] & 0xffff, native_registers[0xc8 + 14] & 0xffff);
-        // EDEN_NATIVE_INLINE_QMD_DUMP: rewrites these files on every inline dispatch (slow).
-        static const bool dump_inline_qmd = std::getenv("EDEN_NATIVE_INLINE_QMD_DUMP") != nullptr;
-        if (dump_inline_qmd) {
-            std::ofstream dump("native-inline-qmd.bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(native_registers.data() + 0xc8), 256);
-            std::ofstream registers("native-inline-compute-registers.bin", std::ios::binary);
-            registers.write(reinterpret_cast<const char*>(native_registers.data()), sizeof(native_registers));
-            std::ofstream shader("native-inline-compute-shader.bin", std::ios::binary);
-            if (memory_manager.IsFullyMappedRange(program, 0x10000)) {
-                std::vector<u8> code(0x10000);
-                memory_manager.ReadBlockUnsafe(program, code.data(), code.size());
-                shader.write(reinterpret_cast<const char*>(code.data()), code.size());
-            }
-        }
         if (!memory_manager.IsFullyMappedRange(address, 256)) {
             native_macro->native_execution_failed = true;
             LOG_ERROR(HW_GPU, "Unmapped native inline QMD destination");
@@ -191,55 +153,14 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const GPUVAddr qmd_address = GPUVAddr{native_registers[0xad]} << 8;
         auto& scheduler = native_context
             ? native_context->GetQmdScheduler(memory_manager.GetID()) : native_qmd;
-        VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
-            memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
-        VideoCommon::TraceNativeQuery(13, memory_manager.GetID(), qmd_address,
-            reinterpret_cast<std::uintptr_t>(&scheduler), method,
-            reinterpret_cast<std::uintptr_t>(native_context), argument);
-        const auto trace_state = [&](u32 event) {
-            if (!VideoCommon::NativeDrawDiagnosticsEnabled()) return;
-            const auto state = scheduler.Inspect(qmd_address);
-            VideoCommon::TraceNativeQuery(event, memory_manager.GetID(), qmd_address,
-                state.flags, method, u64{static_cast<u32>(state.dependencies)} |
-                (u64{static_cast<u32>(state.deferred)} << 32), argument);
-        };
-        trace_state(14);
         if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
             (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) return true;
-        if ((argument & 15) == 12 && VideoCommon::NativeDrawDiagnosticsEnabled()) {
-            static u32 captured{};
-            if (captured++ == 0 && memory_manager.IsFullyMappedRange(qmd_address, 256)) {
-                std::array<u32, 64> descriptor{};
-                memory_manager.ReadBlockUnsafe(qmd_address, descriptor.data(), sizeof(descriptor));
-                std::ofstream dump("native-increment-qmd.bin", std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(descriptor.data()), sizeof(descriptor));
-                LOG_WARNING(HW_GPU, "Native increment dependency descriptor: address={:#x}, words={:08x}",
-                    qmd_address, fmt::join(descriptor, ","));
-            }
-        }
         const auto error = scheduler.Signal(qmd_address, argument,
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
-                NativeQmdScheduler::Descriptor previous{};
-                if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-                    memory_manager.ReadBlockUnsafe(address, previous.data(), sizeof(previous));
-                }
                 // QMD fields can be patched by earlier GPU writes. Fetch the
                 // descriptor through the cache-coherent path before scheduling.
                 memory_manager.ReadBlock(address, descriptor.data(), sizeof(descriptor));
-                if (VideoCommon::NativeDrawDiagnosticsEnabled() && previous != descriptor) {
-                    LOG_INFO(HW_GPU, "Native QMD coherent read changed descriptor {:#x}: release={}/{} -> {}/{}",
-                             address, previous[26], previous[30], descriptor[26], descriptor[30]);
-                }
-                for (u32 slot = 0; slot < NativeQmdScheduler::ReleaseWords.size(); ++slot) {
-                    const u32 base = NativeQmdScheduler::ReleaseWords[slot];
-                    const u32 flags = descriptor[base + 1];
-                    if (!(flags & (1U << 23))) continue;
-                    const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | descriptor[base];
-                    VideoCommon::TraceNativeQuery(slot == 2 ? 19 : 7 + slot, memory_manager.GetID(), destination,
-                        memory_manager.GpuToCpuAddress(destination).value_or(0),
-                        descriptor[4], descriptor[base + 2], flags);
-                }
                 return true;
             },
             [&](u64 address, u32 payload, u32 flags) {
@@ -248,8 +169,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     rasterizer->SignalFenceCoalesced([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;
                         memory_manager.Write<u32>(address, value);
-                        VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
-                            memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
                     });
                 } else {
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
@@ -257,7 +176,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 }
                 return true;
             }, [&](const auto& descriptor) { return DispatchNativeCompute(descriptor); });
-        trace_state(15);
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
             return true;
@@ -277,18 +195,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             // The dispatch already completed and released its semaphores. The QMD and macro dumps
             // below write several files per call, which dominates the frame time when a shader is
             // rejected on every dispatch.
-            static const bool strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
-            if (!strict) return true;
+            return true;
         }
         std::array<u32, 128> qmd{};
         if (memory_manager.IsFullyMappedRange(qmd_address, sizeof(qmd))) {
             memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
-            std::ofstream dump("native-qmd.bin", std::ios::binary);
-            dump.write(reinterpret_cast<const char*>(qmd.data()), sizeof(qmd));
-            std::ofstream macros("native-dispatch-mme.bin", std::ios::binary);
-            macros.write(reinterpret_cast<const char*>(native_macro->native_code.data()), sizeof(native_macro->native_code));
-            std::ofstream registers("native-dispatch-registers.bin", std::ios::binary);
-            registers.write(reinterpret_cast<const char*>(native_registers.data()), sizeof(native_registers));
         }
         LOG_ERROR(HW_GPU, "Native compute dispatch unsupported: method={:#x}, value={:#x}, QMD={:#x}, words={:08x}", method, argument,
                   qmd_address, fmt::join(qmd, ","));
@@ -370,79 +281,6 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 }
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
-    static u32 capture_index{}, capture_remaining{};
-    static bool capture_memory{};
-    static std::unordered_set<GPUVAddr> captured_programs;
-    if (VideoCommon::NativeDrawOnDemandEnabled()) {
-        std::error_code error;
-        if (VideoCommon::NativeRequestPending() && std::filesystem::exists("native-compute.request", error)) {
-            std::ifstream request("native-compute.request");
-            u32 count{};
-            u32 memory{};
-            request >> count;
-            request >> memory;
-            request.close();
-            if (count && count <= 1024 && std::filesystem::remove("native-compute.request", error)) {
-                capture_remaining = count;
-                capture_memory = memory == 1;
-                capture_index = 0;
-                captured_programs.clear();
-            }
-        }
-    }
-    if (capture_remaining) {
-        --capture_remaining;
-        const auto prefix = fmt::format("native-requested-compute-{}", capture_index++);
-        std::ofstream descriptor(prefix + "-qmd.bin", std::ios::binary);
-        descriptor.write(reinterpret_cast<const char*>(qmd.data()), sizeof(qmd));
-        const GPUVAddr program = (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
-        if (captured_programs.size() < 64 && captured_programs.insert(program).second) {
-            const auto dump = [&](const std::string& name, GPUVAddr address, size_t size) {
-                if (!size || !memory_manager.IsFullyMappedRange(address, size)) return;
-                std::vector<u8> bytes(size);
-                memory_manager.ReadBlockUnsafe(address, bytes.data(), bytes.size());
-                std::ofstream file(prefix + name + ".bin", std::ios::binary);
-                file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-            };
-            size_t size{};
-            while (size < 0x20000 && memory_manager.IsFullyMappedRange(program + size, 0x1000)) size += 0x1000;
-            dump("-shader", program, size);
-            for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
-                if (!(qmd[20] & (1U << slot))) continue;
-                const u32 high = qmd[33 + slot * 2];
-                const GPUVAddr address = (GPUVAddr{high & 0xff} << 32) | qmd[32 + slot * 2];
-                dump(fmt::format("-cbuf-{}", slot), address, (std::min)(u32{0x10000}, ((high >> 19) & 0x1fff) << 4));
-                if (capture_memory && slot == 0) {
-                    const u32 cbuf_size = (std::min)(u32{0x400}, ((high >> 19) & 0x1fff) << 4);
-                    u32 captured{};
-                    for (u32 offset = 0x100; offset + 8 <= cbuf_size && captured < 16; offset += 8) {
-                        const GPUVAddr pointer = memory_manager.Read<u64>(address + offset);
-                        if (!pointer || !memory_manager.IsWithinGPUAddressRange(pointer) ||
-                            !memory_manager.IsFullyMappedRange(pointer, 1)) continue;
-                        size_t length{};
-                        for (const auto& [segment, bytes] : memory_manager.GetSubmappedRange(pointer, 0x10000)) {
-                            if (segment != pointer + length) break;
-                            length += bytes;
-                        }
-                        if (!length) continue;
-                        for (const auto& [segment, bytes] : memory_manager.GetSubmappedRange(pointer, length)) {
-                            if (const auto physical = memory_manager.GpuToCpuAddress(segment)) {
-                                rasterizer->FlushRegion(*physical, bytes, VideoCommon::CacheType::BufferCache);
-                            }
-                        }
-                        dump(fmt::format("-memory-{:x}-{:x}", offset, pointer), pointer, length);
-                        ++captured;
-                    }
-                }
-            }
-        }
-    }
-    if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-        const u64 program = qmd[48] | (u64{qmd[49] & 0x1ffff} << 32);
-        if (VideoCommon::NativeDispatchDimsBudget() > 0) LOG_ERROR(HW_GPU, "DispatchProgram {:x}", program);
-        std::ofstream dump(fmt::format("native-compute-qmd-{:x}.bin", program), std::ios::binary);
-        dump.write(reinterpret_cast<const char*>(qmd.data()), sizeof(qmd));
-    }
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
     launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);

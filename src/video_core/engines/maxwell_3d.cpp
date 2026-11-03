@@ -43,7 +43,6 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
-    u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred draw to issue at the end of a macro.
     bool draw_pending{true};
@@ -53,7 +52,6 @@ struct Maxwell3D::FrontState {
     bool instance_pending{true};
     /// The running macro sent a write (the back clears the failure flags after the macro).
     bool macro_wrote{};
-    bool skip_same{};
 };
 
 Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
@@ -264,9 +262,7 @@ bool Maxwell3D::ReadMacroMemory(GPUVAddr address, std::span<u32> words) {
 }
 
 void Maxwell3D::RefreshParametersImpl() {
-    // EDEN_REFRESH_MACRO_PARAMS=1: re-read memory-sourced macro parameters at every accuracy level.
-    static const bool always_refresh = std::getenv("EDEN_REFRESH_MACRO_PARAMS") != nullptr;
-    if (!always_refresh && !Settings::IsGPULevelHigh()) {
+    if (!Settings::IsGPULevelHigh()) {
         return;
     }
     size_t current_index = 0;
@@ -758,22 +754,6 @@ void Maxwell3D::SetHLEReplacementAttributeType(u32 bank, u32 offset,
 
 namespace {
 
-// EDEN_GPU_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
-// front's registers with the back's (logs and resynchronizes differences).
-bool FrontVerifyEnabled() {
-    static const bool verify = std::getenv("EDEN_GPU_SPLIT_VERIFY") != nullptr;
-    return verify;
-}
-
-// EDEN_GPU_SPLIT_SKIP=0: send state writes that keep the register's value too.
-bool FrontSkipSame() {
-    static const bool skip = [] {
-        const char* value = std::getenv("EDEN_GPU_SPLIT_SKIP");
-        return value == nullptr || value[0] != '0';
-    }();
-    return skip;
-}
-
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
 bool FrontHandledOutsideDrawManager(u32 method) {
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
@@ -821,7 +801,6 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
-        front->skip_same = FrontSkipSame();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -867,7 +846,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (!execution_mask[method]) {
         // Nothing would change on the back: the register holds the value already and the shadow
         // RAM (tracked by default) too. Only dirty flags would be set, for state that is equal.
-        if (fs.regs[method] == value && shadow_kept && fs.skip_same && !fs.instance_pending) {
+        if (fs.regs[method] == value && shadow_kept && !fs.instance_pending) {
             return;
         }
         fs.regs[method] = value;
@@ -1097,55 +1076,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     } else if (fs.macro_wrote) {
         fs.macro_wrote = false;
         split.Defer([this] { VideoCommon::GpuSplit::ClearNativeFailures(this); });
-    }
-    if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
-        FrontVerify(split, fs);
-    }
-}
-
-void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
-    split.Drain();
-    static u64 checks{};
-    static u64 differences{};
-    static u64 control_differences{};
-    ++checks;
-    // State writes the back still holds in its method sink count as done.
-    std::array<u32, Regs::NUM_REGS> expected;
-    std::memcpy(expected.data(), regs.reg_array.data(), sizeof(expected));
-    for (const auto& [method, value] : method_sink) {
-        expected[method] = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
-                               ? shadow_state.reg_array[method]
-                               : value;
-    }
-    for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
-        if (fs.regs[i] != expected[i]) {
-            if (differences++ < 64) {
-                LOG_WARNING(HW_GPU, "Split front register {:#x}: front {:#x}, back {:#x}", i,
-                            fs.regs[i], expected[i]);
-            }
-            fs.regs[i] = expected[i];
-        }
-    }
-    if (fs.control != shadow_state.shadow_ram_control) {
-        if (control_differences++ < 16) {
-            LOG_WARNING(HW_GPU, "Split front shadow RAM control {} vs back {}",
-                        static_cast<u32>(fs.control),
-                        static_cast<u32>(shadow_state.shadow_ram_control));
-        }
-        fs.control = shadow_state.shadow_ram_control;
-    }
-    for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
-        if (fs.shadow[i] != shadow_state.reg_array[i]) {
-            if (control_differences++ < 16) {
-                LOG_WARNING(HW_GPU, "Split front shadow register {:#x}: front {:#x}, back {:#x}", i,
-                            fs.shadow[i], shadow_state.reg_array[i]);
-            }
-            fs.shadow[i] = shadow_state.reg_array[i];
-        }
-    }
-    if ((checks & 63) == 1) {
-        LOG_INFO(HW_GPU, "Split front register checks: {} done, {} differences", checks,
-                 differences);
     }
 }
 

@@ -95,7 +95,6 @@ add_library(video_core STATIC
     fence_manager.h
     gpu.cpp
     gpu.h
-    native_query_trace.h
     native_root_table.h
     native_semaphore.h
     gpu_split.cpp
@@ -232,8 +231,6 @@ add_library(video_core STATIC
     shader_environment.h
     shader_notify.cpp
     shader_notify.h
-    stack_trace_diagnostics.cpp
-    stack_trace_diagnostics.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp

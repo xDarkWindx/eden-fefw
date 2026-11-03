@@ -8,7 +8,6 @@
 
 #include <ranges>
 #include "common/settings.h"
-#include "common/timeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -84,13 +83,11 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
-        Common::Timeline::Mark("sem_wait_b", tick, reinterpret_cast<u64>(EDEN_RETURN_ADDRESS()));
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
             last_tick = gpu_tick.load(std::memory_order_relaxed);
         }
-        Common::Timeline::Mark("sem_wait_e", tick);
         return;
     }
 
@@ -107,10 +104,8 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
-    Common::Timeline::Mark("sem_wait_b", tick, reinterpret_cast<u64>(EDEN_RETURN_ADDRESS()));
     while (!semaphore.Wait(tick)) {
     }
-    Common::Timeline::Mark("sem_wait_e", tick);
 
     Refresh();
 }

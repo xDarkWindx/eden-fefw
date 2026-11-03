@@ -14,7 +14,6 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
-#include "video_core/native_query_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -59,12 +58,6 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 }
 
 void MaxwellDMA::Launch() {
-    if (memory_manager.UsesNativeTiling()) {
-        const GPUVAddr destination = regs.offset_out;
-        VideoCommon::TraceNativeQuery(10, memory_manager.GetID(), destination,
-            memory_manager.GpuToCpuAddress(destination).value_or(0),
-            regs.line_count, static_cast<GPUVAddr>(regs.offset_in), regs.line_length_in);
-    }
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
 
     // TODO(Subv): Perform more research and implement all features of this engine.

@@ -2656,12 +2656,8 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
     null_image = MakeImage(*device, runtime.memory_allocator, info, {});
     image_handle = *null_image;
     // Without nullDescriptor this stand-in image is what guest "null texture" reads sample. Fresh
-    // memory is not guaranteed zero, so clear it (EDEN_NULL_TEXTURE_VALUE overrides, for tests).
+    // memory is not guaranteed zero, so clear it.
     {
-        static const float value = [] {
-            const char* text = std::getenv("EDEN_NULL_TEXTURE_VALUE");
-            return text ? static_cast<float>(std::atof(text)) : 0.0f;
-        }();
         runtime.scheduler.RequestOutsideRenderPassOperationContext();
         runtime.scheduler.Record([image = *null_image](vk::CommandBuffer cmdbuf) {
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS,
@@ -2679,7 +2675,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
             };
             cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                                    barrier);
-            const VkClearColorValue color{.float32 = {value, value, value, value}};
+            const VkClearColorValue color{.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
             cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, color, range);
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -2838,22 +2834,6 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     VkFilter min_filter{MaxwellToVK::Sampler::Filter(tsc.min_filter)};
     VkSamplerMipmapMode mipmap_mode{MaxwellToVK::Sampler::MipmapMode(tsc.mipmap_filter)};
 
-    // EDEN_NX2_FORCE_FILTER=linear|point overrides the guest sampler to bisect texture-quality
-    // problems such as aliased UI art. "linear" also drops the LOD clamp, so mipmaps are used even
-    // where the guest asked for none; "point" forces nearest everywhere. Unset leaves it untouched.
-    const char* const force_filter{std::getenv("EDEN_NX2_FORCE_FILTER")};
-    const bool forced_filter{force_filter != nullptr};
-    const bool force_point{forced_filter && (std::strcmp(force_filter, "point") == 0 ||
-                                             std::strcmp(force_filter, "nearest") == 0)};
-    if (forced_filter) {
-        mag_filter = force_point ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        min_filter = force_point ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        mipmap_mode = force_point ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        // Vulkan requires linear min/mag filters whenever anisotropy is enabled.
-        if (force_point) {
-            max_anisotropy = 1.0f;
-        }
-    }
 
     const VkSamplerAddressMode wrap_u{
         MaxwellToVK::Sampler::WrapMode(device, tsc.wrap_u, tsc.mag_filter)};
@@ -2895,11 +2875,6 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         min_lod = tsc.MinLod();
         max_lod = tsc.MaxLod();
     }
-    if (forced_filter) {
-        // Test whether the guest's LOD clamp is what leaves minified art on mip 0.
-        min_lod = 0.0f;
-        max_lod = VK_LOD_CLAMP_NONE;
-    }
     base_ci = VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -2920,16 +2895,6 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         .borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT,
         .unnormalizedCoordinates = VK_FALSE,
     };
-    if (std::getenv("EDEN_NX2_SAMPLER_DIAGNOSTICS") != nullptr) {
-        static std::atomic<u32> logged{};
-        if (logged.fetch_add(1) < 64) {
-            LOG_INFO(Render_Vulkan,
-                     "sampler: mag={} min={} mip={} lod=[{}, {}] bias={} aniso={} forced={}",
-                     static_cast<u32>(base_ci.magFilter), static_cast<u32>(base_ci.minFilter),
-                     static_cast<u32>(base_ci.mipmapMode), base_ci.minLod, base_ci.maxLod,
-                     base_ci.mipLodBias, base_ci.maxAnisotropy, forced_filter);
-        }
-    }
     variants.reserve(1);
     Emplace(VariantKey{});
 }

@@ -11,7 +11,6 @@
 #include <map>
 #include <chrono>
 #include <atomic>
-#include "common/timeline.h"
 #include <algorithm>
 #include <set>
 #include <tuple>
@@ -1030,7 +1029,6 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
-    Common::Timeline::Mark("inline_upload", address, copy_size);
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_addr) [[unlikely]] {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);

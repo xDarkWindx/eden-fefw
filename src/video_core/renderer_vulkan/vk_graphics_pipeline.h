@@ -108,10 +108,8 @@ public:
     /// Color targets this pipeline may write. The guest GPU leaves render targets that the
     /// fragment shader does not output untouched, while Vulkan leaves their contents undefined
     /// (NVIDIA overwrites them), so unwritten targets get a zero write mask.
-    /// EDEN_ALLOW_UNWRITTEN_RT_WRITES restores the old behaviour for comparison.
     u32 WrittenColorTargets() const noexcept {
-        static const bool allow_unwritten = std::getenv("EDEN_ALLOW_UNWRITTEN_RT_WRITES") != nullptr;
-        return allow_unwritten ? 0xff : fragment_store_mask;
+        return fragment_store_mask;
     }
 
     size_t PipelineHash() const noexcept {

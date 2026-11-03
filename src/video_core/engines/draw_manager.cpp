@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/native_diagnostics.h"
 #include <cstring>
 #include <fstream>
 #include <cstdlib>
@@ -318,34 +317,6 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
                 native.native_execution_failed = true;
                 LOG_ERROR(HW_GPU, "Native graphics shaders require the experimental Vulkan path");
                 return;
-            }
-            if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-                static thread_local std::set<std::array<GPUVAddr, Maxwell3D::Regs::MaxShaderProgram>> captured;
-                std::array<GPUVAddr, Maxwell3D::Regs::MaxShaderProgram> programs{};
-                for (size_t stage = 0; stage < programs.size(); ++stage) {
-                    if (!maxwell3d.regs.IsShaderConfigEnabled(stage)) continue;
-                    const auto& pipeline = maxwell3d.regs.pipelines[stage];
-                    programs[stage] = (GPUVAddr{pipeline.reserved[0] & 0xff} << 32) | pipeline.reserved[1];
-                }
-                if (captured.size() < 4096 && captured.insert(programs).second) {
-                    std::ofstream registers("native-graphics-registers.bin", std::ios::binary);
-                    registers.write(reinterpret_cast<const char*>(&maxwell3d.regs), sizeof(maxwell3d.regs));
-                    for (size_t stage = 0; stage < Maxwell3D::Regs::MaxShaderProgram; ++stage) {
-                        if (!maxwell3d.regs.IsShaderConfigEnabled(stage)) continue;
-                        const auto& pipeline = maxwell3d.regs.pipelines[stage];
-                        // C797 uses per-stage program addresses at 0x2014/0x2018,
-                        // unlike Maxwell's program-region plus 0x2004 offset.
-                        const GPUVAddr address = (GPUVAddr{pipeline.reserved[0] & 0xff} << 32) | pipeline.reserved[1];
-                        LOG_INFO(HW_GPU, "Native graphics shader stage={}, address={:#x}", stage, address);
-                        if (!maxwell3d.memory_manager.IsFullyMappedRange(address, 0x1000)) continue;
-                        std::array<u8, 0x1000> bytes{};
-                        maxwell3d.memory_manager.ReadBlockUnsafe(address, bytes.data(), bytes.size());
-                        std::ofstream shader("native-graphics-shader-" + std::to_string(stage) + ".bin", std::ios::binary);
-                        shader.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                    }
-                    LOG_DEBUG(HW_GPU, "Translating native graphics draw: indexed={}, vertices={}, instances={}",
-                              draw_indexed, count, instance_count);
-                }
             }
         }
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);

@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <limits>
 #include "core/hle/service/am/service/native_video_layout.h"
-#include "common/timeline.h"
 #include "core/hle/service/am/service/native_video_decoder.h"
 #include <algorithm>
 #include <atomic>
@@ -886,7 +885,6 @@ private:
                 if (state.producer->DetachReleasedBuffer(*state.queued[slot]) != android::Status::NoError) continue;
                 state.queued[slot].reset();
                 state.available |= u64{1} << slot;
-                Common::Timeline::Mark("buf_release", slot);
                 if (static const bool trace = std::getenv("EDEN_NATIVE_WINDOW_TRACE") != nullptr; trace) {
                     LOG_INFO(Service_AM, "Native display buffer retired: slot={}, mask={:#x}, reported={:#x}, outstanding={}",
                              slot, state.available, ReportedAvailability(state), OutstandingPresents(state));
@@ -1008,7 +1006,6 @@ private:
             });
             system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{1}, std::chrono::milliseconds{1}, m_release_poll);
         }
-        Common::Timeline::Mark("queue_image", slot, fence_id);
         LOG_INFO(Service_AM, "Native image queued for display: image={}, slot={}, fence={}/{}, dimensions={}x{}, outstanding={}",
                  image->id, slot, fence_id, packet[24], native->width, native->height, OutstandingPresents(state));
         R_SUCCEED();

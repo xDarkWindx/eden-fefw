@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/alignment.h"
-#include "common/timeline.h"
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hardware_properties.h"
@@ -320,7 +319,6 @@ bool HandleSvc(Core::System& system, u32 imm, std::span<u64, 8> args) {
         }
         const u64 resume = stack.back();
         stack.pop_back();
-        Common::Timeline::Mark("hook_ret", resume, args[0]);
         if (lines.fetch_add(1) < LineLimit()) {
             LOG_ERROR(Core, "GuestHooks RET x0={:#x} -> {}", args[0], Describe(resume));
         }
@@ -366,7 +364,6 @@ bool HandleSvc(Core::System& system, u32 imm, std::span<u64, 8> args) {
             LOG_ERROR(Core, "GuestHooks ENTER {} x0={:#x} x1={:#x} x2={:#x} x3={:#x} lr={:#x} ({})",
                       hook.name, args[0], args[1], args[2], args[3], ctx.lr, Describe(ctx.lr));
         }
-        Common::Timeline::Mark("hook_enter", ctx.lr, args[0]);
         saved_returns[ctx.sp].push_back(ctx.lr);
         ctx.lr = hook.return_stub;
         ctx.pc = hook.stub;

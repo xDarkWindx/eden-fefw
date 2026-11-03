@@ -7,7 +7,6 @@
 #include <bit>
 
 #include "common/assert.h"
-#include "common/timeline.h"
 #include "common/bit_util.h"
 #include "common/fiber.h"
 #include "common/logging.h"
@@ -341,8 +340,6 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
     if (next_thread == cur_thread) {
         return;
     }
-    Common::Timeline::Mark("switch", (static_cast<u64>(m_core_id) << 32) | (next_thread == m_idle_thread ? 0xffffffffu : static_cast<u32>(next_thread->GetThreadId())),
-                           next_thread->GetActiveCore() | (u64(next_thread->GetPriority()) << 8));
 
     // Next thread is now known not to be nullptr, and must not be dispatchable.
     ASSERT(next_thread->GetDisableDispatchCount() == 1);

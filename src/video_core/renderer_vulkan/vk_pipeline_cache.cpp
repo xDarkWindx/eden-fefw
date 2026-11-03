@@ -322,25 +322,9 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
-// EDEN_NX2_ASYNC_TRANSLATION=0: translate every graphics pipeline on the GPU thread, as before
-// (for A/B tests). Otherwise, with asynchronous shaders on, native graphics pipelines are
-// translated on worker threads.
-bool IsAsyncTranslationAllowed() {
-    const char* const value = std::getenv("EDEN_NX2_ASYNC_TRANSLATION");
-    return value == nullptr || value[0] != '0';
-}
-
-// EDEN_NX2_ASYNC_TRANSLATION_WAIT_MS=<milliseconds>: how long the GPU thread waits for a
-// pipeline it just queued before skipping the draw. Default 3; 0 never waits.
-std::chrono::microseconds GetTranslationWaitBudget() {
-    constexpr double DefaultMilliseconds = 3.0;
-    const char* const value = std::getenv("EDEN_NX2_ASYNC_TRANSLATION_WAIT_MS");
-    const double milliseconds = value != nullptr ? std::strtod(value, nullptr) : DefaultMilliseconds;
-    if (!(milliseconds > 0.0)) {
-        return std::chrono::microseconds{0};
-    }
-    return std::chrono::microseconds{static_cast<s64>(milliseconds * 1000.0)};
-}
+// How long the GPU thread waits for a native graphics pipeline it just queued for translation
+// before skipping the draw.
+constexpr std::chrono::microseconds TRANSLATION_WAIT_BUDGET{3000};
 
 // Translation threads also run the driver compile of what they translate. They get half of the
 // pipeline workers' count, so they cannot hold up the driver compiles queued on those (compute
@@ -385,9 +369,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
       // Translation threads compile in parallel with the pipeline workers: not on drivers that
       // break with parallel compiles.
-      use_async_translation{use_asynchronous_shaders && IsAsyncTranslationAllowed() &&
+      use_async_translation{use_asynchronous_shaders &&
                             !device.HasBrokenParallelShaderCompiling()},
-      translation_wait_budget{GetTranslationWaitBudget()},
+      translation_wait_budget{TRANSLATION_WAIT_BUDGET},
       num_translation_threads{use_async_translation ? GetTotalTranslationWorkers() : 0},
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),

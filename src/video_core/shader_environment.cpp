@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "video_core/native_diagnostics.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -463,19 +462,6 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
     native_source_header_size = source_header_size;
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
     std::vector<Instruction> native;
-    const auto dump_failure = [&] {
-        if (!std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") &&
-            !std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND")) return;
-        std::ofstream dump("native-rejected-shader.bin", std::ios::binary);
-        dump.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
-        if (native_header_size && gpu_memory->IsFullyMappedRange(program_base, native_header_size)) {
-            std::vector<u8> header(native_header_size);
-            gpu_memory->ReadBlock(program_base, header.data(), header.size());
-            std::ofstream full("native-rejected-shader-full.bin", std::ios::binary);
-            full.write(reinterpret_cast<const char*>(header.data()), header.size());
-            full.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
-        }
-    };
     Shader::Ampere::ProgramCaptureState capture;
     NativeInstructionReader reader{*gpu_memory};
     for (u32 index = 0; index < maximum_instructions; ++index) {
@@ -484,7 +470,6 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
         if (!reader.TryRead(address, instruction)) {
             // Not inside a fully mapped page: check and read this one instruction on its own.
             if (!gpu_memory->IsFullyMappedRange(address, sizeof(Instruction))) {
-                dump_failure();
                 throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
             }
             gpu_memory->ReadBlockUnsafe(address, &instruction, sizeof(instruction));
@@ -492,7 +477,6 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
         if (status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
-            dump_failure();
             throw Shader::RuntimeError("Native shader branch outside capture bounds");
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
@@ -523,63 +507,20 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             }
         }
     }
-    if (native_header_size == 0 && VideoCommon::NativeDrawDiagnosticsEnabled()) {
-        std::ofstream dump(fmt::format("native-compute-source-{:x}.bin", program_base), std::ios::binary);
-        dump.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
-    }
     std::vector<u32> verified_traps;
     for (u32 index = 0; index < native.size(); ++index) {
         if (native[index].Bits(0, 12) == 0x95c) verified_traps.push_back(index * sizeof(Instruction));
     }
     if (!verified_traps.empty()) {
         const size_t count = verified_traps.back() / sizeof(Instruction) + 1;
-        std::ofstream constants;
-        if (VideoCommon::NativeDrawDiagnosticsEnabled())
-            constants.open("native-trap-constants.bin", std::ios::binary);
         const Shader::Ampere::TrapGuardReader read = [&](u32 bank, u32 offset) -> std::optional<u32> {
-            const auto value = guard_reader ? guard_reader(bank, offset) : std::nullopt;
-            if (constants && value) {
-                const std::array<u32, 3> record{bank, offset, *value};
-                constants.write(reinterpret_cast<const char*>(record.data()), sizeof(record));
-            }
-            return value;
+            return guard_reader ? guard_reader(bank, offset) : std::nullopt;
         };
         if (stage != Shader::Stage::Compute || count > 256 ||
             !Shader::Ampere::VerifyTrapGuards(std::span{native}.first(count), read)) {
-            dump_failure();
             throw Shader::RuntimeError("Native compute trap is reachable or its uniform guard is unknown");
         }
         native_trap_prefix.assign(native.begin(), native.begin() + count);
-    }
-    if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-        if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
-            const u64 key = Shader::Ampere::NativeProgramKey(native);
-            std::vector<u8> header(native_header_size);
-            if (header.empty() || gpu_memory->IsFullyMappedRange(program_base, header.size())) {
-                if (!header.empty()) gpu_memory->ReadBlock(program_base, header.data(), header.size());
-                const u64 header_key = header.empty() ? 0 : Common::CityHash64(reinterpret_cast<const char*>(header.data()), header.size());
-                static std::mutex capture_mutex;
-                static std::set<std::array<u64,3>> captured;
-                static size_t captured_bytes{};
-                const size_t code_bytes = native.size() * sizeof(Instruction);
-                std::scoped_lock capture_lock(capture_mutex);
-                if (captured.size() < 2048 && code_bytes * 2 + header.size() <= 128 * 1024 * 1024 - captured_bytes &&
-                    captured.insert({key, header_key, static_cast<u64>(stage)}).second) {
-                    captured_bytes += code_bytes * 2 + header.size();
-                    const auto folder = std::filesystem::path{directory};
-                    std::filesystem::create_directories(folder);
-                    const auto name = fmt::format("{:016x}", key);
-                    std::ofstream source(folder / (name + ".source.bin"), std::ios::binary);
-                    source.write(reinterpret_cast<const char*>(native.data()), code_bytes);
-                    std::ofstream program(folder / fmt::format("{}-stage{}-{:016x}.program.bin", name, static_cast<u32>(stage), header_key), std::ios::binary);
-                    program.write(reinterpret_cast<const char*>(header.data()), header.size());
-                    program.write(reinterpret_cast<const char*>(native.data()), code_bytes);
-                    std::ofstream metadata(folder / (name + ".txt"));
-                    metadata << "stage " << static_cast<u32>(stage) << "\nprogram " << std::hex << program_base << std::dec
-                             << "\nheader_bytes " << header.size() << "\nsource_bytes " << code_bytes << '\n';
-                }
-            }
-        }
     }
     const u64 native_program_key = Shader::Ampere::NativeProgramKey(native);
     // EDEN_NATIVE_FRONTEND selects, per program and before any IR exists, whether the native Ampere
@@ -597,14 +538,6 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
         }
         // Diagnostic (auto mode): EDEN_NATIVE_AMPERE_KEYS limits the native frontend to the listed
         // program keys and "stageN" tokens; every other program falls back to lowering.
-        if (const char* allow = std::getenv("EDEN_NATIVE_AMPERE_KEYS");
-            allow && reject.empty() && frontend_mode == Shader::Ampere::FrontendMode::Auto) {
-            const std::string_view list{allow};
-            if (list.find(fmt::format("{:016x}", native_program_key)) == std::string_view::npos &&
-                list.find(fmt::format("stage{}", static_cast<u32>(stage))) == std::string_view::npos) {
-                reject = "not in EDEN_NATIVE_AMPERE_KEYS";
-            }
-        }
         if (reject.empty() && frontend_mode == Shader::Ampere::FrontendMode::Compare) {
             LOG_INFO(Shader, "ampere frontend: key={:016x} supported (compare mode keeps the lowering)",
                      native_program_key);
@@ -631,76 +564,6 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
         }
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true);
-    if (!lowered) {
-        dump_failure();
-        if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
-            const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
-            const auto folder = std::filesystem::path{directory};
-            std::filesystem::create_directories(folder);
-            const auto source_path = folder / (key + ".source.bin");
-            const auto override_path = folder / (key + ".override.bin");
-            {
-                std::ofstream dump(source_path, std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Shader::Ampere::Instruction));
-            }
-            {
-                // Retain mapped bytes beyond the first EXIT for investigating
-                // native CALL targets in compiler library subroutines.
-                std::ofstream mapped(folder / (key + ".mapped.bin"), std::ios::binary);
-                std::array<u8, 0x1000> block{};
-                for (u32 offset = 0; offset < 0x10000; offset += 0x1000) {
-                    if (!gpu_memory->IsFullyMappedRange(program_base + offset, block.size())) break;
-                    gpu_memory->ReadBlock(program_base + offset, block.data(), block.size());
-                    mapped.write(reinterpret_cast<const char*>(block.data()), block.size());
-                }
-            }
-            // EDEN_NATIVE_SHADER_NO_PAUSE=1: dump the rejected shader and carry on (the shader stays
-            // rejected). Without it the GPU thread waits up to 30 minutes for an override file, which stalls
-            // the whole title (Kirby Air Riders hung on its first rejected compute shader).
-            static const bool no_pause = [] {
-                const char* value = std::getenv("EDEN_NATIVE_SHADER_NO_PAUSE");
-                return value != nullptr && *value == '1';
-            }();
-            LOG_WARNING(Shader, "Native shader {}: key={}, offset={:#x}, reason={}, program={:#x}, header={}, source={}",
-                        no_pause ? "dumped (not paused)" : "paused", key, lowered.error_offset, lowered.error,
-                        program_base, native_header_size, source_path.string());
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes{30};
-            while (!no_pause && !gpu_memory->IsShuttingDown() && std::chrono::steady_clock::now() < deadline) {
-                if (std::filesystem::exists(override_path)) {
-                    std::ifstream file(override_path, std::ios::binary | std::ios::ate);
-                    const auto length = file.tellg();
-                    if (length <= 0 || length > 16 * 1024 * 1024) {
-                        throw Shader::RuntimeError("Invalid native shader override size");
-                    }
-                    std::vector<u8> bytes(static_cast<size_t>(length));
-                    file.seekg(0);
-                    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
-                    if (!file) throw Shader::RuntimeError("Native shader override read failed");
-                    const u32 source_bytes = Shader::Ampere::ProgramOverrideSourceSize(bytes);
-                    if (source_bytes > native.size() * sizeof(Shader::Ampere::Instruction)) {
-                        if (!gpu_memory->IsFullyMappedRange(program_base + native_header_size, source_bytes))
-                            throw Shader::RuntimeError("Unmapped extended native shader source");
-                        native.resize(source_bytes / sizeof(Shader::Ampere::Instruction));
-                        gpu_memory->ReadBlock(program_base + native_header_size, native.data(), source_bytes);
-                    }
-                    lowered = Shader::Ampere::DecodeProgramOverride(bytes, native);
-                    if (!lowered) throw Shader::RuntimeError("Native shader override rejected: {}", lowered.error);
-                    LOG_WARNING(Shader, "Native shader resumed: key={}, instructions={}", key, lowered.instructions.size());
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds{100});
-            }
-        }
-    }
-    if (lowered) {
-        // Diagnostic: comma-separated program keys that must be rejected as if unsupported.
-        if (const char* reject = std::getenv("EDEN_NATIVE_REJECT_KEYS")) {
-            const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
-            if (std::string_view{reject}.find(key) != std::string_view::npos) {
-                throw Shader::RuntimeError("Native shader {} rejected by EDEN_NATIVE_REJECT_KEYS", key);
-            }
-        }
-    }
     if (!lowered) {
         if (lowered.error_offset / sizeof(Instruction) < native.size()) {
             const auto& words = native[lowered.error_offset / sizeof(Instruction)].words;
@@ -745,22 +608,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        // EDEN_NATIVE_LOWER_GS=1 lets geometry and tessellation stages through the lowering.
-        static const bool lower_all_stages = std::getenv("EDEN_NATIVE_LOWER_GS") != nullptr;
-        if (!lower_all_stages && program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
+        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
-        }
-        if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-            const u32 native_stage = program == Maxwell::ShaderType::Pixel ? 4 : program == Maxwell::ShaderType::Geometry ? 3 : program == Maxwell::ShaderType::Tessellation ? 2 : program == Maxwell::ShaderType::TessellationInit ? 1 : 0;
-            for (u32 slot = 0; slot < maxwell3d->state.shader_stages[native_stage].const_buffers.size(); ++slot) {
-                const auto& table = maxwell3d->state.shader_stages[native_stage].const_buffers[slot];
-                if (!table.enabled || !table.size || table.size > Tegra::Engines::Maxwell3D::Regs::MaxConstBufferSize)
-                    continue;
-                std::vector<u8> bytes(table.size);
-                gpu_memory->ReadBlock(table.address, bytes.data(), bytes.size());
-                std::ofstream dump(fmt::format("native-graphics-cbuf-{}-{}.bin", static_cast<u32>(program), slot), std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-            }
         }
         stage = program == Maxwell::ShaderType::VertexB ? Shader::Stage::VertexB : Shader::Stage::Fragment;
         // The capture reads constant-buffer tables through ReadCbufValue, which indexes the stage's buffers.
@@ -1006,18 +855,6 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
-        if (VideoCommon::NativeDrawDiagnosticsEnabled()) {
-            for (u32 slot = 0; slot < 8; ++slot) {
-                const auto& buffer = qmd.const_buffer_config[slot];
-                if (!(qmd.const_buffer_enable_mask.Value() & (1U << slot)) || !buffer.size ||
-                    buffer.size > 0x10000 || !gpu_memory->IsFullyMappedRange(buffer.Address(), buffer.size))
-                    continue;
-                std::vector<u8> bytes(buffer.size);
-                gpu_memory->ReadBlock(buffer.Address(), bytes.data(), bytes.size());
-                std::ofstream dump(fmt::format("native-compute-cbuf-{:x}-{}.bin", program_base_, slot), std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-            }
-        }
         InitializeNativeCode(std::move(lowered_native_), 0, [&](u32 bank, u32 offset) {
             return ReadNativeGuardConstant(*kepler_compute, *gpu_memory, bank, offset);
         });

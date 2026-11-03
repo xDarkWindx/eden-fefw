@@ -467,10 +467,6 @@ private:
     template <bool insert>
     void ChangeRegister(BufferId buffer_id);
 
-    /// Debug check (EDEN_BUFFER_PAGE_CHECK): logs page_table changes that leave stale entries.
-    template <bool insert>
-    void CheckPageTableChange(BufferId buffer_id, u64 page_begin, u64 page_end);
-
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
@@ -541,15 +537,7 @@ private:
     /// everything is a large part of each fence's cost, and the reactive flush still brings any
     /// other page the CPU reads. From PokeDinner c3be47da (Eden-NS2 15b48a6615), where copying
     /// everything dropped Pokemon Pokopia from 60 to about 42 frames a second.
-    /// EDEN_BUFFER_DOWNLOADS=1 copies everything back, =0 only CPU-read pages, for every title.
     bool AsyncBufferDownloads() const {
-        static const int forced = [] {
-            const char* value = std::getenv("EDEN_BUFFER_DOWNLOADS");
-            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
-        }();
-        if (forced >= 0) {
-            return forced == 1;
-        }
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
     /// Buffer pages the guest CPU reads (NoteCpuRead).

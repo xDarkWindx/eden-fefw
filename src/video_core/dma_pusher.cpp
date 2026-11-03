@@ -56,7 +56,7 @@ void DmaPusher::DispatchCalls() {
 
 bool DmaPusher::HasFailedNativeWork() const {
     // With the GPU thread split the back thread clears the flags after each method it runs
-    // (gpu_split.cpp), as this does on one thread. (The split stays off with EDEN_NATIVE_STRICT.)
+    // (gpu_split.cpp), as this does on one thread.
     if (VideoCommon::GpuSplit::Get().Active()) {
         return false;
     }
@@ -65,12 +65,8 @@ bool DmaPusher::HasFailedNativeWork() const {
         !(context->engine.native_execution_failed || context->compute_engine.native_execution_failed)) {
         return false;
     }
-    // EDEN_NATIVE_STRICT keeps the channel stalled for debugging; otherwise drop the failed work
-    // (a skipped draw or dispatch) and keep the game running instead of hanging on its fences.
-    static const bool strict = std::getenv("EDEN_NATIVE_STRICT") != nullptr;
-    if (strict) {
-        return true;
-    }
+    // Drop the failed work (a skipped draw or dispatch) and keep the game running instead of
+    // hanging on its fences.
     static std::atomic<u32> reported{};
     if (reported.fetch_add(1) < 32) {
         LOG_WARNING(HW_GPU, "Native GPU work failed; skipping it and continuing the channel");

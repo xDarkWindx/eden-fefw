@@ -25,7 +25,6 @@
 #include "core/perf_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
-#include "video_core/native_query_trace.h"
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -82,10 +81,6 @@ struct GPU::Impl {
             current_channel = it->second.get();
             renderer->ReadRasterizer()->BindChannel(*current_channel);
         }
-        if (current_channel->native_abi) {
-            VideoCommon::TraceNativeQuery(17, current_channel->memory_manager->GetID(),
-                                          0, 0, 0, channel_id, 0);
-        }
     }
 
     std::shared_ptr<Control::ChannelState> AllocateChannel() {
@@ -124,17 +119,8 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        // EDEN_CACHED_WRITE=0: apply them by invalidation (re-upload from guest memory), as before.
-        static const bool cached_write = [] {
-            const char* value = std::getenv("EDEN_CACHED_WRITE");
-            return value == nullptr || value[0] != '0';
-        }();
         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            if (cached_write) {
-                renderer->ReadRasterizer()->OnCachedWrite(address, size);
-            } else {
-                renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
-            }
+            renderer->ReadRasterizer()->OnCachedWrite(address, size);
         });
         system.GatherGPUDirtyMemory(callback_writes);
     }
@@ -285,33 +271,15 @@ struct GPU::Impl {
                 free_swap_counters.pop_front();
             }
         }
-        // Diagnostic (EDEN_NATIVE_WINDOW_TRACE): when each composite is requested, registered on
-        // the GPU thread (with the guest syncpoint value then) and executed.
-        static const bool trace = std::getenv("EDEN_NATIVE_WINDOW_TRACE") != nullptr;
-        static std::atomic<u32> trace_count{};
-        const u64 trace_id = trace ? ++composite_trace_id : 0;
-        const bool traced = trace && trace_count++ < 4096;
-        if (traced) {
-            LOG_INFO(HW_GPU, "Native composite request: id={} address={:#x} fence={}/{} guest={}", trace_id,
-                     layers.empty() ? 0 : layers.front().address, num_fences ? fences[0].id : -1,
-                     num_fences ? fences[0].value : 0,
-                     num_fences ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(fences[0].id) : 0);
-        }
         pending_composite_fence = RequestSyncOperation(
             [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences), trace_id, traced] {
+             composite_fences = std::move(fences)] {
                 if (num_fences == 0) {
-                    if (traced) LOG_INFO(HW_GPU, "Native composite execute: id={} unfenced", trace_id);
                     renderer->Composite(composite_layers);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                if (traced) {
-                    LOG_INFO(HW_GPU, "Native composite register: id={} fence={}/{} guest={}", trace_id,
-                             composite_fences[0].id, composite_fences[0].value,
-                             syncpoint_manager.GetGuestSyncpointValue(composite_fences[0].id));
-                }
-                const auto executer = [this, current_request_counter, composite_layers, trace_id, traced]() {
+                const auto executer = [this, current_request_counter, composite_layers]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -319,7 +287,6 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    if (traced) LOG_INFO(HW_GPU, "Native composite execute: id={}", trace_id);
                     renderer->Composite(composite_layers);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
@@ -396,7 +363,6 @@ struct GPU::Impl {
     std::deque<size_t> request_swap_counters;
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
-    std::atomic<u64> composite_trace_id{};
 };
 
 GPU::GPU(Core::System& system, bool is_async, bool use_nvdec)
