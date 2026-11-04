@@ -143,11 +143,13 @@ void Report() {
     const u64 paths = d.paths[PathBuffer] + d.paths[PathPush] + d.paths[PathSet] + d.paths[PathNone];
     LOG_INFO(Render_Vulkan,
              "Back thread descriptors: buffer {:.0f}/s, push {:.0f}/s, set {:.0f}/s, none {:.0f}/s "
-             "(of {:.0f}/s); sets kept {:.0f}/s, rewritten for a pipeline bind {:.0f}/s; buffer "
+             "(of {:.0f}/s); sets kept {:.0f}/s, rewritten for a pipeline bind {:.0f}/s ({:.0f}/s with "
+             "the pipeline's last entries); buffer "
              "allocations reused {:.1f}%, {:.0f} new/s with {:.0f} entries each; per draw {:.1f} KB copied, {:.1f} KB compared, {:.1f} KB assigned; ring "
              "exhausted {:.1f}/s, ring frame wait {:.0f} us/s",
              per_s(d.paths[PathBuffer]), per_s(d.paths[PathPush]), per_s(d.paths[PathSet]),
              per_s(d.paths[PathNone]), per_s(paths), per_s(d.set_reused), per_s(d.set_rebound),
+             per_s(d.set_rebound_same),
              d.buffer_reused + d.buffer_allocated != 0
                  ? static_cast<double>(d.buffer_reused) * 100.0 /
                        static_cast<double>(d.buffer_reused + d.buffer_allocated)

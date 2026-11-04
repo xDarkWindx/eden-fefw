@@ -98,6 +98,7 @@ struct DrawThread {
     u64 buffer_reused{};
     u64 set_reused{};           ///< Descriptor set draws that kept the last set (same payload)
     u64 set_rebound{};          ///< ... that wrote a new set because the pipeline was bound again
+    u64 set_rebound_same{};     ///< ... whose entries equal the pipeline's last set anyway
     u64 buffer_allocated{};
     u64 buffer_entries{};       ///< Entries written into new allocations (one vkGetDescriptorEXT each)
     u64 copied_bytes{};         ///< Cached compact-table entries copied (AddEntries)

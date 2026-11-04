@@ -1120,6 +1120,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         // The comparison runs only when the pipeline stays bound and the sizes match.
         const bool compares = !bind_pipeline && last_descriptor_payload.size() == num_descriptor_entries;
+        if (BackStats::Enabled() && bind_pipeline &&
+            last_descriptor_payload.size() == num_descriptor_entries &&
+            std::memcmp(last_descriptor_payload.data(), entries,
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0) {
+            // Statistics: a set this pipeline last wrote would have served (same entries).
+            ++draw_stats.set_rebound_same;
+        }
         update_descriptors =
             bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
             std::memcmp(last_descriptor_payload.data(), entries,
