@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <set>
 #include <tuple>
+#include <cstdlib>
+#include <optional>
 #include <array>
 #include <memory>
 #include <cstdlib>
@@ -248,6 +250,23 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+namespace {
+
+/// EDEN_FLUSH_IN_DRAW_LOCK=1: a draw takes the cache locks before applying the constant buffer
+/// writes the engine accumulated (FlushCaching), instead of after. InnerInvalidation then
+/// re-enters the (recursive) locks the draw already holds, instead of taking and releasing each
+/// of them once more per draw against the guest CPU threads waiting for them. The pipeline lookup
+/// stays after the invalidation (it may drop shaders), so it runs under the locks too.
+bool FlushInDrawLock() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_FLUSH_IN_DRAW_LOCK");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+} // Anonymous namespace
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     namespace BackStats = VideoCommon::BackStats;
@@ -281,6 +300,15 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     };
     FlushWork();
     BackStats::Mark(BackStats::FlushWork);
+
+    using CacheLocks = std::scoped_lock<decltype(buffer_cache.mutex), decltype(texture_cache.mutex)>;
+    std::optional<CacheLocks> lock;
+    std::optional<BackStats::DrawLockHold> lock_hold;
+    if (FlushInDrawLock()) {
+        lock.emplace(buffer_cache.mutex, texture_cache.mutex);
+        lock_hold.emplace();
+        BackStats::Mark(BackStats::LockWait);
+    }
     gpu_memory->FlushCaching();
     BackStats::Mark(BackStats::FlushCaching);
 
@@ -291,9 +319,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         submitted = pipeline_cache.TakeDeferredDraw();
         return;
     }
-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
-    const BackStats::DrawLockHold lock_hold;
-    BackStats::Mark(BackStats::LockWait);
+    if (!lock) {
+        lock.emplace(buffer_cache.mutex, texture_cache.mutex);
+        lock_hold.emplace();
+        BackStats::Mark(BackStats::LockWait);
+    }
     buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
