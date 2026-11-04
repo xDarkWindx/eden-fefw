@@ -255,7 +255,7 @@ de B e C **não se multiplicam**: C tira trabalho justamente do rasterizador que
 
 
 1. Rodar o build de medição do portão G1 (e G4).
-2. Escrever o desenho do allocator de C0 (2.4 acima) e revisá-lo; se G1 der o esperado (≥ 15%), implementar **C0**
+2. Escrever o desenho do allocator de C0 (seção 4) e revisá-lo; se G1 der o esperado (≥ 15%), implementar **C0**
    atrás de interruptor, medir.
 3. **C** só depois dos portões de correção C-1 (variantes de sampler) e C-2 (versões do heap) resolvidos no papel.
 4. **B** só depois de medir a partição exclusiva engine/rasterizador (G2, G3) e com o caso de leitura depois de
