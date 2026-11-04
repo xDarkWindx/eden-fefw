@@ -113,6 +113,11 @@ public:
     /// Waits until the back executed everything sent so far. `site`: the caller, for statistics
     /// (VideoCommon::BackStats::DrainSite).
     void Drain(u32 site = 0);
+    /// Bumped by every Drain while the split is active (front thread only): what the front noted
+    /// about work still queued for the back is stale once the back has caught up.
+    [[nodiscard]] u64 DrainEpoch() const {
+        return drain_epoch;
+    }
 
 private:
     enum class Kind : u64 {
@@ -180,6 +185,7 @@ private:
 
     // Front side.
     u64 write_position{};
+    u64 drain_epoch{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.

@@ -123,6 +123,9 @@ void GpuSplit::Stop(bool session_end) {
     // reading at 0: with the old positions kept it would skip through the new, empty ring a
     // wrap at a time and never reach the old write position (Eglantine 092c16d6).
     ring.reset();
+    // Releases the front noted for the old back thread are stale (a new session may reuse their
+    // addresses with other values).
+    ++drain_epoch;
     write_position = 0;
     published_local = 0;
     consumed_cache = 0;
@@ -207,6 +210,7 @@ void GpuSplit::Drain(u32 site) {
     if (!active) {
         return;
     }
+    ++drain_epoch;
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;

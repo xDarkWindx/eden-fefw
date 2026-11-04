@@ -161,6 +161,10 @@ struct Shared {
     std::atomic<u64> acquire_ready_before{}; ///< Already satisfied before draining
     std::atomic<u64> acquire_changed{};      ///< The drain changed the word
     std::array<std::atomic<u64>, 3> acquire_ops{}; ///< Equal, greater or equal, mask
+    // EDEN_SKIP_ACQUIRE_DRAIN (counted with the stats on or off).
+    std::atomic<u64> skip_pending{};  ///< Acquires satisfied by a release still queued for the back
+    std::atomic<u64> skip_memory{};   ///< ... by the word already in guest memory (mode 2)
+    std::atomic<u64> skip_failures{}; ///< In-order checks on the back that found the acquire unmet
     // Cache locks taken outside draws: by other threads, and by the draw thread itself.
     LockCounters cpu_write;
     LockCounters cached_writes;

@@ -237,6 +237,27 @@ reescritos por bind de pipeline.
   há um caminho para pular o `Drain` (ganho potencial: a ociosidade de 10-15% da thread de trás).
 - `Wait(tick)` das outras threads: ~115-120/s, ~360-410 ms/s; não é a thread de trás.
 
+### 3.9 Rodada 4 e o experimento D (pular o `Drain` do acquire)
+
+Praça, `41a9366`: 802 acquires/s, **todos "maior ou igual"**; 294/s já prontos antes do `Drain`, 580/s com o
+valor mudado pelo `Drain` (o release que os satisfaz estava na fila da thread de trás, enfileirado pela frente,
+em geral por outro canal). Thread de trás ociosa 13%.
+
+**D** (`EDEN_SKIP_ACQUIRE_DRAIN`, `puller.cpp`): a frente anota, por endereço de dispositivo, o payload de cada
+release que enfileira para a thread de trás (`ProcessSemaphoreRelease` e o `WriteLong` do trigger). Num acquire
+nativo "maior ou igual", se o último release anotado para o endereço desde o último `Drain` (época
+`GpuSplit::DrainEpoch`) já satisfaz o valor, o `Drain` é pulado: a thread de trás executa o ring em ordem, então
+o release roda antes de tudo que vem depois do acquire. Modo `2` também pula quando a palavra na memória já
+satisfaz e não há release anotado.
+- Por que é seguro: a ordem do que a GPU vê não muda (mesmo fluxo); a frente não usa o rasterizador depois de
+  um acquire pronto; a tabela é só da frente e fica velha em todo `Drain` e `Stop` (a época sobe).
+- O que pode quebrar: uma escrita na mesma palavra que a frente não vê (semáforo de engine 3D/compute/DMA na
+  mesma posição, a CPU zerando o semáforo com trabalho ainda na fila) entre o release anotado e o acquire. Por
+  isso cada acquire pulado agenda uma **checagem na thread de trás, no ponto exato do acquire no fluxo**
+  (`ReadNativeSemaphoreWord`), que loga `Skipped acquire drain unmet in order` se não estiver satisfeito. O modo
+  `2` tem o risco extra de a memória do guest estar velha em relação ao buffer da GPU.
+- Ganho esperado: até a ociosidade da thread de trás (10-15%) mais o tempo de espera da frente.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

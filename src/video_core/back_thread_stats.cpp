@@ -200,11 +200,13 @@ void Report() {
              "Split drains by caller (count/s, front waiting): {}. Native acquires: ready {:.0f}/s, "
              "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s; "
              "before the drain: ready {:.0f}/s, word changed by the drain {:.0f}/s; ops equal "
-             "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s",
+             "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s. Skipped drains: pending release {:.0f}/s, "
+             "memory {:.0f}/s, failed in-order checks {}",
              drain_sites.empty() ? std::string{"none"} : drain_sites, per_s(acquire_ready),
              per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks),
              per_s(acquire_ready_before), per_s(acquire_changed), per_s(op_equal), per_s(op_gequal),
-             per_s(op_mask));
+             per_s(op_mask), per_s(Take(shared.skip_pending)), per_s(Take(shared.skip_memory)),
+             shared.skip_failures.load(std::memory_order_relaxed));
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);
