@@ -70,6 +70,8 @@ void Report() {
     draw_thread = DrawThread{};
     draw_thread.last = d.last;
     draw_thread.report_check = d.report_check;
+    draw_thread.draw_serial = d.draw_serial;
+    draw_thread.last_compute_serial = d.last_compute_serial;
 
     // Percentages of the wall time (100% = one core busy), and per-second rates.
     const auto pct = [wall_ticks](u64 ticks) { return static_cast<double>(ticks) * 100.0 / wall_ticks; };
@@ -126,6 +128,30 @@ void Report() {
              avg(d.copied_bytes, d.draws) / 1024.0, avg(d.compared_bytes, d.draws) / 1024.0,
              avg(d.assigned_bytes, d.draws) / 1024.0, per_s(d.ring_exhausted),
              us_per_s(d.ring_frame_wait));
+
+    const u64 gm_queries = Take(shared.gpu_modified_queries);
+    LOG_INFO(Render_Vulkan,
+             "Back thread tables and ranges: handle table downloads {:.1f}/s, {:.0f} us each, {:.0f} "
+             "draws since the last compute dispatch, bytes same as the last download {:.0f}%; "
+             "compact table builds {:.0f}/s, {:.0f} elements, {:.1f}% changed ({:.0f}/s resized); "
+             "IsRegionGpuModified {:.0f}/s, true {:.1f}%, within one page {:.1f}%",
+             per_s(d.table_downloads), avg(d.table_download_ticks, d.table_downloads) / ticks_per_us,
+             avg(d.table_draws_since_compute, d.table_downloads),
+             d.table_same + d.table_changed != 0
+                 ? static_cast<double>(d.table_same) * 100.0 /
+                       static_cast<double>(d.table_same + d.table_changed)
+                 : 0.0,
+             per_s(d.builds), avg(d.build_elements, d.builds),
+             d.build_elements != 0 ? static_cast<double>(d.build_changed) * 100.0 /
+                                         static_cast<double>(d.build_elements)
+                                   : 0.0,
+             per_s(d.build_resized), per_s(gm_queries),
+             gm_queries != 0 ? static_cast<double>(Take(shared.gpu_modified_true)) * 100.0 /
+                                   static_cast<double>(gm_queries)
+                             : 0.0,
+             gm_queries != 0 ? static_cast<double>(Take(shared.gpu_modified_one_page)) * 100.0 /
+                                   static_cast<double>(gm_queries)
+                             : 0.0);
 
     const auto wait_text = [&](const char* name, WaitCounters& counters) {
         const u64 count = Take(counters.count);

@@ -306,6 +306,26 @@ jogo nesses intervalos, quem limita ali é a CPU do jogo (que espera os locks do
   três resultados do `OnCPUWrite` (não registrada, segurada, marcada) e quantas seguradas cairiam nas 16 últimas
   páginas do núcleo, e traz o experimento `EDEN_CPU_WRITE_PAGES=N` (N páginas, mesmo contrato).
 
+### 3.13 Rodadas 9-10: pacing da tela, `EDEN_CPU_WRITE_PAGES` e perfil
+
+- Correção da 3.12: o jogo estava a 19-20 FPS (não 25), e a espera de ~5-6 ms por frame é, muito provavelmente,
+  o encaixe da tela emulada (60 Hz, swap interval 2: um frame acima de 33 ms sai aos 50 ms). Com o VSync do PC
+  desligado nada muda. A thread de trás trabalha ~43 ms por frame; para 30 FPS precisa ficar abaixo de 33 ms. A
+  métrica passa a ser µs por draw e o % ocupado, não o idle.
+- `OnCPUWrite`: held 111-124 mil/s, written 11-13 mil/s, unregistered 0; 96% das held caem nas 16 últimas
+  páginas do núcleo. Com `EDEN_CPU_WRITE_PAGES=16`: `OnCPUWrite` 140 → 31 mil/s, `unlock` 3,2 → 1,5%, `flush
+  caching` 8,1 → 6,9%, idle 12,4 → 7,3%, frente esperando o jogo 124 → 72 ms/s, draws/s +2,5%, FPS 19-20 → 20-21.
+  Mas o `Finish` por frame (tabela de handles, dentro do lock do draw) subiu de 37 para 123 ms/s: com a thread de
+  trás mais adiantada, ela espera mais a GPU nesse ponto (`handles` 12,0 → 20,8%; µs por draw 8,24 → 8,86).
+- Perfil do VS (3 threads mais pesadas; 1% ≈ 2% da thread de trás): `memcpy` ~4%, `CompactTextureTable::Build`
+  ~4%, `RtlReleaseSRWLockExclusive` ~4%, `BufferCache::IsRegionGpuModified` ~3,5% (chamado por
+  `InnerInvalidation`, `AccelerateInlineToMemory`, `WriteMemory` e, menos, `CachedWriteMemory`: são as escritas
+  de constant buffer e uploads inline da engine, não as escritas seguradas do jogo).
+- Rodada 11 mede: o download da tabela de handles (tempo, draws gravados desde o último dispatch de compute, se
+  os bytes mudaram desde o último download), os `Build` (quantos elementos mudam de fato) e as consultas
+  `IsRegionGpuModified` (quantas dão verdadeiro, quantas cabem numa página). Candidatos: esperar só a cópia da
+  tabela em vez do `Finish` inteiro; `Build` incremental; resposta por página para `IsRegionGpuModified`.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

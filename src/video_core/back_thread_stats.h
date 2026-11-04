@@ -106,6 +106,20 @@ struct DrawThread {
     u64 ring_exhausted{};       ///< Descriptor buffer frames that ran out (a Finish each)
     u64 ring_frame_wait{};      ///< Waiting for a reused descriptor buffer frame
     u32 report_check{};
+    // Kept across reports.
+    u64 draw_serial{};          ///< Draws prepared so far
+    u64 last_compute_serial{};  ///< draw_serial at the last compute dispatch
+    // Handle tables a compute shader wrote (buffer-backed texture arrays, downloaded per frame).
+    u64 table_downloads{};
+    u64 table_download_ticks{}; ///< Inside buffer_cache.DownloadMemory (a Finish when GPU-written)
+    u64 table_draws_since_compute{}; ///< Draws recorded since the last dispatch, at each download
+    u64 table_same{};           ///< The downloaded bytes equal the last download at that address
+    u64 table_changed{};
+    // CompactTextureTable::Build: elements whose (TIC, TSC, excluded) changed since the last build.
+    u64 builds{};
+    u64 build_elements{};
+    u64 build_changed{};
+    u64 build_resized{};        ///< Builds with another element count (not compared)
 };
 extern DrawThread draw_thread;
 
@@ -190,6 +204,10 @@ struct Shared {
     std::atomic<u64> cpu_write_written{};      ///< Marked CPU-modified (the texture cache is told)
     std::atomic<u64> cpu_write_would_hit{};    ///< Held, on one of the core's last 16 held pages
     std::atomic<u64> cpu_write_skipped{};      ///< Held without asking (EDEN_CPU_WRITE_PAGES)
+    // BufferCache::IsRegionGpuModified (under the buffer cache lock, any thread).
+    std::atomic<u64> gpu_modified_queries{};
+    std::atomic<u64> gpu_modified_true{};
+    std::atomic<u64> gpu_modified_one_page{}; ///< Queries within one 4 KiB page
     std::atomic<u64> drain_ticks{};
     std::atomic<u64> space_ticks{};
 };

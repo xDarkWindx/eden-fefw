@@ -14,6 +14,7 @@
 #include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCommon {
@@ -68,6 +69,9 @@ struct CompactTextureTable {
     /// Direct-mapped like the per-draw lookup memos, so a build costs about what binding the elements
     /// one by one did. A collision only lists a key twice (two slots that resolve the same way).
     void Build(std::span<const std::pair<u32, u32>> handles, std::span<const u8> excluded) {
+        if (BackStats::Enabled()) {
+            CountChanges(handles, excluded);
+        }
         element_tics.clear();
         unique_tics.clear();
         unique_tscs.clear();
@@ -109,6 +113,27 @@ struct CompactTextureTable {
     }
 
 private:
+    /// Statistics: how many elements differ from the table as last built (EDEN_BACK_THREAD_STATS).
+    void CountChanges(std::span<const std::pair<u32, u32>> handles, std::span<const u8> excluded) const {
+        auto& stats = BackStats::draw_thread;
+        ++stats.builds;
+        stats.build_elements += handles.size();
+        if (element_tics.size() != handles.size()) {
+            ++stats.build_resized;
+            stats.build_changed += handles.size();
+            return;
+        }
+        for (size_t element = 0; element < handles.size(); ++element) {
+            const Pair& pair = pairs[element_pairs[element]];
+            const bool was_excluded = pair.excluded;
+            if (element_tics[element] != handles[element].first ||
+                unique_tscs[pair.tsc_slot] != handles[element].second ||
+                was_excluded != (excluded[element] != 0)) {
+                ++stats.build_changed;
+            }
+        }
+    }
+
     /// Direct-mapped key -> slot map, emptied by Reset in O(1) (generation tags).
     template <typename Key, size_t Size>
     struct SlotMemo {

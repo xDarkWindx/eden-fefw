@@ -256,6 +256,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (prepare_start != 0) {
         BackStats::is_draw_thread = true;
         ++BackStats::draw_thread.draws;
+        ++BackStats::draw_thread.draw_serial;
         BackStats::draw_thread.last = prepare_start;
     }
     SCOPE_EXIT {
@@ -644,6 +645,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     const VideoCommon::BackStats::ScopedSharedTime compute_time{VideoCommon::BackStats::shared.compute};
+    if (VideoCommon::BackStats::Enabled()) {
+        VideoCommon::BackStats::draw_thread.last_compute_serial = VideoCommon::BackStats::draw_thread.draw_serial;
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 

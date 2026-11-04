@@ -501,7 +501,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                 const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
                                 if (range_address != expected || !range_size || !device_address)
                                     throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
+                                namespace BackStats = VideoCommon::BackStats;
+                                const u64 download_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
                                 buffer_cache.DownloadMemory(*device_address, range_size);
+                                if (download_start != 0) {
+                                    auto& draw_stats = BackStats::draw_thread;
+                                    ++draw_stats.table_downloads;
+                                    draw_stats.table_download_ticks += BackStats::Stamp() - download_start;
+                                    draw_stats.table_draws_since_compute +=
+                                        draw_stats.draw_serial - draw_stats.last_compute_serial;
+                                }
                                 expected += range_size;
                             }
                             if (expected != base + source.size)
@@ -513,6 +522,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                             u64{desc.count} * source.stride + (std::max)(source.offset, source.stride) + 8);
                         buffer_texture_bytes.resize(span);
                         gpu_memory->ReadBlockUnsafe(base, buffer_texture_bytes.data(), span);
+                        if (index == 0 && VideoCommon::BackStats::Enabled()) {
+                            // Whether the GPU-written table changed since its last download here.
+                            struct LastTable {
+                                GPUVAddr base;
+                                u64 hash;
+                            };
+                            static thread_local std::array<LastTable, 16> last_tables{};
+                            const u64 hash = Common::CityHash64(
+                                reinterpret_cast<const char*>(buffer_texture_bytes.data()), span);
+                            LastTable& slot = last_tables[(base >> 8) & (last_tables.size() - 1)];
+                            auto& draw_stats = VideoCommon::BackStats::draw_thread;
+                            if (slot.base == base) {
+                                ++(slot.hash == hash ? draw_stats.table_same : draw_stats.table_changed);
+                            }
+                            slot = {base, hash};
+                        }
                     }
                     const u64 offset = source.offset + u64{index} * source.stride;
                     if (offset + sizeof(u32) > source.size)

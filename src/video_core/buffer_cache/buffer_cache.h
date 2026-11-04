@@ -746,7 +746,18 @@ template <class P>
 bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
     // One lookup instead of visiting every range inside (~4% of the GPU thread for title 1's
     // inline uploads once GPU-written ranges are no longer cleared by downloads).
-    return gpu_modified_ranges.Intersects(addr, size);
+    const bool modified = gpu_modified_ranges.Intersects(addr, size);
+    if (VideoCommon::BackStats::Enabled()) {
+        namespace BackStats = VideoCommon::BackStats;
+        BackStats::Add(BackStats::shared.gpu_modified_queries, 1);
+        if (modified) {
+            BackStats::Add(BackStats::shared.gpu_modified_true, 1);
+        }
+        if ((addr >> 12) == ((addr + (size != 0 ? size - 1 : 0)) >> 12)) {
+            BackStats::Add(BackStats::shared.gpu_modified_one_page, 1);
+        }
+    }
+    return modified;
 }
 
 template <class P>
