@@ -326,6 +326,55 @@ jogo nesses intervalos, quem limita ali é a CPU do jogo (que espera os locks do
   `IsRegionGpuModified` (quantas dão verdadeiro, quantas cabem numa página). Candidatos: esperar só a cópia da
   tabela em vez do `Finish` inteiro; `Build` incremental; resposta por página para `IsRegionGpuModified`.
 
+### 3.14 Visão geral depois das rodadas 1-10
+
+**Meta em números.** Praça a ~20 FPS porque a thread de trás trabalha ~43 ms por frame (~3.600 draws); a tela
+emulada (60 Hz, intervalo 2) só aceita 33 ou 50 ms. Para 30 FPS: abaixo de 33 ms, ou seja, **−25% de trabalho
+por frame**. Ganhos menores só aparecem como média (22-24 FPS alternando).
+
+**Onde vai o tempo da thread de trás (% do tempo de parede, ~87-93% ocupada):**
+
+| Bloco | % | Natureza |
+| --- | --- | --- |
+| Métodos da engine fora de draws ("other busy") | ~20 | **Ainda não decomposto** |
+| Handles (inclui o `Finish` da tabela, 4-12%) | 12-21 | Memória do guest, `Build`, espera da GPU |
+| `FlushCaching` (escritas de constant buffer da engine) | 7-8 | Invalidação + locks |
+| Push images, stage buffers, buffers | ~21 | Caches de textura e buffer |
+| Lock (esperar + soltar) | ~6-7 | Disputa com as threads do jogo |
+| Resolve, pipeline, setup, comparações, resto | ~10 | Diversos |
+| Compute, upload inline | ~8 | Engine |
+
+**O que não é gargalo:** o worker do Vulkan (24%), a frente do split (~17% ocupada), os despertares (µs), a GPU
+real em média (~67%).
+
+**Descartado com dados:** 1a/1b (sem descriptor buffer na RTX), F (o custo do lock só mudou de lugar), D (os
+releases vêm da conclusão de compute na GPU), giro maior (não era latência de acordar).
+
+**Ganho até agora:** `EDEN_CPU_WRITE_PAGES=16`, +2,5% de draws/s (19-20 → 20-21 FPS), ainda sem validação visual
+ampla.
+
+**Restrições estruturais que apareceram:**
+1. ~800 acquires/s esperam compute terminar na GPU (QMD): o jogo encadeia compute → gráfico várias vezes por
+   frame. Cada um esvazia o split. Qualquer estágio novo de thread paga um esvaziamento a mais por acquire.
+2. Uma vez por frame, a tabela de handles escrita por compute é baixada com `Finish` dentro do lock: a thread de
+   trás espera a GPU ali, e mais quanto mais adiantada estiver.
+3. A tela emulada quantiza: só um salto grande muda o FPS de forma estável.
+4. **A GPU pode virar o limite perto de 30 FPS:** ~67% ocupada a 20 FPS significa ~100% a 30 FPS, nas mesmas
+   configurações (a saída nativa é 3840x2160). A resolução interna vai pesar no último passo.
+
+**Caminhos, em ordem de custo:**
+- **Micro (2-5% cada):** `Finish` só da cópia da tabela; `Build` incremental; `IsRegionGpuModified` por página;
+  cópias do caminho set; mais disputa de lock. Juntos talvez 10-15%: média 22-24 FPS, não 30.
+- **Decompor os ~20% de "other busy"** antes de qualquer decisão estrutural: é o maior bloco sem diagnóstico.
+- **Estrutural (B-split, rasterizador numa thread própria):** teto ~×1,4-1,5 se o estágio do rasterizador ficar
+  com ~65% e o da engine com ~35%. Custa replicar o estado do Maxwell3D por log de escritas e paga um
+  esvaziamento a mais em cada um dos ~800 acquires/s. É o único caminho visto que alcança 30 FPS sozinho.
+- **Heap bindless (C):** tiraria push images, resolve e parte de handles (~15-20%). Semanas no recompilador.
+
+**Riscos de visão de túnel:** tudo foi medido só na praça (palácio, batalha e seleção ainda não); o
+`EDEN_CPU_WRITE_PAGES` muda quando as escritas do jogo chegam aos caches da GPU (precisa de validação visual
+ampla); e a medição custa ~1-2%.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
