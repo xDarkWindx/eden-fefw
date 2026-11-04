@@ -151,6 +151,12 @@ struct Shared {
     WaitCounters wait_tick;       ///< On the draw thread
     WaitCounters wait_tick_other; ///< On other threads (fence release, present, ...)
     std::array<LockCounters, 9> drain_sites{}; ///< GpuSplit::Drain by caller (DrainSite)
+    // Native semaphore acquires after their drain: ready at once, ready after the front released
+    // fences (it waited for the GPU), or not ready (the channel is suspended).
+    std::atomic<u64> acquire_ready{};
+    std::atomic<u64> acquire_ready_after_fences{};
+    std::atomic<u64> acquire_suspended{};
+    std::atomic<u64> acquire_fence_ticks{}; ///< The front in ReleaseFences(true) for an acquire
     // Cache locks taken outside draws: by other threads, and by the draw thread itself.
     LockCounters cpu_write;
     LockCounters cached_writes;

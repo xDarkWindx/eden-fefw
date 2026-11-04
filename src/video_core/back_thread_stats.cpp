@@ -187,8 +187,15 @@ void Report() {
                                        DRAIN_NAMES[site], per_s(count), us_per_s(ticks));
         }
     }
-    LOG_INFO(Render_Vulkan, "Split drains by caller (count/s, front waiting): {}",
-             drain_sites.empty() ? std::string{"none"} : drain_sites);
+    const u64 acquire_ready = Take(shared.acquire_ready);
+    const u64 acquire_after_fences = Take(shared.acquire_ready_after_fences);
+    const u64 acquire_suspended = Take(shared.acquire_suspended);
+    const u64 acquire_fence_ticks = Take(shared.acquire_fence_ticks);
+    LOG_INFO(Render_Vulkan,
+             "Split drains by caller (count/s, front waiting): {}. Native acquires: ready {:.0f}/s, "
+             "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s",
+             drain_sites.empty() ? std::string{"none"} : drain_sites, per_s(acquire_ready),
+             per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks));
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);

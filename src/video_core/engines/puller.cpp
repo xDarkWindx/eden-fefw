@@ -182,9 +182,18 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     if (op == GpuSemaphoreOperation::AcquireMask) return (word & regs.semaphore_sequence) != 0;
                     return false;
                 };
-                if (!ready()) {
+                namespace BackStats = VideoCommon::BackStats;
+                const bool ready_at_once = ready();
+                if (!ready_at_once) {
+                    const BackStats::ScopedSharedTime fence_time{BackStats::shared.acquire_fence_ticks};
                     dma_pusher.rasterizer->ReleaseFences(true);
                     word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
+                }
+                if (BackStats::Enabled()) {
+                    BackStats::Add(ready_at_once ? BackStats::shared.acquire_ready
+                                   : ready()     ? BackStats::shared.acquire_ready_after_fences
+                                                 : BackStats::shared.acquire_suspended,
+                                   1);
                 }
                 if (!ready()) {
                     if (!NativeSemaphoreWait::Supported(static_cast<u32>(op))) {
