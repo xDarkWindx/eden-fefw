@@ -113,11 +113,6 @@ public:
     /// Waits until the back executed everything sent so far. `site`: the caller, for statistics
     /// (VideoCommon::BackStats::DrainSite).
     void Drain(u32 site = 0);
-    /// Bumped by every Drain while the split is active (front thread only): what the front noted
-    /// about work still queued for the back is stale once the back has caught up.
-    [[nodiscard]] u64 DrainEpoch() const {
-        return drain_epoch;
-    }
 
 private:
     enum class Kind : u64 {
@@ -185,7 +180,6 @@ private:
 
     // Front side.
     u64 write_position{};
-    u64 drain_epoch{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -203,6 +197,13 @@ private:
     alignas(64) std::atomic<bool> back_waiting{};
     // The front sleeps on `consumed` once Drain/WaitForSpace have spun a while; the back wakes it.
     alignas(64) std::atomic<bool> front_waiting{};
+    // Statistics (EDEN_BACK_THREAD_STATS): when each side last called the other awake.
+    std::atomic<u64> consumed_notify_stamp{};
+    std::atomic<u64> publish_notify_stamp{};
+    u64 drained_stamp{}; ///< Front: when the last drain ended, until the next publish
+    /// EDEN_SPLIT_SPIN: how many times longer both sides spin before sleeping (front in Drain,
+    /// back with an empty ring).
+    u32 spin_scale{1};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

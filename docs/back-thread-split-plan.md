@@ -258,6 +258,21 @@ satisfaz e não há release anotado.
   `2` tem o risco extra de a memória do guest estar velha em relação ao buffer da GPU.
 - Ganho esperado: até a ociosidade da thread de trás (10-15%) mais o tempo de espera da frente.
 
+### 3.10 Rodadas 5-6: o D não se aplica; a pausa pode ser latência de acordar
+
+- `EDEN_SKIP_ACQUIRE_DRAIN=1` (confirmado no log) não pulou nenhum `Drain`. Os acquires que o `Drain` satisfaz
+  (~580/s) esperam releases de **QMD de compute nativo** (448/s somam ao semáforo num callback de fence, quando
+  a GPU termina o dispatch: `kepler_compute.cpp:170`; 51/s escrevem direto) e 81/s de origem desconhecida
+  (colisão ou outro espaço de endereço). Nenhum vem do puller, do DMA nem do report 3D. A frente não tem como
+  saber esse valor (vem da conclusão na GPU e do QMD na memória): **o D foi removido**. O canal gráfico espera
+  mesmo o compute terminar na GPU.
+- Thread de trás ociosa ~11,7% com ~780 `Drain`/s: ~150 µs de pausa por `Drain`. Hipótese: duas latências de
+  acordar. Durante o `Drain` (~0,9 ms) a frente gira 16384 `pause` e dorme; quando a de trás termina, ela acorda
+  a frente, que só então lê o semáforo e publica mais; enquanto isso a de trás gira 8192 `pause` e dorme também.
+- Rodada 7 mede cada lado (dormiu?, latência de acordar, fim do `Drain` → próxima publicação) e traz o
+  experimento `EDEN_SPLIT_SPIN=N` (giro N vezes maior nos dois lados). Custo: um núcleo girando enquanto espera;
+  há folga (CPU ~33%), mas o giro no irmão SMT da thread de trás roubaria ciclos dela.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

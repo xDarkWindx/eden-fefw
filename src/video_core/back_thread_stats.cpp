@@ -201,21 +201,40 @@ void Report() {
              "Split drains by caller (count/s, front waiting): {}. Native acquires: ready {:.0f}/s, "
              "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s; "
              "before the drain: ready {:.0f}/s, word changed by the drain {:.0f}/s; ops equal "
-             "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s. Skipped drains: pending release {:.0f}/s, "
-             "memory {:.0f}/s, failed in-order checks {}. Acquires the drain satisfied, by the last "
+             "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s. Acquires the drain satisfied, by the last "
              "release there: puller {:.0f}/s, DMA {:.0f}/s, compute QMD {:.0f}/s, compute QMD add "
              "{:.0f}/s, 3D report {:.0f}/s, unknown {:.0f}/s",
              drain_sites.empty() ? std::string{"none"} : drain_sites, per_s(acquire_ready),
              per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks),
              per_s(acquire_ready_before), per_s(acquire_changed), per_s(op_equal), per_s(op_gequal),
-             per_s(op_mask), per_s(Take(shared.skip_pending)), per_s(Take(shared.skip_memory)),
-             shared.skip_failures.load(std::memory_order_relaxed),
+             per_s(op_mask),
              per_s(Take(shared.acquire_release_source[ReleasePuller])),
              per_s(Take(shared.acquire_release_source[ReleaseDma])),
              per_s(Take(shared.acquire_release_source[ReleaseQmd])),
              per_s(Take(shared.acquire_release_source[ReleaseQmdAdd])),
              per_s(Take(shared.acquire_release_source[Release3D])),
              per_s(Take(shared.acquire_release_source[ReleaseUnknown])));
+    const u64 drains_seen = shared.drains.load(std::memory_order_relaxed);
+    const u64 front_slept = Take(shared.front_slept);
+    const u64 front_wake = Take(shared.front_wake);
+    const u64 front_wake_count = Take(shared.front_wake_count);
+    const u64 drain_to_publish = Take(shared.drain_to_publish);
+    const u64 drain_to_publish_count = Take(shared.drain_to_publish_count);
+    const auto avg_us = [ticks_per_us](u64 ticks, u64 count) {
+        return count != 0 ? static_cast<double>(ticks) / ticks_per_us / static_cast<double>(count)
+                          : 0.0;
+    };
+    LOG_INFO(Render_Vulkan,
+             "Split handoffs: front slept in {:.0f}% of drains, woke {:.1f} us after the back's call; "
+             "drain end to next publish {:.1f} us; back idle {:.0f} times/s ({:.1f} us each), slept "
+             "{:.0f}% of them, woke {:.1f} us after the front's call",
+             drains_seen != 0 ? static_cast<double>(front_slept) * 100.0 / static_cast<double>(drains_seen) : 0.0,
+             avg_us(front_wake, front_wake_count), avg_us(drain_to_publish, drain_to_publish_count),
+             per_s(d.back_idle_episodes), avg_us(d.back_idle, d.back_idle_episodes),
+             d.back_idle_episodes != 0 ? static_cast<double>(d.back_slept) * 100.0 /
+                                             static_cast<double>(d.back_idle_episodes)
+                                       : 0.0,
+             avg_us(d.back_wake, d.back_wake_count));
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);

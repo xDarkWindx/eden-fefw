@@ -89,6 +89,10 @@ struct DrawThread {
     u64 back_busy{}; ///< GpuSplit::BackLoop executing entries
     u64 back_idle{}; ///< ... spinning or sleeping
     bool back_loop{}; ///< BackLoop ran in this window
+    u64 back_idle_episodes{}; ///< Times BackLoop found the ring empty
+    u64 back_slept{};         ///< ... and went to sleep after spinning
+    u64 back_wake{};          ///< From the front's wake-up call to the back running again
+    u64 back_wake_count{};
     // Descriptors of graphics draws.
     std::array<u64, 4> paths{}; ///< Descriptor buffer, push descriptor, descriptor set, none
     u64 buffer_reused{};
@@ -161,10 +165,6 @@ struct Shared {
     std::atomic<u64> acquire_ready_before{}; ///< Already satisfied before draining
     std::atomic<u64> acquire_changed{};      ///< The drain changed the word
     std::array<std::atomic<u64>, 3> acquire_ops{}; ///< Equal, greater or equal, mask
-    // EDEN_SKIP_ACQUIRE_DRAIN (counted with the stats on or off).
-    std::atomic<u64> skip_pending{};  ///< Acquires satisfied by a release still queued for the back
-    std::atomic<u64> skip_memory{};   ///< ... by the word already in guest memory (mode 2)
-    std::atomic<u64> skip_failures{}; ///< In-order checks on the back that found the acquire unmet
     /// Acquires whose word the drain changed, by the source of the last release the back executed
     /// at that address (ReleaseSource).
     std::array<std::atomic<u64>, 6> acquire_release_source{};
@@ -175,6 +175,11 @@ struct Shared {
     LockCounters draw_thread_locks;
     // The split's front.
     std::atomic<u64> drains{};
+    std::atomic<u64> front_slept{};      ///< Drains in which the front went to sleep after spinning
+    std::atomic<u64> front_wake{};       ///< From the back's wake-up call to the front running again
+    std::atomic<u64> front_wake_count{};
+    std::atomic<u64> drain_to_publish{}; ///< From a drain's end to the front's next publish
+    std::atomic<u64> drain_to_publish_count{};
     std::atomic<u64> drain_ticks{};
     std::atomic<u64> space_ticks{};
 };

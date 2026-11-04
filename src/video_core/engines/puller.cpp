@@ -4,7 +4,6 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <array>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -57,103 +56,6 @@ void OnBack(const Func& func) {
 
 void DrainBack(VideoCommon::BackStats::DrainSite site) {
     VideoCommon::GpuSplit::Get().Drain(site);
-}
-
-/// EDEN_SKIP_ACQUIRE_DRAIN: 0 (default) drains before every native acquire; 1 skips the drain when
-/// a semaphore release the front queued for the back since the last drain already satisfies a
-/// greater-or-equal acquire; 2 also when the word in guest memory already satisfies it and no
-/// release is queued for it.
-int SkipAcquireDrainMode() {
-    static const int mode = [] {
-        const char* const value = std::getenv("EDEN_SKIP_ACQUIRE_DRAIN");
-        if (value == nullptr || value[0] < '1' || value[0] > '2') {
-            return 0;
-        }
-        LOG_INFO(HW_GPU, "EDEN_SKIP_ACQUIRE_DRAIN={}: native acquires may skip the split drain",
-                 value[0]);
-        return value[0] - '0';
-    }();
-    return mode;
-}
-
-// Releases the front queued for the back since the last drain, by device address (front thread
-// only; all channels are parsed on it). The back executes the ring in order, so such a release has
-// run, and written its payload, before anything the front queues after it. Direct-mapped: a
-// collision forgets the older release, which only means one drain more. Entries of an older drain
-// epoch are stale: once the back caught up, guest memory is authoritative again (and the CPU may
-// have rewritten the word since).
-struct PendingRelease {
-    DAddr address{};
-    u64 epoch{};
-    u32 value{};
-    bool valid{};
-};
-std::array<PendingRelease, 256> pending_releases{};
-
-PendingRelease& PendingSlot(DAddr address) {
-    return pending_releases[(address >> 2) & (pending_releases.size() - 1)];
-}
-
-void NotePendingRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
-    auto& split = VideoCommon::GpuSplit::Get();
-    if (SkipAcquireDrainMode() == 0 || !split.Active()) {
-        return;
-    }
-    const auto device_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
-    if (!device_address) {
-        return;
-    }
-    PendingSlot(*device_address) = PendingRelease{
-        .address = *device_address,
-        .epoch = split.DrainEpoch(),
-        .value = payload,
-        .valid = true,
-    };
-}
-
-/// Whether a native greater-or-equal acquire may go on without draining the back. Each skip queues
-/// a check that runs on the back exactly where the acquire is in the stream and logs if the word
-/// does not satisfy it there (it cannot wait: what would release it may not be queued yet).
-bool SkipAcquireDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 required) {
-    auto& split = VideoCommon::GpuSplit::Get();
-    const int mode = SkipAcquireDrainMode();
-    if (mode == 0 || !split.Active()) {
-        return false;
-    }
-    const auto device_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
-    if (!device_address) {
-        return false;
-    }
-    namespace BackStats = VideoCommon::BackStats;
-    const PendingRelease& pending = PendingSlot(*device_address);
-    const bool queued = pending.valid && pending.address == *device_address &&
-                        pending.epoch == split.DrainEpoch();
-    if (queued) {
-        // The last release queued for the word decides what the back finds there.
-        if (pending.value < required) {
-            return false;
-        }
-        BackStats::Add(BackStats::shared.skip_pending, 1);
-    } else if (mode == 2 && !dma_pusher.memory_manager.OverlapsSyncpointShim(address, sizeof(u32)) &&
-               dma_pusher.memory_manager.Read<u32>(address) >= required) {
-        BackStats::Add(BackStats::shared.skip_memory, 1);
-    } else {
-        return false;
-    }
-    split.Defer([pusher = &dma_pusher, address, required] {
-        const u32 word = ReadNativeSemaphoreWord(*pusher, address);
-        if (word >= required) {
-            return;
-        }
-        const u64 failures = BackStats::shared.skip_failures.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (failures <= 16 || failures % 1024 == 0) {
-            LOG_WARNING(HW_GPU,
-                        "Skipped acquire drain unmet in order: address={:#x}, word={}, required={} "
-                        "(failures so far: {})",
-                        address, word, required, failures);
-        }
-    });
-    return true;
 }
 
 } // Anonymous namespace
@@ -267,13 +169,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             VideoCommon::BackStats::NoteRelease(sequence_address, VideoCommon::BackStats::ReleasePuller);
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
-        NotePendingRelease(dma_pusher, sequence_address, payload);
     } else {
-        if (dma_pusher.channel_state.native_abi && op == GpuSemaphoreOperation::AcquireGequal &&
-            SkipAcquireDrain(dma_pusher, regs.semaphore_address.SemaphoreAddress(),
-                             regs.semaphore_sequence)) {
-            return;
-        }
         // Acquires read what the back may still have to write: let it finish first. From here
         // on the back is idle, and the front may use the rasterizer until it sends more.
         // Statistics only: the word as guest memory holds it before the drain (a plain read; the
@@ -370,7 +266,6 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
-    NotePendingRelease(dma_pusher, sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
