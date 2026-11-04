@@ -43,7 +43,7 @@ texturas no caminho de descriptor buffer. É a parte segura. O salto para 30 FPS
 | `UpdateDescriptorQueue::Acquire` faz `WaitWorker` no estouro e, ao crescer, **realoca** o vetor `payload` | `vk_update_descriptor.cpp:42-68` | Hoje é seguro porque o único leitor do payload é o worker e ele já foi esperado. Uma thread nova lendo o payload teria de ser esperada também, em todo `WaitWorker`. |
 | O caminho de descriptor set (`UpdateDescriptorSet`) e o de push descriptor já rodam **dentro do lambda**, no worker. Só o caminho de descriptor buffer escreve na thread de trás. | `vk_graphics_pipeline.cpp:1012-1029` e `:1065-1114` | Com descriptor buffer (provável na RTX para os pipelines grandes: >32 descritores excluem o push descriptor), a escrita é a parte movível que sobra. A fase 0 confirma qual caminho é usado. |
 | No acerto do cache de descritores da tabela compacta, `AddEntries` copia `desc.count` entradas de 24 B; depois `ConfigureDraw` compara o payload inteiro com `last_descriptor_payload` (`memcmp`) e, na falha, copia de novo (`assign`) | `pipeline_helper.h:483`, `vk_graphics_pipeline.cpp:1004-1028` | Com ~3100 entradas por draw (`reserve=3112` no log antigo): ~75 KB copiados + ~75 KB comparados por draw com banco, mesmo quando nada mudou. Isso pode ser eliminado (1a). |
-| `DelayedDestructionRing` conta **frames** (`TickFrame`), não ticks da GPU: views e imagens apagadas morrem 8 `TickFrame` depois. As 8 fatias do payload também são reusadas por `TickFrame`, sem espera (`vk_update_descriptor.cpp:32-37`) | `texture_cache_base.h:546-552`, `delayed_destruction_ring.h` | A segurança de quem lê mais tarde vem do present: o pool tem até **7** frames (`MAX_FRAMES_IN_FLIGHT`, `vk_present_manager.cpp:25`, `:367`), e um frame só volta ao pool depois de o worker executar o comando de present do composite que o usou. Isso dá margem **exata** (N ≤ 7 contra 8 ticks), sem folga. Demonstração em 5.2. 1b não aumenta o atraso; qualquer estágio novo (1c) aumenta e quebra a conta. |
+| `DelayedDestructionRing` conta **frames** (`TickFrame`), não ticks da GPU: views e imagens apagadas morrem 8 `TickFrame` depois. As 8 fatias do payload também são reusadas por `TickFrame`, sem espera (`vk_update_descriptor.cpp:32-37`) | `texture_cache_base.h:546-552`, `delayed_destruction_ring.h` | A segurança de quem lê mais tarde vem do present: o pool tem até **7** frames (`MAX_FRAMES_IN_FLIGHT`, `vk_present_manager.cpp:25`, `:367`), e um frame só volta ao pool depois de o worker executar o comando de present do composite que o usou. Isso dá margem **exata** (N ≤ 7 contra 8 ticks), sem folga. Demonstração em 5.2. 1b não muda a conta. Um estágio novo (1c) não a quebra por si só, mas exige demonstrar que nenhum present ultrapassa preparo pendente (5.2). |
 | `DispatchWork` a cada 32 draws, `Flush` a cada 4096 draws ou 192 operações/2,5 ms | `vk_rasterizer.cpp:1013-1023`, `:1124-1144` | É a cadência de entrega ao worker, **não um limite de profundidade**: `DispatchWork` só empilha chunks (`vk_scheduler.cpp:88-102`), e a fila pode acumular muitos se o worker atrasar. |
 | O compute também consome `guest_descriptor_queue` e escreve o descriptor buffer na hora, na thread de trás | `vk_compute_pipeline.cpp:282-292` | Qualquer payload incompleto (buracos de 1a) tem de ser proibido fora do graphics, por autorização explícita, não pelo modo da fila. (Hoje o compute não passa `compact` ao `PushImageDescriptors`, `:265`, mas a regra não pode depender disso.) |
 | O lambda de draw tem `return` antecipado (`if (!pipeline) return;`) | `vk_graphics_pipeline.cpp:1076` | Em 1b, a escrita do descriptor buffer tem de ser a **primeira** coisa do lambda, antes de qualquer retorno. Senão a thread de trás publica uma alocação como reaproveitável que nunca foi escrita. |
@@ -146,9 +146,11 @@ Regras que valem para toda a fase 1:
   trabalho retido (não despachado), e (c) quanto tempo a espera durou. Isso separa dois casos com remédios
   diferentes: worker ocioso com trabalho retido no produtor (despachar mais cedo ajuda) contra worker saturado
   (não ajuda).
-- **Atraso do worker em frames:** `CommandChunk` ganha (só com estatística ligada) o número do frame
-  (`TickFrame`) da thread de trás quando foi despachado. O worker registra o máximo de
-  `frame_atual_de_trás − frame_do_chunk`. É o número que sustenta a segurança de H2 e deve ficar ≤ 2.
+- **Atraso do worker em frames (diagnóstico, não prova):** `CommandChunk` ganha (só com estatística ligada) o
+  número do frame (`TickFrame`) da thread de trás quando recebeu o **primeiro** comando (no `AcquireNewChunk`
+  ou no primeiro `Record`, não no despacho). O worker registra o máximo de `frame_atual_de_trás −
+  frame_do_chunk`: é a idade do comando mais antigo que ele executa. A segurança vem da demonstração de 5.2;
+  este número só ajuda a entender um problema em campo.
 - Atraso da submissão: do `SubmitExecution` gravado ao `vkQueueSubmit` executado (o lambda de submissão
   carimba).
 - Threads da CPU do jogo: contagem e tempo de espera nos locks de `OnCPUWrite`, `OnCachedWrites`,
@@ -239,9 +241,14 @@ num_descriptor_entries`.
 
 ### 4.3 Riscos e cuidados
 
-- **Payload com buracos é lixo para qualquer outro leitor.** Os buracos só existem com `allow_holes` e são
-  preenchidos antes de qualquer leitura que não seja o `memcmp` dos trechos fora dos blocos. Asserts no
-  verify: compute, push e set nunca têm buracos; um `Record` de draw nunca sai com buracos pendentes.
+- **Payload com buracos é lixo para qualquer leitor.** A regra é sobre **consumo**, não sobre o `Record`:
+  - `write_descriptors = true` (alocação nova): o payload é materializado por inteiro antes de publicar o
+    comando que o lê;
+  - reaproveitamento (acerto rápido): o payload fica com buracos, e nenhum consumidor o lê; o comando só usa o
+    offset da alocação pronta;
+  - verify: materialização obrigatória para hash e comparação.
+  Asserts no verify: compute, push e set nunca têm buracos; todo comando com `write_descriptors = true` sai
+  com o payload completo. Proibir buracos em todo `Record` no modo normal devolveria a cópia que 1a elimina.
 - `rescaling.PushTexture(cache.rescaled)` continua no acerto (não depende da cópia).
 - `Skip` precisa da mesma checagem de capacidade de `Acquire` (o `reserve` já cobre `num_descriptor_entries`).
 - **Lixo no slice e verify:** um buraco deixa no slice os bytes de um frame anterior. Zerar não deixa esses
@@ -277,23 +284,27 @@ Compute (`vk_compute_pipeline.cpp:292`) fica fora no início (poucos dispatches)
   esvaziar e então pega o `execution_mutex`, que o worker adquire antes de soltar o `queue_mutex`
   (`vk_scheduler.cpp:75-85`, `:313`). Logo, quando `WaitWorker` volta, nenhum chunk está em execução nem na
   fila. O caso (a) depende do present, demonstrado abaixo. É o mesmo contrato em que o push descriptor e o
-  `UpdateDescriptorSet` já confiam hoje. Com 1a, os buracos são preenchidos **antes** do `Record`, então o
-  worker nunca lê `words` (que pode mudar no draw seguinte).
+  `UpdateDescriptorSet` já confiam hoje. Com 1a, quando o comando vai escrever descriptores, os buracos são
+  preenchidos **antes** do `Record`; no reaproveitamento, o worker não lê o payload. Em nenhum caso o worker lê
+  `words` (que pode mudar no draw seguinte).
 
   **Demonstração do caso (a).** Sejam N o número de frames do pool do present (`image_count ≤
   MAX_FRAMES_IN_FLIGHT = 7`, `vk_present_manager.cpp:25`, `:363-375`) e c o número do composite.
   1. Cada composite pega pelo menos um frame do pool (`GetRenderFrame`, `renderer_vulkan.cpp:230`); com LSFG,
      pega mais um por frame gerado, do mesmo pool (`:243-250`). O `rasterizer.TickFrame()` roda uma vez por
-     composite, no fim (`:262`), depois do `GetRenderFrame`.
+     composite, no fim (`:262`), depois do `GetRenderFrame`. Os retornos antecipados de `Composite` (swapchain
+     sem formato, janela oculta, `:215-227`) saem antes do `TickFrame`: as fatias não avançam sem adquirir um
+     frame.
   2. Um frame só volta ao pool depois de o comando de present do composite que o usou ser **executado pelo
      worker**. Com present assíncrono, `Present` grava um lambda que o worker executa para pôr o frame na fila
      de apresentação; a thread de present apresenta e devolve. Sem present assíncrono, `Present` faz
      `WaitWorker` (`vk_present_manager.cpp:189-200`).
   3. No `GetRenderFrame` do composite c, há no máximo N frames fora do pool, todos de composites anteriores.
      Para um voltar, o worker tem de ter executado o present de pelo menos um composite j ≥ c − N.
-     **Hipótese a conferir na implementação:** os frames voltam na ordem em que foram apresentados (a fila de
-     apresentação é FIFO e o worker executa em ordem). Com ela, o primeiro a voltar é o do composite mais
-     antigo, e o worker executou tudo até o present do composite c − N, inclusive.
+     Os frames voltam na ordem em que foram apresentados: o worker executa os presents em ordem, e a
+     `PresentThread` retira com `pop_front`, apresenta e só então devolve ao pool
+     (`vk_present_manager.cpp:330-353`). Logo o primeiro a voltar é o do composite mais antigo, e o worker
+     executou tudo até o present do composite c − N, inclusive.
   4. Depois do `TickFrame` do composite c, a fatia em uso é a que serviu aos draws gravados entre os
      `TickFrame` dos composites c − 8 e c − 7. Todos esses draws estão no fluxo **antes** do present do
      composite c − 7.
@@ -304,10 +315,13 @@ Compute (`vk_compute_pipeline.cpp:292`) fica fora no início (poucos dispatches)
      durante o frame c − 8 não é referenciada por comandos gravados depois disso, e todos os que a referenciam
      estão antes do present do composite c − 7.
   Consequências: 1b não muda essa conta (o worker continua sendo o único leitor e consome na mesma ordem).
-  **Qualquer estágio novo entre a thread de trás e o worker (1c) quebra a conta**, porque o frame pode voltar
-  ao pool antes de o estágio novo terminar o que está atrás dele. 1c exigiria que o present esperasse também o
-  estágio novo, ou mais fatias. O contador de atraso em frames (3.4) serve para diagnóstico; ele não prova
-  nada.
+  Um estágio novo (1c) **não quebra a conta por si só**: se for anterior ao worker no mesmo fluxo ordenado, o
+  worker só executa o present depois de todo o preparo que vem antes dele, e a devolução do frame continua
+  implicando esse preparo concluído. Mais latência não adianta composites, porque o pool continua limitando o
+  produtor. A conta quebra se um preparo puder ficar pendente enquanto o present o ultrapassa, ou se outro
+  consumidor continuar lendo o payload depois da devolução. **1c exige demonstrar que nenhum present ultrapassa
+  preparo pendente e que `WaitWorker` inclui todos os estágios.** O contador de atraso em frames (3.4) serve
+  para diagnóstico; ele não prova nada.
 - `alloc.host`: o ring só reescreve a memória de um frame depois de `scheduler.Wait(frame_ticks[frame])`, um
   tick da GPU que só chega depois de o worker executar o lambda e submeter. Na volta dentro do mesmo frame,
   `Finish` espera a GPU, o que também implica o worker. A memória é host-coherent (o ring recusa a que não é):
@@ -358,7 +372,7 @@ Só se a espera da thread de trás pelo lock for ≥ 3%. Hoje o lock (`vk_raster
 | --- | --- | --- | --- |
 | H1 | Dois produtores no scheduler ao mesmo tempo (corrupção silenciosa de `chunk`, `state`, `deferred_clear`) | R1: um produtor por vez; a troca acontece só em `MaybeStart`/`Stop` do split, depois de `Drain` e `join` | Verify: o scheduler guarda o produtor **da época atual** (`std::atomic<std::thread::id>`). `GpuSplit` abre uma época nova (`Scheduler::SetProducer(this_thread)` na thread que assume, depois do `join`/`Drain`). Cada chamada de produtor confere a época e loga uma vez se divergir. Não pode ser "o primeiro produtor para sempre": o split para e volta no meio do jogo (`gpu_split.cpp:59-86`). |
 | H2 | O worker lê memória já reescrita (payload, descriptor buffer) | 5.2 (demonstração do caso (a), `WaitWorker` no caso (b)); buracos preenchidos antes do `Record` | O que **garante** é o protocolo (5.2) e o harness (8.1), que exercita o protocolo, não só o hash. O hash no verify só **detecta** corrupção em campo: a thread de trás guarda o CityHash64 do payload **completo** (no verify os buracos são sempre materializados) e o worker recalcula antes de escrever. |
-| H3 | Handle de view ou sampler destruído antes do `vkGetDescriptorEXT` | Demonstração 5.2, item 6: N ≤ 7 frames no pool contra 8 `TickFrame` de `sentenced_*`, margem zero | O contador de atraso em frames (3.4) só diagnostica. Qualquer mudança que acrescente estágio (1c) ou frames ao pool invalida a conta e tem de refazê-la. Validation layers num teste curto, se o usuário topar. |
+| H3 | Handle de view ou sampler destruído antes do `vkGetDescriptorEXT` | Demonstração 5.2, item 6: N ≤ 7 frames no pool contra 8 `TickFrame` de `sentenced_*`, margem zero | O contador de atraso em frames (3.4) só diagnostica. Mais frames no pool invalidam a conta; um estágio novo (1c) exige refazer a demonstração (nenhum present ultrapassa preparo pendente; `WaitWorker` inclui todos os estágios). Validation layers num teste curto, se o usuário topar. |
 | H4 | Decisão de reaproveitamento errada (1a): id igual com conteúdo diferente | `words` só muda por `Rewrite`/`PatchElement`, que trocam o id; contador `u64` sem volta | Verify: em todo acerto da chave rápida, preenche os buracos e faz o `memcmp` completo mesmo assim; loga se der diferente. Teste diferencial (8.2). |
 | H5 | Locks: espera nova ou ciclo | O worker não pega lock de cache (R2); 1a e 1b não criam lock nenhum nem mudam aquisições. Não existe uma ordem fixa `buffer → texture` a preservar: `PrepareDraw` usa `std::scoped_lock` com os dois mutexes (`std::lock`, com recuo), e os dois são recursivos, com aquisições aninhadas por dentro (query cache, `AccelerateDMA`) | Revisão de código; contadores de espera dos dois lados (3.4) antes e depois. O item L (seção 6) tem de mapear as aquisições aninhadas e os callbacks concretos de cada chamada que sair do lock, sem presumir ordem. |
 | H6 | Ordem de memória entre a thread de trás e o worker | O push e o pop do chunk sob `queue_mutex` (`DispatchWork`/`WorkerThread`) criam happens-before para tudo que a thread de trás escreveu antes do `Record` | TSan no harness (8.1), que usa a mesma fila. |
@@ -369,7 +383,7 @@ Só se a espera da thread de trás pelo lock for ≥ 3%. Hoje o lock (`vk_raster
 | H11 | Crescimento do payload (`payload.assign`) com ponteiros vivos em lambdas | `WaitWorker` antes (já é assim) | Já coberto; o harness inclui crescimento. |
 | H12 | Parar e reiniciar o split (`GpuSplit::Stop`, `MaybeStart` com as configurações mudando) | 1a e 1b não criam thread; o estado é por pipeline e independente do split | Teste manual: trocar a precisão da GPU no meio do jogo com o split ativo. |
 
-Para 1c (se houver), além de quebrar a demonstração de 5.2 (o present teria de esperar também o estágio novo), os riscos novos são outros: `WaitWorker` tem de esperar os dois estágios (as duas filas
+Para 1c (se houver), além de refazer a demonstração de 5.2 (nenhum present ultrapassa preparo pendente), os riscos novos são outros: `WaitWorker` tem de esperar os dois estágios (as duas filas
 vazias e os dois `execution_mutex`); o estágio de preparo não pode usar o `cmdbuf`; e quem marca o chunk de
 submissão é o estágio final. O desenho fica para quando houver número que o justifique.
 
@@ -380,15 +394,20 @@ submissão é o estágio final. O desenho fica para quando houver número que o 
 Modelo com o código real onde der: a fila de chunks copiada de `Scheduler::DispatchWork`/`WorkerThread`, e
 `UpdateDescriptorQueue` compilado com stubs de `Device` e `Scheduler` (`WaitWorker` do modelo). O produtor grava
 draws com payloads de tamanho aleatório, buracos e `TickFrame`, força estouros e crescimento, e reaproveita
-alocações de um ring de descritores falso cujo "tick da GPU" anda quando o worker "submete". O worker confere o
-hash de cada payload e escreve no ring falso; um verificador confere que nenhuma região do ring foi reescrita
-antes de o tick dela passar. Rodadas com `sleep` aleatório nos dois lados, TSan e `-O2`, ~1 milhão de draws.
+alocações de um ring de descritores falso. O modelo separa **`submitted_tick`** (anda quando o worker
+"submete") de **`completed_tick`** (a "GPU" falsa, numa thread própria, conclui ticks submetidos com atraso
+aleatório e independente do worker). O `Wait(tick)` do modelo espera `completed_tick`, como o real. O worker
+confere o hash de cada payload e escreve no ring falso. Dois verificadores, separados:
+- **payload**: nenhuma fatia é reescrita antes da última leitura do worker que a referencia;
+- **descriptor buffer**: nenhuma região do ring é reescrita antes de `completed_tick` passar o tick da última
+  submissão que a usa (a "GPU" pode estar lendo depois da submissão). Rodadas com `sleep` aleatório nos dois lados, TSan e `-O2`, ~1 milhão de draws.
 O modelo inclui também o **pool de frames do present** (N configurável até 7, devolução só depois de o worker
 executar o comando de present, `TickFrame` uma vez por composite e frames gerados do LSFG). O verificador
 confere diretamente o protocolo: nenhuma fatia é reescrita enquanto um chunk que a referencia ainda não
 executou, e nenhuma "view" sentenciada é destruída antes disso. Isso é o que prova 5.2 no modelo; o hash só
-confere os dados. Rodar também com N = 8 (fora do limite), que **tem** de falhar, para mostrar que o
-verificador pega a violação. Os buracos de 1a entram no modelo com saídas antecipadas e exceções simuladas
+confere os dados. Testes negativos com **escalonamento determinístico** (não aleatório, que pode
+não falhar): N = 8 com o worker travado num ponto escolhido até a fatia voltar ao produtor; e um ring que
+reutiliza a região no `submitted_tick` em vez do `completed_tick`. Os dois **têm** de disparar o verificador. Os buracos de 1a entram no modelo com saídas antecipadas e exceções simuladas
 entre o registro e o `ConfigureDraw`.
 
 ### 8.2 Teste diferencial de 1a (ASan/UBSan)
@@ -468,7 +487,7 @@ balanço. Se B não fechar no papel, C (heap bindless) volta a ser a alternativa
 Aceito como veio:
 - Buracos proibidos fora do graphics por autorização explícita por draw (`allow_holes`), não pelo modo da fila (4).
 - Justificativa de lifetime trocada por uma demonstração (5.2): pool ≤ 7, devolução de frames só depois de o
-  worker executar o present, 8 fatias e 8 `TickFrame`. Margem zero; 1c a quebraria. O contador de atraso virou
+  worker executar o present, 8 fatias e 8 `TickFrame`. Margem zero; 1c exige refazer a demonstração (revisão 3). O contador de atraso virou
   só diagnóstico (H3).
 - A chave rápida de 1a aprende também depois de um fallback igual: a lista de blocos de referência é
   atualizada sempre que o passo 2 termina, e os blocos são registrados copiados ou não (4.2).
@@ -490,3 +509,17 @@ Acrescentado nesta revisão (achado ao conferir a crítica):
   reaproveitamento se a escrita for incondicional e vier antes de qualquer uso (5.1).
 
 Continua igual: a ordem das fases (0 → 1a → 1b, com 1c e L condicionais), as regras R2-R4 e a fase 2.
+
+## 13. O que mudou na revisão 3
+
+- 1c não quebra a garantia de lifetime por si só: exige demonstrar que nenhum present ultrapassa preparo
+  pendente e que `WaitWorker` inclui todos os estágios (5.2, H3, seção 7, seção 12).
+- Harness: `submitted_tick` separado de `completed_tick`, com verificadores separados para o payload (última
+  leitura do worker) e para o descriptor buffer (conclusão da GPU); testes negativos determinísticos (8.1).
+- Regra dos buracos reescrita por consumo: payload completo só quando o comando escreve descritores; no
+  reaproveitamento ninguém lê; no verify sempre materializado (4.3, 5.2).
+- 3.4: o atraso em frames é só diagnóstico e mede a idade do comando mais antigo do chunk, não do despacho.
+- 5.2: a ordem FIFO deixou de ser hipótese (`PresentThread`, `vk_present_manager.cpp:330-353`), e os retornos
+  antecipados de `Composite` saem antes do `TickFrame`.
+
+Próximo passo: fase 0.
