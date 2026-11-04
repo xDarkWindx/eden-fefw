@@ -497,6 +497,13 @@ distintas) nas escritas seguradas (~7,5%) e no `flush caching` (~8%).
   20 mil lotes aleatórios (até 600 regiões em blocos de 64 B), mesma cobertura e nenhuma região atravessando
   página, com ASan/UBSan.
 
+### 3.22 Rodada 14 (`0923d60dac`)
+
+- Pior ponto da praça: aplicar as escritas seguradas no início de cada lista caiu de ~7,5% para **1,2%** da
+  thread de trás (fim de lista 0,3%); resíduo da engine 13,1%.
+- Andando pela cidade (provavelmente a 30 FPS): início de lista 2,7%.
+- Usuário: **um trecho da praça que ficava em 24 FPS agora fica em 30.**
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
