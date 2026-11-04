@@ -1,6 +1,7 @@
 # Desenho da etapa 3: B-split redesenhado contra heap bindless (Fortune's Weave)
 
-Escrito em 2026-11-04 sobre o `main` em `740b932003` (release 1.12). Para revisão antes de qualquer código. Números
+Escrito em 2026-11-04 sobre o `main` em `740b932003` (release 1.12). Para revisão antes de qualquer código.
+**Revisão 2:** incorpora a revisão adversarial (seção 10); as seções 2-8 foram corrigidas no lugar. Números
 das rodadas 1-14 de `docs/back-thread-split-plan.md` (seções 3.7-3.22), na praça da cidade, RTX 5060 Ti, 1x.
 
 ## 1. Onde estamos e o que falta
@@ -82,15 +83,19 @@ front (parsing, macros) ──ring 1──▶ engine (métodos, registradores, D
 
 ### 2.4 Ganho estimado
 
-Vazão = 1 / max(estágio). Hoje a thread de trás faz engine (~13%) + compute/inline (~8%) + rasterizador (~65%) +
-outros (~4%). Com B:
-- engine: ~13% + parte de compute/inline (a parte de engine) + envio ao ring 2 (~2-3%) ≈ **18-22%**;
-- rasterizador: ~65% + replicação de registradores (4-7%) + aplicar escritas de memória adiadas (~1-2%) + compute e
-  inline do lado do cache (~5%) ≈ **75-79%** do tempo de hoje.
+Vazão = 1 / max(estágio). Em unidades de tempo de parede, a thread de trás hoje está ~90 de 100 ocupada: engine
+~13, compute/inline ~8, rasterizador ~65, outros ~4. Com B:
+- engine: ~13 + a parte de engine de compute/inline + envio ao ring 2 (~2-3) ≈ **18-22**;
+- rasterizador: ~65 + replicação de registradores (4-7, **a medir**, portão G2) + escritas de memória adiadas (~1-2)
+  + a parte de cache de compute/inline (~5) ≈ **75-79**.
 
-Teto: ~1/0,77 ≈ **×1,27-1,33**, antes das bolhas dos ~780 `Drain`/s em pipeline mais fundo (estimadas em 2-5%).
-Resultado provável: **×1,2-1,3**. No pior ponto da praça: ~44 → ~34-37 ms de trabalho, **ainda acima dos 33 ms**:
-sozinho, B não leva o pior ponto a 30 FPS estáveis (passaria a alternar 20/30 com mais frames em 30).
+Ganho ideal sobre o trabalho ocupado: 90/79 ≈ **×1,14** a 90/75 ≈ **×1,20**, antes das bolhas dos ~780 `Drain`/s em
+pipeline mais fundo (2-5%) e de mudanças de disputa de lock. Sobre ~44 ms de trabalho no pior ponto: **~37-39 ms**,
+acima dos 33 ms. Os baldes incluem esperas, então isto é uma ordem de grandeza, não uma previsão.
+
+O Maxwell3D sombra do rasterizador aplica os deltas sem executar métodos: em particular, não pode emitir de novo o
+draw instanciado adiado que a engine já emitiu (o item do draw adiado vai no ring, na ordem; o sombra só copia o
+estado).
 
 ### 2.5 Riscos e custo
 
@@ -98,6 +103,10 @@ sozinho, B não leva o pior ponto a 30 FPS estáveis (passaria a alternar 20/30 
   Erros de ordem aparecem como artefatos intermitentes (dados de um draw no outro), difíceis de reproduzir.
 - Deadlocks novos com dois níveis de `Drain` e canais suspensos.
 - O ganho depende de G2 (custo de replicar) e de G3 (profundidade de drenagem).
+- Leituras da engine sobre memória que ela escreve: além das macros (que já drenam), o caminho de QMD lê
+  descritores com `MemoryManager::ReadBlock`, que pode entrar no rasterizador para coerência; mudanças de canal e
+  leituras da CPU do jogo também. Adiar escritas (2.2 a) exige ordenar todas essas leituras. O harness precisa de
+  casos de leitura depois de escrita entre engines.
 - Esforço: **semanas**. Interruptor obrigatório (`EDEN_GPU_SPLIT=3`, por exemplo). Harness com TSan do protocolo de
   dois rings e das escritas de memória adiadas antes do primeiro build do usuário.
 
@@ -114,18 +123,29 @@ C faz o mesmo **só para os arrays de banco** (os descritores com `buffer_source
 16+ elementos que hoje viram tabela compacta); texturas comuns continuam no caminho atual:
 
 - **Heap persistente por tabela TIC:** um descriptor set (ou buffer) global com um array de imagens por tipo de view
-  (2D, 2D array, cubo, 3D, ...) indexado pelo **índice TIC**, e um array de samplers indexado pelo **índice TSC**
-  (dois: comum e de comparação de profundidade, porque `Sampler::HandleFor(image_view, is_depth)` depende da
-  imagem). Entradas inválidas, de tipo incompatível ou de formato inteiro onde o shader espera float apontam para a
+  (2D, 2D array, cubo, 3D, ...) indexado pelo **índice TIC**, e samplers por **(TSC, variante)**. O sampler Vulkan
+  não depende só do TSC: `Sampler::MakeKey` (`vk_texture_cache.cpp:2902`) escolhe a variante pela imagem do TIC
+  (anisotropia suportada, nearest forçado em formato inteiro, redução min/max, border color, sRGB, swizzle; o
+  `is_depth` nem entra). O heap precisa de um array de samplers por variante e de uma tabela de tradução por TIC
+  que o shader consulte (índice TSC + variante da imagem), ou o caminho otimizado fica restrito aos pares
+  comprovadamente equivalentes (portão C-1). Entradas inválidas, de tipo incompatível ou de formato inteiro onde o shader espera float apontam para a
   view nula do tipo (como `PushImageDescriptors` faz hoje).
 - **Recompilador:** para esses descritores, em vez de `array[elemento]`, o shader lê o handle no constant buffer (já
   é um UBO ligado) ou no storage buffer, extrai TIC e TSC (com `via_header_index`, segundo handle, exclusões) e
   indexa o heap (`nonuniformEXT`). É o que o recompilador já faz para descobrir o índice do elemento, só que o
   resultado indexa o heap em vez do array do draw.
-- **Cache de texturas:** mantém o heap em dia com a tabela TIC do canal: cria/atualiza a view de cada entrada TIC
-  usada, prepara as imagens (upload de escritas da CPU, aliases) quando a geração do banco muda (o mecanismo de
-  reaproveitamento de bancos já detecta isso, `texture_bank_reuse.h`), e troca entradas por views nulas antes de
-  destruir uma imagem (destruição já é atrasada 8 frames).
+- **Cache de texturas:** mantém o heap em dia com a tabela TIC do canal. Dois problemas abertos:
+  - **Versões do heap.** Atualizar um slot (update-after-bind ou não) não cria snapshot: se o draw A usa o TIC 10,
+    a entrada muda e o draw B usa o mesmo slot, A pode ver a versão de B, tanto em comandos gravados ainda não
+    submetidos quanto em trabalho na GPU. Trocar por view nula antes de destruir também não protege A. O protocolo
+    precisa de versões imutáveis (slots novos por versão, com reaproveitamento só depois do tick da GPU) ou de
+    sincronização de reuso, cobrindo mudanças dentro do mesmo frame (portão C-2).
+  - **Preparação.** O reaproveitamento atual não é só "comparar uma geração": `TryReuseViewBank`
+    (`texture_cache.h:2650-2690`) confere canal, endereço e limite da tabela e o snapshot da memória, e mesmo no
+    acerto renova o LRU das imagens (uma vez por frame) e chama `PrepareImage` nas imagens com aliases **a cada
+    draw**. Se a CPU deixar de ler os handles, ela precisa de um **conjunto conservador** dos TICs que o shader pode
+    acessar para preparar uploads, layouts, aliases e feedback loops; preparar a tabela inteira pode custar mais que
+    preparar o banco usado. Não há garantia, neste desenho, de eliminar todo o trabalho por draw.
 
 ### 3.2 O que sai da thread de trás
 
@@ -135,14 +155,16 @@ draw), a comparação do payload e, no worker, o `UpdateDescriptorSet` de ~3.000
 da tabela de handles**: o shader leria a tabela escrita pela GPU direto do buffer (bytes iguais em 100% dos
 downloads medidos, rodada 11), sem a CPU precisar dela.
 
-Fica: preparar as imagens do banco quando a geração muda (já amortizado, 99% de reaproveitamento) e manter o heap.
+Fica: a manutenção do banco por draw que existe hoje mesmo no acerto (aliases, LRU, conferência da tabela), a do
+heap (versões, variantes de sampler) e a preparação de um conjunto conservador de TICs.
 
 ### 3.3 Ganho estimado
 
 Se os draws com banco forem a maior parte de `handles` (~10%), `push images` (~7,5%), `resolve` (~4%) e da
 comparação/cópia de payload (~1,5%): **~18-23% da thread de trás**, mais o `Finish` por frame (~1-2%). **Portão G1:
 medir essa fração** (os blocos hoje não separam draws com e sem banco). Resultado provável: **×1,2-1,3**, sem pipeline
-mais fundo nem bolhas novas. No pior ponto: ~44 → ~34-37 ms, **também acima dos 33 ms** sozinho. O lock dos caches também fica menos tempo seguro (menos disputa com as threads do
+mais fundo nem bolhas novas, **descontada** a manutenção que fica (acima). Ordem de grandeza: ~×1,15-1,25; no pior
+ponto, ~35-38 ms, acima dos 33 ms sozinho. O lock dos caches também fica menos tempo seguro (menos disputa com as threads do
 jogo).
 
 Custo do lado da GPU: indexação não uniforme custa algo nos shaders desses draws; na NVIDIA costuma ser pequeno,
@@ -157,7 +179,9 @@ mas soma à GPU que já vai a ~85-100% a 30 FPS (ver 6). **Portão G4.**
   update-after-bind (ou de trocar o set ligado quando muda, com versões por frame). Arrays de tamanho fixo (o
   limite da tabela TIC) evitam `runtimeDescriptorArray`. Conferir os limites da RTX
   (`maxPerStageDescriptorUpdateAfterBindSampledImages` etc.).
-- **Semântica:** escala de resolução por imagem (`rescaling.PushTexture`) não chega ao shader por entrada; com o
+- **Portões de correção antes do protótipo:** C-1 (reproduzir todas as variantes de sampler) e C-2 (versões do heap
+  entre draws).
+- **Semântica:** escala de resolução por imagem (pode virar metadado por entrada do heap) (`rescaling.PushTexture`) não chega ao shader por entrada; com o
   usuário em 1x isso não pesa, mas precisa de regra (heap desligado com escala, ou flag por entrada num buffer).
   Formatos reinterpretados pela TIC, imagens com aliases e render targets amostrados (feedback loop) precisam do
   mesmo tratamento que `PrepareImageView`/`CheckFeedbackLoop` dão hoje, mas para o banco inteiro.
@@ -174,9 +198,21 @@ fica só com buffers e texturas comuns.
   ~3.000 entradas no worker. Fica: `handles` (decodificação e `Build`), `resolve` (já com bancos reaproveitados) e o
   `Finish` da tabela.
 - Ganho estimado: **~8-11%** (portão G1 também).
-- Riscos: lifetime do set reaproveitado entre frames (o pool recicla por tick: precisa "tocar" o set a cada uso,
-  `ResourcePool::CommitResource`); views apagadas (a geração do banco cobre; destruição atrasada 8 frames);
-  recompilador e layout de pipeline com dois sets (moderado, sem mudar o que o shader lê).
+- **Allocator dedicado (pergunta 4 da revisão 1):** `ResourcePool::CommitResource` (`vk_resource_pool.cpp:17`)
+  pega *qualquer* recurso livre e marca o tick; não existe "renovar o uso deste set", e chamar `Commit()` a cada uso
+  não protege o set antigo. C0 precisa de um allocator de sets de banco com:
+  - identidade do set (o banco que ele representa: hash dos TICs, carimbos dos bancos de views e samplers, geração
+    de views, layout);
+  - último uso = o `CurrentTick` do scheduler no momento em que o bind é gravado (cobre os usos ainda na fila do
+    worker: aquele tick só é sinalizado depois da submissão e da conclusão na GPU);
+  - aposentadoria quando o banco é invalidado (o set sai da tabela de identidade e só volta ao pool quando a GPU
+    passa do último uso);
+  - proibição de sobrescrever um set com consumidores pendentes (um banco novo sempre pega um set livre, nunca
+    atualiza um em uso).
+- O conteúdo do set é o mesmo `SampledImage` (view + sampler pela variante da imagem) que `PushImageDescriptors`
+  escreve hoje, então as variantes de sampler ficam corretas por construção. A manutenção por draw do banco
+  (aliases, LRU) continua.
+- Outros riscos: recompilador e layout de pipeline com dois sets (moderado, sem mudar o que o shader lê).
 - Esforço: **dias**. Não chega sozinho aos 30 FPS no pior ponto, mas é um passo do caminho C (o set do banco é o
   embrião do heap).
 
@@ -184,8 +220,8 @@ fica só com buffers e texturas comuns.
 
 | | B (segundo split) | C (heap bindless) | C0 (set por banco) |
 | --- | --- | --- | --- |
-| Ganho provável | ×1,2-1,3 | ×1,2-1,3 | ×1,08-1,12 |
-| Chega a 30 no pior ponto? | sozinho, não (~34-37 ms) | sozinho, não (~34-37 ms) | não |
+| Ganho provável (ordem de grandeza) | ×1,14-1,20 antes de bolhas | ×1,15-1,25, descontada a manutenção | ×1,08-1,12 |
+| Chega a 30 no pior ponto? | sozinho, não (~37-39 ms) | sozinho, não (~35-38 ms) | não |
 | Onde mexe | engine + rasterizador inteiros | recompilador + cache de texturas (só bancos) | layout de pipeline + descritores de banco |
 | Risco | alto, global (ordem, deadlock) | alto, local (shader, heap, recursos do dispositivo) | moderado |
 | Esforço | semanas | semanas | dias |
@@ -195,8 +231,8 @@ fica só com buffers e texturas comuns.
 
 ## 6. Condições que valem para qualquer opção
 
-- **GPU real:** ~67% a 20 FPS significa ~85-100% a 30 FPS na saída atual (3840x2160). Se a thread de trás deixar de
-  ser o limite, a resolução interna pode virar. Medir a ocupação da GPU no pior ponto antes de decidir (portão G4).
+- **GPU real:** o teste de resolução do usuário sustenta que o limite hoje é a CPU na configuração habitual. "67% ×
+  1,5" é só um cenário, não uma previsão: medir a ocupação da GPU no pior ponto (portão G4) antes de contar com ela.
 - Tudo atrás de interruptor, desligado até passar nos pontos fixos (praça, palácio, seleção de personagem, batalha).
 - O usuário compila no Windows/MSVC com avisos como erro; cada rodada dele precisa trazer uma mudança candidata a
   padrão ou responder um portão.
@@ -212,17 +248,18 @@ fica só com buffers e texturas comuns.
 
 ## 8. Recomendação (a criticar)
 
-Nenhuma das opções, sozinha, leva o pior ponto (20-21 FPS, ~44 ms de trabalho por frame) a 30 estáveis: cada uma dá
-~34-37 ms. Os 30 ali exigem **C e B juntos** (multiplicam: ~44 / (1,25 × 1,25) ≈ 28 ms), ou uma delas mais as
-sobras menores, e a GPU real acompanhando (G4). Fora do pior ponto, qualquer uma já põe mais trechos em 30.
+Nenhuma das opções, sozinha, leva o pior ponto (20-21 FPS, ~44 ms de trabalho por frame) a 30 estáveis. Os ganhos
+de B e C **não se multiplicam**: C tira trabalho justamente do rasterizador que B separaria. Depois de C, o tempo de B
+é `max(engine, rasterizador) + comunicação e dependências`, recalculado com os estágios novos; a conta "44 / (1,25 ×
+1,25)" da revisão 1 era só ilustrativa. Fora do pior ponto, qualquer uma já põe mais trechos em 30.
 
 
-1. Rodar o build de medição dos portões G1-G4.
-2. Se G1 der o esperado (≥ 15%): fazer **C0** primeiro (dias, risco moderado, ~8-11%, e é a base do heap), medir, e
-   então **C** completo. C ataca o custo que sobrou no lugar certo (o banco é bindless no hardware), não aumenta a
-   profundidade das drenagens e remove o `Finish` por frame.
-3. B fica como alternativa se G1 mostrar que os bancos não são a maior parte, ou se C esbarrar em recursos do
-   dispositivo. Antes de B, um protótipo de medição de G2/G3.
+1. Rodar o build de medição do portão G1 (e G4).
+2. Escrever o desenho do allocator de C0 (2.4 acima) e revisá-lo; se G1 der o esperado (≥ 15%), implementar **C0**
+   atrás de interruptor, medir.
+3. **C** só depois dos portões de correção C-1 (variantes de sampler) e C-2 (versões do heap) resolvidos no papel.
+4. **B** só depois de medir a partição exclusiva engine/rasterizador (G2, G3) e com o caso de leitura depois de
+   escrita entre engines no harness.
 
 ## 9. Perguntas para o revisor
 
@@ -234,3 +271,17 @@ sobras menores, e a GPU real acompanhando (G4). Fora do pior ponto, qualquer uma
 4. Para C0, o reaproveitamento do set entre frames é seguro com o `ResourcePool` atual se o set for "tocado" a cada
    uso, ou precisa de um pool próprio?
 5. Há algum caminho menor que eu não listei que remova ≥ 15% sem ser B nem C?
+
+## 10. Revisão 2: o que mudou
+
+| Apontamento (revisão adversarial) | Correção |
+| --- | --- |
+| C: dois arrays de samplers por TSC não reproduzem `Sampler::MakeKey` (variantes pela imagem) | Samplers por (TSC, variante) com tradução por TIC, ou caminho restrito; portão C-1 |
+| C: update-after-bind não preserva a versão de cada draw | Versões imutáveis ou sincronização de reuso, cobrindo o mesmo frame; portão C-2 |
+| C0: `CommitResource()` não renova um set específico | Allocator dedicado com identidade, último uso pelo tick de gravação, aposentadoria e sem sobrescrita em uso |
+| C: preparar só quando a geração muda não basta (LRU e aliases por draw, conferência da tabela) | Manutenção por draw mantida na conta; conjunto conservador de TICs como problema aberto; ganho de C reduzido |
+| B: ganho com tempo de parede e fração misturados | Normalizado: 90/79-90/75 ≈ ×1,14-1,20; ~37-39 ms no pior ponto |
+| B + C multiplicados | Não se multiplicam; recalcular estágios depois de C |
+| B: leituras além das macros (QMD `ReadBlock`, canal, CPU) | Listadas; harness com leitura depois de escrita entre engines |
+| GPU "67% × 1,5" | Só cenário; portão G4 |
+
