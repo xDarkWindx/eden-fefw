@@ -53,6 +53,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
+#include "video_core/texture_cache/compact_texture_table.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -813,6 +814,37 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             query_cache.InvalidateRegion(addr, size);
             pipeline_cache.InvalidateRegion(addr, size);
         }
+    }
+}
+
+void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> writes) {
+    // As OnCachedWrite for each, with each cache locked once: the caches are independent, so
+    // their order between regions does not matter.
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : writes) {
+            if (addr != 0 && size != 0) {
+                texture_cache.WriteMemory(addr, size);
+            }
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        for (const auto& [addr, size] : writes) {
+            if (addr != 0 && size != 0) {
+                buffer_cache.CachedWriteMemory(addr, size);
+            }
+        }
+    }
+    for (const auto& [addr, size] : writes) {
+        if (addr != 0 && size != 0) {
+            pipeline_cache.InvalidateRegion(addr, size);
+        }
+    }
+    if (VideoCommon::CompactTextureStats::Enabled()) {
+        auto& stats = VideoCommon::CompactTextureStats::Get();
+        ++stats.cached_write_batches;
+        stats.cached_write_regions += writes.size();
     }
 }
 

@@ -348,6 +348,8 @@ struct CompactTextureStats {
     u64 range_misses{};        ///< ... walked again (GetSubmappedRange)
     u64 host_conditional_draws{}; ///< Draws prepared under host conditional rendering
     u64 skipped_draws{};       ///< Draws a CPU-evaluated condition skipped (no preparation)
+    u64 cached_write_batches{}; ///< InvalidateGPUCache batches of held guest writes
+    u64 cached_write_regions{}; ///< Regions in those batches
     std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
 
     static bool Enabled() {
@@ -403,9 +405,11 @@ struct CompactTextureStats {
                  view_hits ? double(snapshot_bytes) / view_hits : 0.0);
         LOG_INFO(Render_Vulkan,
                  "Draw path: virtual ranges reused {:.1f}% of {:.0f}/s; draws under host conditional "
-                 "rendering {:.0f}/s, skipped by a CPU-evaluated condition {:.0f}/s",
+                 "rendering {:.0f}/s, skipped by a CPU-evaluated condition {:.0f}/s; held guest writes "
+                 "{:.0f} regions/s in {:.0f} batches/s",
                  rate(range_hits, range_hits + range_misses), per_second(range_hits + range_misses),
-                 per_second(host_conditional_draws), per_second(skipped_draws));
+                 per_second(host_conditional_draws), per_second(skipped_draws),
+                 per_second(cached_write_regions), per_second(cached_write_batches));
         *this = {};
         window = now;
     }

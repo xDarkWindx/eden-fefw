@@ -119,10 +119,18 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCachedWrite(address, size);
+        // Collected first and applied as one batch: every region used to lock the texture and
+        // buffer caches on its own, and each unlock woke a guest CPU thread waiting for them.
+        // Per thread: fences can also apply them (fence_manager.h).
+        static thread_local std::vector<std::pair<DAddr, u64>> cached_writes;
+        cached_writes.clear();
+        std::function<void(PAddr, size_t)> callback_writes([](PAddr address, size_t size) {
+            cached_writes.emplace_back(static_cast<DAddr>(address), static_cast<u64>(size));
         });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (!cached_writes.empty()) {
+            renderer->ReadRasterizer()->OnCachedWrites(cached_writes);
+        }
     }
 
     /// Signal the ending of command list.

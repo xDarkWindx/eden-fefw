@@ -137,6 +137,14 @@ public:
         OnCacheInvalidation(addr, size);
     }
 
+    /// The held writes of one InvalidateGPUCache at once: a backend can lock each cache once for
+    /// all of them instead of once per region.
+    virtual void OnCachedWrites(std::span<const std::pair<DAddr, u64>> writes) {
+        for (const auto& [addr, size] : writes) {
+            OnCachedWrite(addr, size);
+        }
+    }
+
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
         OnCacheInvalidation(addr, size);
