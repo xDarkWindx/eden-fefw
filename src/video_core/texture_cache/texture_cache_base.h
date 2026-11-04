@@ -272,6 +272,13 @@ public:
         return bank_generation;
     }
 
+    /// Bumped only where image views are erased (their ids may then name other views) or channels
+    /// created. Within one view generation an image view id keeps its handles and its image's
+    /// scaling, so descriptors made from the same ids are the same (see PushImageDescriptors).
+    [[nodiscard]] u64 ViewGeneration() const noexcept {
+        return view_generation;
+    }
+
     /// Writes the view ids last resolved for these TIC indices into ids, if still valid, after
     /// redoing what reuse cannot skip (alias synchronization, LRU ticks). Returns the bank's stamp,
     /// or 0 if it has to be resolved (FillImageViews) and stored again.
@@ -495,6 +502,7 @@ private:
 
 
     u64 bank_generation = 1;
+    u64 view_generation = 1;
     u64 bank_stamp = 0;
     TextureBankCache<ViewBankEntry> view_banks;
     TextureBankCache<SamplerBankEntry> sampler_banks;

@@ -1353,6 +1353,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     }
     has_deleted_images = true;
     ++bank_generation; // Views erased: their ids may be reused
+    ++view_generation;
 }
 
 template <class P>
@@ -2477,6 +2478,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     }
     has_deleted_images = true;
     ++bank_generation; // Views erased: their ids may be reused
+    ++view_generation;
 }
 
 template <class P>
@@ -2949,6 +2951,7 @@ template <class P>
 void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
     ++bank_generation; // Channel states may have moved
+    ++view_generation;
     const auto it = channel_map.find(channel.bind_id);
     auto* this_state = &channel_storage[it->second];
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];

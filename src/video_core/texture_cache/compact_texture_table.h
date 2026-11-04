@@ -46,7 +46,7 @@ struct CompactTextureTable {
     u64 tscs_hash{};                ///< Of unique_tscs
 
     /// The descriptors last written for this table, with what named them: the resolved banks
-    /// (stamps, see texture_bank_reuse.h) and the texture cache generation. Raw bytes of the
+    /// (stamps, see texture_bank_reuse.h) and the texture cache view generation. Raw bytes of the
     /// backend's descriptor entries. Build keeps them (current = false): when the array changes
     /// within one generation, the elements that resolve to the same view and sampler keep their
     /// entries (PatchCompactElements).
@@ -283,7 +283,7 @@ bool PushCompactTextureBlock(const CompactTextureBlock& block, std::span<const I
 /// CompactElementKey differs from keys[element], write(element, image of its pair) runs and
 /// keys[element] is updated. make(view_id, sampler_id, guest_index) runs once per distinct pair
 /// needed, as in PushCompactTextureBlock. Only valid when keys were written in the same texture
-/// cache generation (the same ids then make the same images). Returns the elements rewritten.
+/// cache view generation (the same ids then make the same images). Returns the elements rewritten.
 template <typename Image, typename Make, typename Write>
 size_t PatchCompactElements(const CompactTextureBlock& block, std::span<const ImageViewId> view_ids,
                             std::span<const SamplerId> sampler_ids, std::span<u64> keys,

@@ -428,9 +428,11 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             auto& cache = block.table->descriptor_cache;
             static_assert(sizeof(DescriptorUpdateEntry) % sizeof(u64) == 0);
             constexpr size_t words_per_entry = sizeof(DescriptorUpdateEntry) / sizeof(u64);
-            const u64 generation = texture_cache.BankGeneration();
+            // Descriptors only depend on the views' and samplers' handles and scaling: the view
+            // generation, which images registered or written by the CPU do not bump.
+            const u64 generation = texture_cache.ViewGeneration();
             const bool reusable = block.view_stamp != 0 && block.sampler_stamp != 0;
-            // Entries written in this generation for this many elements: patchable element by
+            // Entries written in this view generation for this many elements: patchable element by
             // element (same view and sampler ids, same descriptor), and reusable as they are when
             // the table did not change and the banks are the same.
             const bool patchable = cache.generation == generation &&
