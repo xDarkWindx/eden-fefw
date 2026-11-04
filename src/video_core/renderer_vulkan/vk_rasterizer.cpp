@@ -846,6 +846,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 }
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    VideoCommon::BackStats::CountInvalidations(VideoCommon::BackStats::shared.flush_caching, sequences);
     {
         const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
@@ -869,6 +870,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 }
 
 void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> writes) {
+    VideoCommon::BackStats::CountInvalidations(VideoCommon::BackStats::shared.held_writes, writes);
     // As OnCachedWrite for each, with each cache locked once: the caches are independent, so
     // their order between regions does not matter.
     {
@@ -1232,26 +1234,37 @@ void RasterizerVulkan::FlushWork() {
 #endif // __ANDROID__
 
     static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
-    // EDEN_FLUSH_DRAWS=N (from PokeDinner 226162edf, EDEN_NX2_FLUSH_DRAWS there, 128 for native
-    // titles): submit to the host GPU about every N draws instead of every DRAWS_TO_DISPATCH, so
-    // it starts on a frame while the rest is still being recorded. In Fortune's Weave the back
-    // thread waits once a frame (Finish for the handle table) for all work submitted before it;
-    // less of it still unsubmitted there means a shorter wait. Costs more queue submissions.
-    // The counter is checked when it reaches CHECK_MASK modulo CHECK_MASK + 1: without the variable
-    // the comparison stays as it was (a flush every DRAWS_TO_DISPATCH + CHECK_MASK draws); with it,
-    // N is rounded up to a multiple of CHECK_MASK + 1 and the flush comes every N - 1 draws (the
-    // counter restarts at zero). Other submissions (FlushCommands) restart the count too.
-    static const u32 flush_at = [] {
+    // Switch 2 titles submit to the host GPU every NATIVE_FLUSH_DRAWS draws instead of every
+    // DRAWS_TO_DISPATCH (from PokeDinner 226162edf, which took it from selevet-eglantine), so the GPU
+    // starts on a frame while the rest is still being recorded. In Fortune's Weave the back thread
+    // waits once a frame (Finish, for the GPU-written handle table) for all work submitted before
+    // it: 760 -> 255 us per wait in the city plaza, with more queue submissions (~240 -> ~860/s).
+    // EDEN_FLUSH_DRAWS=N sets the period for every title (32 to 1048576, rounded up to a multiple
+    // of CHECK_MASK + 1; 4096 restores the old one for Switch 2 titles).
+    // The counter is checked when it reaches CHECK_MASK modulo CHECK_MASK + 1: with the default
+    // period the comparison stays as it was (a flush every DRAWS_TO_DISPATCH + CHECK_MASK draws);
+    // with a set one the flush comes every N - 1 draws (the counter restarts at zero). Other
+    // submissions (FlushCommands) restart the count too.
+    static const u32 custom_flush_at = [] {
         const char* const value = std::getenv("EDEN_FLUSH_DRAWS");
         const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
         if (parsed == 0) {
-            return DRAWS_TO_DISPATCH;
+            return 0U;
         }
         constexpr u32 step = CHECK_MASK + 1;
         const u32 draws = Common::AlignUp(static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL)), step);
         LOG_INFO(Render_Vulkan, "EDEN_FLUSH_DRAWS: submitting every {} draws", draws);
         return draws - 1;
     }();
+    u32 flush_at = custom_flush_at != 0 ? custom_flush_at : DRAWS_TO_DISPATCH;
+#ifndef __ANDROID__
+    static constexpr u32 NATIVE_FLUSH_DRAWS = 128;
+    static_assert(NATIVE_FLUSH_DRAWS % (CHECK_MASK + 1) == 0);
+    if (custom_flush_at == 0 && maxwell3d != nullptr &&
+        maxwell3d->GetNativeMacroEngine().native_turing) {
+        flush_at = NATIVE_FLUSH_DRAWS - 1;
+    }
+#endif
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }

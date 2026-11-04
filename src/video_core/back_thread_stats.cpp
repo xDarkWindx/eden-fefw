@@ -307,6 +307,19 @@ void Report() {
                                        : 0.0,
              avg_us(d.back_wake, d.back_wake_count), per_s(front_guest_waits),
              us_per_s(front_guest_wait), us_per_s(front_pending_sleep), front_busy);
+    const auto invalidation_text = [&](const char* name, InvalidationCounters& counters) {
+        const u64 batches = Take(counters.batches);
+        const u64 ranges = Take(counters.ranges);
+        const u64 merged = Take(counters.merged);
+        const u64 pages = Take(counters.pages);
+        return fmt::format("{} {:.0f} batches/s, {:.1f} ranges each, {:.1f} after joining touching "
+                           "ones, {:.1f} distinct pages",
+                           name, per_s(batches), avg(ranges, batches), avg(merged, batches),
+                           avg(pages, batches));
+    };
+    const std::string held_text = invalidation_text("held guest writes", shared.held_writes);
+    const std::string flush_text = invalidation_text("flush caching", shared.flush_caching);
+    LOG_INFO(Render_Vulkan, "Invalidation batches: {}; {}", held_text, flush_text);
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);

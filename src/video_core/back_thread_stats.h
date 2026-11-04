@@ -6,7 +6,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstddef>
+#include <span>
+#include <utility>
+#include <vector>
 
 #if defined(ARCHITECTURE_x86_64)
 #ifdef _MSC_VER
@@ -150,6 +154,16 @@ struct LockCounters {
     std::atomic<u64> ticks{};
 };
 
+/// A batch of ranges applied to the caches: how many ranges, how many remain once overlapping
+/// and adjacent ones are joined (an exact union, which every cache would treat alike), and how
+/// many distinct 4 KiB pages they touch.
+struct InvalidationCounters {
+    std::atomic<u64> batches{};
+    std::atomic<u64> ranges{};
+    std::atomic<u64> merged{};
+    std::atomic<u64> pages{};
+};
+
 /// Written by other threads (worker, guest CPU threads, the split's front).
 struct Shared {
     std::atomic<u64> frame{}; ///< TickFrame count of the draw thread
@@ -220,6 +234,8 @@ struct Shared {
     // ReadNativeSemaphoreWord: words read back from a GPU-modified buffer (FlushRegion).
     std::atomic<u64> semaphore_readbacks{};
     std::atomic<u64> semaphore_readback_ticks{};
+    InvalidationCounters held_writes;   ///< RasterizerVulkan::OnCachedWrites (guest writes)
+    InvalidationCounters flush_caching; ///< RasterizerVulkan::InnerInvalidation (engine writes)
     std::atomic<u64> gpu_modified_queries{};
     std::atomic<u64> gpu_modified_true{};
     std::atomic<u64> gpu_modified_one_page{}; ///< Queries within one 4 KiB page
@@ -284,6 +300,44 @@ inline void Max(std::atomic<u64>& counter, u64 value) {
     while (value > current &&
            !counter.compare_exchange_weak(current, value, std::memory_order_relaxed)) {
     }
+}
+
+/// Counts a batch of (address, size) ranges into `counters` (statistics only; sorts a copy).
+template <typename Address, typename Size>
+void CountInvalidations(InvalidationCounters& counters, std::span<const std::pair<Address, Size>> batch) {
+    if (!Enabled() || batch.empty()) {
+        return;
+    }
+    static thread_local std::vector<std::pair<u64, u64>> ranges;
+    ranges.clear();
+    for (const auto& [address, size] : batch) {
+        if (size != 0) {
+            ranges.emplace_back(static_cast<u64>(address), static_cast<u64>(address) + static_cast<u64>(size));
+        }
+    }
+    std::ranges::sort(ranges);
+    u64 merged = 0;
+    u64 pages = 0;
+    u64 end = 0;
+    u64 last_page = ~u64{0};
+    for (const auto& [begin, finish] : ranges) {
+        if (merged == 0 || begin > end) {
+            ++merged;
+            end = finish;
+        } else {
+            end = (std::max)(end, finish);
+        }
+        for (u64 page = begin >> 12; page <= (finish - 1) >> 12; ++page) {
+            if (page != last_page && (last_page == ~u64{0} || page > last_page)) {
+                ++pages;
+                last_page = page;
+            }
+        }
+    }
+    Add(counters.batches, 1);
+    Add(counters.ranges, ranges.size());
+    Add(counters.merged, merged);
+    Add(counters.pages, pages);
 }
 
 /// Ends the current draw span in `bucket` and starts the next.

@@ -464,6 +464,26 @@ trás parada, `consumed` com release/acquire).
   verdadeiro, 100% dentro de uma página. Descriptor sets religados com as mesmas entradas: 0 (reaproveitar sets
   não serve). Sinais coalescidos: todos na hora (nenhum adiado para fence).
 
+### 3.20 Rodada 12 e o que vira padrão
+
+Praça, sem `EDEN_CPU_WRITE_PAGES`, só a estatística ligada:
+
+| | referência | `FLUSH_DRAWS=128` | + `INLINE_DEFER=1` |
+| --- | --- | --- | --- |
+| Draws/s | 74,1 mil | 75,0 mil | 73,9 mil |
+| Ocupada (% por mil draws/s) | 1,221 | 1,199 (−1,8%) | 1,200 |
+| `Finish` por frame | 45 ms/s, 760 µs | 15 ms/s, 255 µs | 12 ms/s, 208 µs |
+| Upload inline / `flush caching` | 4,4 / 7,9% | 4,0 / 8,1% | 2,2 / 8,2% |
+
+Fluido nas três (usuário). **Padrão agora:** envio à GPU a cada 128 draws nos títulos do Switch 2 (desktop);
+`EDEN_INLINE_DEFER` fica desligado (o custo só mudou de lugar); `EDEN_CPU_WRITE_PAGES` desligado (colateral).
+Escritas de registrador redundantes: o `FrontWrite` já descarta as de mesmo valor em registradores sem efeito
+colateral antes de mandá-las à thread de trás (`maxwell_3d.cpp:849-855`), equivalente ao `15eef40dd1` do
+PokeDinner no caminho que pesa (as escritas de macro); o restante (~700 mil métodos/s) é pequeno. O Eden
+removeu o retorno antecipado geral de `ProcessDirtyRegisters` de propósito (`af554c0baa`, regressões em jogos do
+Switch 1). Rodada 13: tamanho dos lotes de invalidação (regiões, regiões depois de juntar as contíguas, páginas
+distintas) nas escritas seguradas (~7,5%) e no `flush caching` (~8%).
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
