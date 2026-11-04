@@ -447,6 +447,23 @@ Também conferido: a invalidação do shader cache em lote equivale à por regi�
 `queue_mutex`, sem ordem nova de locks; as anotações de release lidas pela frente só depois de um `Drain` (thread de
 trás parada, `consumed` com release/acquire).
 
+### 3.19 Rodada 11 (praça, `fa0ef24983`)
+
+- **`EDEN_CPU_WRITE_PAGES=16` rejeitado:** o contador de FPS não muda, mas o jogo "parece 10 FPS" (usuário).
+  Provável causa: escritas do jogo seguradas até a próxima command list chegam aos caches da GPU uma lista
+  atrasadas (dados de animação/constantes de um frame no seguinte) e o ritmo das apresentações fica irregular
+  (39-64 ms entre `QueueNativeImage`). Fica desligado; não vira padrão.
+- `EDEN_FLUSH_DRAWS=128` (com PAGES=16): `Finish` 127 → 62 ms/s (2,2 → 1,0 ms por download), `handles` 21,1 →
+  15,3%, µs por draw 8,67 → 7,86, draws/s 73,4 → 79,4 mil (+8%). Com `EDEN_INLINE_DEFER=1` junto: upload inline
+  4,1 → 2,3%, 7,79 µs por draw, 82 mil draws/s. Precisa ser repetido **sem** PAGES=16.
+- Decomposição: escritas de macro 80% do tempo do ring (3,5-3,9 mi/s; os draws rodam dentro delas); trabalho
+  próprio da engine ~19-20%; **aplicar as escritas seguradas do jogo no início de cada lista: 7,6-7,8%**; fim de
+  lista 0,2%.
+- Tabela de handles: ~60 downloads/s, 3 draws depois do último dispatch, **bytes iguais ao download anterior em
+  100%**. `Build`: 47-48% dos elementos mudam (incremental não compensa). `IsRegionGpuModified`: ~850 mil/s, 13%
+  verdadeiro, 100% dentro de uma página. Descriptor sets religados com as mesmas entradas: 0 (reaproveitar sets
+  não serve). Sinais coalescidos: todos na hora (nenhum adiado para fence).
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
