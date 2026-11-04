@@ -19,6 +19,7 @@
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -133,9 +134,12 @@ public:
     /// Waits for the given GPU tick, optionally pacing frames.
     void Wait(u64 tick, double target_fps = 0.0) {
         if (tick > 0) {
+            const bool retained = StatsRetained();
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            const VideoCommon::BackStats::WaitTimer wait_timer{
+                VideoCommon::BackStats::shared.wait_tick, StatsQueued(), retained};
             master_semaphore->Wait(tick);
         }
         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {
@@ -218,6 +222,9 @@ private:
             using FuncType = TypedCommand<T>;
             static_assert(sizeof(FuncType) < sizeof(data), "Lambda is too large");
 
+            if (command_offset == 0 && VideoCommon::BackStats::Enabled()) {
+                first_frame = VideoCommon::BackStats::shared.frame.load(std::memory_order_relaxed);
+            }
             command_offset = Common::AlignUp(command_offset, alignof(FuncType));
             if (command_offset > sizeof(data) - sizeof(FuncType)) {
                 return false;
@@ -246,11 +253,17 @@ private:
             return submit;
         }
 
+        /// The draw thread's frame when the first command was recorded (statistics only).
+        u64 FirstFrame() const {
+            return first_frame;
+        }
+
     private:
         Command* first = nullptr;
         Command* last = nullptr;
 
         size_t command_offset = 0;
+        u64 first_frame = 0;
         bool submit = false;
         alignas(std::max_align_t) std::array<u8, 0x8000> data{};
     };
@@ -295,6 +308,14 @@ private:
     void EndRenderPass();
 
     void AcquireNewChunk();
+
+    /// Statistics (EDEN_BACK_THREAD_STATS): chunks queued for the worker, and whether the
+    /// producer's chunk holds commands (only read on the draw thread, the producer).
+    [[nodiscard]] u64 StatsQueued();
+    [[nodiscard]] bool StatsRetained() const {
+        return VideoCommon::BackStats::Enabled() && VideoCommon::BackStats::is_draw_thread &&
+               chunk && !chunk->Empty();
+    }
 
     const Device& device;
     StateTracker& state_tracker;

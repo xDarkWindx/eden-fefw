@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
@@ -203,6 +204,7 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    const VideoCommon::BackStats::ScopedSharedTime composite_time{VideoCommon::BackStats::shared.composite};
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };

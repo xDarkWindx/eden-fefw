@@ -18,6 +18,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/exception.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -481,6 +482,10 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             }
             if (same_banks || patched) {
                 guest_descriptor_queue.AddEntries(cache.words.data(), desc.count);
+                if (VideoCommon::BackStats::Enabled()) {
+                    VideoCommon::BackStats::draw_thread.copied_bytes +=
+                        u64{desc.count} * sizeof(DescriptorUpdateEntry);
+                }
                 views += desc.count;
                 samplers += desc.count;
                 rescaling.PushTexture(cache.rescaled);

@@ -179,6 +179,21 @@ ocupado da thread de trás):
 | (a) + `CurrentGraphicsPipeline` + estados dinâmicos + fora de draws ≥ 35% | B vale um estudo (seção 9) |
 | 1a + 1b juntos < 5% | não fazer a fase 1; ir direto ao desenho de B ou C |
 
+### 3.6 Como rodar (implementado no branch `perf/back-thread-split`)
+
+- `EDEN_BACK_THREAD_STATS=1` (ou `=2`, carimbos com `lfence`) e `EDEN_TEXTURE_TABLE_STATS=1` na mesma janela do
+  PowerShell. Seis linhas a cada 4 s: `Back thread:` (draws/s, ocupado, `PrepareDraw`, composite, clear, compute,
+  DMA, upload inline, lock segurado), `Back thread draw spans` (os 21 trechos encadeados, % do tempo de parede),
+  `Back thread descriptors`, `Back thread waits` (`Finish`, `WaitWorker`, `Wait`; fila e retido no produtor),
+  `Vulkan worker` e `Cache locks` (com a frente do split).
+- Rodada: praça (vista aberta, ~30 s parado depois de estabilizar), palácio de Megaira, uma batalha. Uma rodada
+  com `=1` e uma curta com `=2` na praça. Draws/s para comparar builds: com `EDEN_BACK_THREAD_STATS` desligado.
+- Os trechos somam ~o `PrepareDraw` (o resto é o próprio custo dos carimbos). "other busy" = ocupado da thread
+  de trás menos draws, composite, clear e compute: métodos da engine fora de draws, macros da frente
+  replicadas, `TickWork`, DMA e uploads inline (estes dois também aparecem à parte).
+- Limitações: os carimbos custam ~20 por draw (~1-2%); `Wait(tick)` também conta as esperas de dentro do
+  `Finish`; "in draw lock" só vale para o lock de `PrepareDraw`, não para o de `Clear`/`DispatchCompute`/DMA.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

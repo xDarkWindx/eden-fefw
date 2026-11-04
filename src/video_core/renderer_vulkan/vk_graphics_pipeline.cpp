@@ -21,6 +21,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -787,6 +788,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::enabled_stages[4]) {
         config_stage(4);
     }
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::Handles);
     if (view_count != views.size()) {
         views.resize(view_count);
     }
@@ -855,6 +857,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             }
         }
     }
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::Resolve);
     if (stats) {
         const auto [range_hits, range_misses] = buffer_cache.TakeVirtualRangeCounts();
         compact_stats.range_hits += range_hits;
@@ -928,6 +931,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::enabled_stages[4]) {
         bind_stage_info(4);
     }
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::BindStage);
 
     if (regs.transform_feedback_enabled != 0) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -937,6 +941,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     buffer_cache.BindHostGeometryBuffers(is_indexed);
 
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::Buffers);
 
     RescalingPushConstant rescaling;
     RenderAreaPushConstant render_area;
@@ -950,8 +955,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     };
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         buffer_cache.BindHostStageBuffers(stage);
+        VideoCommon::BackStats::Mark(VideoCommon::BackStats::StageBuffers);
         PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage], rescaling,
                              samplers_it, views_it, compact_blocks.empty() ? nullptr : &compact_binding);
+        VideoCommon::BackStats::Mark(VideoCommon::BackStats::PushImages);
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
             render_area.uses_render_area = true;
@@ -989,6 +996,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                                                                      compact_fill.size()},
                                         compact_view_ids);
     }
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::PostConfigure);
     if (IsBuilt() && !pipeline) {
         return false;
     }
@@ -997,35 +1005,63 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
+    namespace BackStats = VideoCommon::BackStats;
     const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+    const u64 payload_bytes = u64{num_descriptor_entries} * sizeof(DescriptorUpdateEntry);
+    auto& draw_stats = BackStats::draw_thread;
+    if (BackStats::Enabled()) {
+        const BackStats::DescriptorPath path =
+            !descriptor_set_layout  ? BackStats::PathNone
+            : uses_descriptor_buffer ? BackStats::PathBuffer
+            : uses_push_descriptor   ? BackStats::PathPush
+                                     : BackStats::PathSet;
+        ++draw_stats.paths[path];
+    }
 
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
     if (descriptor_set_layout && uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
-        const bool reuse_allocation =
+        const bool same_generation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
-            last_descriptor_payload.size() == num_descriptor_entries &&
+            last_descriptor_payload.size() == num_descriptor_entries;
+        const bool reuse_allocation =
+            same_generation &&
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        if (BackStats::Enabled() && same_generation) {
+            draw_stats.compared_bytes += payload_bytes;
+        }
+        BackStats::Mark(BackStats::DescCompare);
         if (reuse_allocation) {
             descriptor_buffer_offset = last_descriptor_buffer_offset;
             descriptor_buffer_chunk = last_descriptor_buffer_chunk;
             descriptor_buffer_ring.TouchFrame(scheduler);
+            if (BackStats::Enabled()) {
+                ++draw_stats.buffer_reused;
+            }
         } else {
             const DescriptorBufferRing::Allocation alloc{
                 descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
+            BackStats::Mark(BackStats::DescAllocate);
             if (!alloc.host) {
                 LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping draw");
                 return false;
             }
             WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host);
+            BackStats::Mark(BackStats::DescWrite);
             descriptor_buffer_offset = alloc.offset;
             descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_offset = alloc.offset;
             last_descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_generation = alloc.generation;
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            BackStats::Mark(BackStats::DescAssign);
+            if (BackStats::Enabled()) {
+                ++draw_stats.buffer_allocated;
+                draw_stats.buffer_entries += num_descriptor_entries;
+                draw_stats.assigned_bytes += payload_bytes;
+            }
         }
     }
 
@@ -1061,6 +1097,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (update_descriptors) {
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
+        if (BackStats::Enabled()) {
+            draw_stats.compared_bytes += payload_bytes;
+            if (update_descriptors) {
+                draw_stats.assigned_bytes += payload_bytes;
+            }
+        }
+        BackStats::Mark(BackStats::DescCompare);
     }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
@@ -1111,6 +1154,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                       descriptor_set, nullptr);
         }
     });
+    BackStats::Mark(BackStats::DescRecord);
     return true;
 }
 

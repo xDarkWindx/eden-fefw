@@ -13,6 +13,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 
@@ -153,6 +154,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    const VideoCommon::BackStats::ScopedSharedTime space_time{VideoCommon::BackStats::shared.space_ticks};
     WaitForBack(4096, [&] { return write_position + words - consumed_cache <= RingWords; });
 }
 
@@ -210,7 +212,13 @@ void GpuSplit::Drain() {
         return;
     }
     Publish();
-    WaitForBack(16384, [&] { return consumed_cache == write_position; });
+    {
+        const VideoCommon::BackStats::ScopedSharedTime drain_time{VideoCommon::BackStats::shared.drain_ticks};
+        WaitForBack(16384, [&] { return consumed_cache == write_position; });
+    }
+    if (VideoCommon::BackStats::Enabled()) {
+        VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.drains, 1);
+    }
     publish_every = 8;
 }
 
@@ -311,7 +319,9 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     system->RegisterHostThread();
+    namespace BackStats = VideoCommon::BackStats;
     u64 read_position = 0;
+    u64 idle_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
     while (!stop_token.stop_requested()) {
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
@@ -333,6 +343,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 continue;
             }
         }
+        u64 busy_start{};
+        if (idle_start != 0) {
+            busy_start = BackStats::Stamp();
+            BackStats::draw_thread.back_idle += busy_start - idle_start;
+            BackStats::draw_thread.back_loop = true;
+        }
         u64 last_store = read_position;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
@@ -345,6 +361,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
         }
         StoreConsumed(read_position);
+        if (busy_start != 0) {
+            idle_start = BackStats::Stamp();
+            BackStats::draw_thread.back_busy += idle_start - busy_start;
+        }
     }
 }
 

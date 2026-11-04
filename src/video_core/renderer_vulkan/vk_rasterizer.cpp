@@ -45,6 +45,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -249,9 +250,21 @@ RasterizerVulkan::~RasterizerVulkan() {
 
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
-
+    namespace BackStats = VideoCommon::BackStats;
+    BackStats::MaybeReport();
+    const u64 prepare_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
+    if (prepare_start != 0) {
+        BackStats::is_draw_thread = true;
+        ++BackStats::draw_thread.draws;
+        BackStats::draw_thread.last = prepare_start;
+    }
     SCOPE_EXIT {
+        BackStats::Mark(BackStats::Tail);
         gpu.TickWork();
+        BackStats::Mark(BackStats::TickWork);
+        if (prepare_start != 0) {
+            BackStats::draw_thread.prepare += BackStats::draw_thread.last - prepare_start;
+        }
     };
     bool submitted = false;
     SCOPE_EXIT {
@@ -268,14 +281,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     };
     FlushWork();
     gpu_memory->FlushCaching();
+    BackStats::Mark(BackStats::FlushWork);
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+    BackStats::Mark(BackStats::Pipeline);
     if (!pipeline) {
         // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
         submitted = pipeline_cache.TakeDeferredDraw();
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    const BackStats::DrawLockHold lock_hold;
+    BackStats::Mark(BackStats::LockWait);
     buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
@@ -287,13 +304,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
 
     UpdateDynamicStates(pipeline);
+    BackStats::Mark(BackStats::DynamicStates);
 
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    BackStats::Mark(BackStats::Queries);
     draw_func();
+    BackStats::Mark(BackStats::DrawFunc);
     submitted = true;
     buffer_cache.runtime.FlushStorageWrites();
+    BackStats::Mark(BackStats::FlushStorage);
 }
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -435,6 +456,7 @@ void RasterizerVulkan::DrawTexture() {
 }
 
 void RasterizerVulkan::Clear(u32 layer_count) {
+    const VideoCommon::BackStats::ScopedSharedTime clear_time{VideoCommon::BackStats::shared.clear};
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -620,6 +642,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 }
 
 void RasterizerVulkan::DispatchCompute() {
+    const VideoCommon::BackStats::ScopedSharedTime compute_time{VideoCommon::BackStats::shared.compute};
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -724,11 +747,15 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         return;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         texture_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         buffer_cache.DownloadMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
@@ -738,7 +765,9 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
 
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         if (buffer_cache.IsRegionGpuModified(addr, size)) {
             return true;
         }
@@ -747,7 +776,9 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         return texture_cache.IsRegionGpuModified(addr, size);
     }
     return false;
@@ -756,13 +787,17 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     {
         // Guest CPU reads of buffer memory decide which GPU-written buffer data is copied back.
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         buffer_cache.NoteCpuRead(Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
                                  Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE) -
                                      Common::AlignDown(addr, Core::DEVICE_PAGESIZE));
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         auto area = texture_cache.GetFlushArea(addr, size);
         if (area) {
             return *area;
@@ -781,11 +816,15 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
         return;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         texture_cache.WriteMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         buffer_cache.WriteMemory(addr, size);
     }
     if ((True(which & VideoCommon::CacheType::QueryCache))) {
@@ -798,13 +837,17 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 
 void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         for (const auto& [addr, size] : sequences) {
             texture_cache.WriteMemory(addr, size);
         }
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
         }
@@ -821,7 +864,9 @@ void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> wri
     // As OnCachedWrite for each, with each cache locked once: the caches are independent, so
     // their order between regions does not matter.
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cached_writes};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         for (const auto& [addr, size] : writes) {
             if (addr != 0 && size != 0) {
                 texture_cache.WriteMemory(addr, size);
@@ -829,7 +874,9 @@ void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> wri
         }
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cached_writes};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         for (const auto& [addr, size] : writes) {
             if (addr != 0 && size != 0) {
                 buffer_cache.CachedWriteMemory(addr, size);
@@ -851,13 +898,17 @@ void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> wri
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cpu_write};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         if (buffer_cache.OnCPUWrite(addr, size)) {
             return true;
         }
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cpu_write};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         texture_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
@@ -870,11 +921,15 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
     }
 
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         texture_cache.WriteMemory(addr, size);
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
@@ -885,13 +940,17 @@ void RasterizerVulkan::OnCachedWrite(DAddr addr, u64 size) {
         return;
     }
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cached_writes};
         std::scoped_lock lock{texture_cache.mutex};
+        lock_timer.Acquired();
         texture_cache.WriteMemory(addr, size);
     }
     {
         // Copies just these bytes in: marking the pages CPU-modified instead re-uploads them
         // whole from guest memory, over what the GPU wrote there and never copied back.
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.cached_writes};
         std::scoped_lock lock{buffer_cache.mutex};
+        lock_timer.Acquired();
         buffer_cache.CachedWriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
@@ -900,7 +959,9 @@ void RasterizerVulkan::OnCachedWrite(DAddr addr, u64 size) {
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) return true;
     {
+        const VideoCommon::BackStats::LockTimer lock_timer{VideoCommon::BackStats::shared.other_locks};
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+        lock_timer.Acquired();
         if (buffer_cache.IsRegionGpuModified(addr, size)) return false;
         texture_cache.WriteMemory(addr, size);
         buffer_cache.WriteMemory(addr, size);
@@ -1023,6 +1084,7 @@ void RasterizerVulkan::FlushCommandsBatched() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.frame, 1);
     draw_counter = 0;
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
@@ -1061,6 +1123,7 @@ Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() 
 
 void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                 std::span<const u8> memory) {
+    const VideoCommon::BackStats::ScopedSharedTime upload_time{VideoCommon::BackStats::shared.inline_upload};
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_addr) [[unlikely]] {
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
@@ -1149,11 +1212,13 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
     : buffer_cache{buffer_cache_}, texture_cache{texture_cache_}, scheduler{scheduler_} {}
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
+    const VideoCommon::BackStats::ScopedSharedTime dma_time{VideoCommon::BackStats::shared.dma};
     std::scoped_lock lock{buffer_cache.mutex};
     return buffer_cache.DMAClear(src_address, amount, value);
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    const VideoCommon::BackStats::ScopedSharedTime dma_time{VideoCommon::BackStats::shared.dma};
     std::scoped_lock lock{buffer_cache.mutex};
     return buffer_cache.DMACopy(src_address, dest_address, amount);
 }
@@ -1162,6 +1227,7 @@ template <bool IS_IMAGE_UPLOAD>
 bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
+    const VideoCommon::BackStats::ScopedSharedTime dma_time{VideoCommon::BackStats::shared.dma};
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {

@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -103,13 +104,21 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
     const VkDeviceSize needed{Common::AlignUp(size, alignment)};
     if (frame_reused) {
         frame_reused = false;
+        const u64 wait_start = VideoCommon::BackStats::Enabled() ? VideoCommon::BackStats::Stamp() : 0;
         scheduler.Wait(frame_ticks[frame_index]);
+        if (wait_start != 0) {
+            VideoCommon::BackStats::draw_thread.ring_frame_wait +=
+                VideoCommon::BackStats::Stamp() - wait_start;
+        }
     }
     if (cursor + needed > chunk_capacity) {
         if (chunk_cursor + 1 < chunks_per_frame) {
             ++chunk_cursor;
         } else {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer frame exhausted, stalling on the GPU");
+            if (VideoCommon::BackStats::Enabled()) {
+                ++VideoCommon::BackStats::draw_thread.ring_exhausted;
+            }
             scheduler.Finish();
             chunk_cursor = 0;
             ++generation;

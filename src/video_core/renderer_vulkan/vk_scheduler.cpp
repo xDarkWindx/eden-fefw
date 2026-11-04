@@ -65,6 +65,8 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
 }
 
 void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    const VideoCommon::BackStats::WaitTimer wait_timer{VideoCommon::BackStats::shared.finish,
+                                                       StatsQueued(), StatsRetained()};
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitExecution(signal_semaphore, wait_semaphore);
@@ -73,6 +75,8 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
+    const VideoCommon::BackStats::WaitTimer wait_timer{VideoCommon::BackStats::shared.wait_worker,
+                                                       StatsQueued(), StatsRetained()};
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -92,6 +96,13 @@ void Scheduler::DispatchWork() {
         bool wake;
         {
             std::scoped_lock ql{queue_mutex};
+            if (VideoCommon::BackStats::Enabled()) {
+                namespace BackStats = VideoCommon::BackStats;
+                const u64 queued = work_queue.size();
+                BackStats::Add(BackStats::shared.dispatches, 1);
+                BackStats::Add(BackStats::shared.dispatch_queue_sum, queued);
+                BackStats::Max(BackStats::shared.dispatch_queue_max, queued);
+            }
             work_queue.push(std::move(chunk));
             wake = worker_waiting;
         }
@@ -292,6 +303,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         return true;
     }};
 
+    u64 idle_start{}; ///< Statistics: when the worker last ran out of work
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
 
@@ -318,7 +330,23 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
+            const u64 busy_start = VideoCommon::BackStats::Enabled() ? VideoCommon::BackStats::Stamp() : 0;
+            if (busy_start != 0) {
+                namespace BackStats = VideoCommon::BackStats;
+                if (idle_start != 0) {
+                    BackStats::Add(BackStats::shared.worker_idle, busy_start - idle_start);
+                }
+                const u64 frame = BackStats::shared.frame.load(std::memory_order_relaxed);
+                BackStats::Max(BackStats::shared.worker_age_max,
+                               frame > work->FirstFrame() ? frame - work->FirstFrame() : 0);
+            }
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            if (busy_start != 0) {
+                namespace BackStats = VideoCommon::BackStats;
+                idle_start = BackStats::Stamp();
+                BackStats::Add(BackStats::shared.worker_busy, idle_start - busy_start);
+                BackStats::Add(BackStats::shared.worker_chunks, 1);
+            }
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
@@ -357,8 +385,16 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    const u64 recorded = VideoCommon::BackStats::Enabled() ? VideoCommon::BackStats::Stamp() : 0;
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, recorded,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+        if (recorded != 0) {
+            namespace BackStats = VideoCommon::BackStats;
+            const u64 latency = BackStats::Stamp() - recorded;
+            BackStats::Add(BackStats::shared.submits, 1);
+            BackStats::Add(BackStats::shared.submit_latency, latency);
+            BackStats::Max(BackStats::shared.submit_latency_max, latency);
+        }
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -492,6 +528,14 @@ void Scheduler::EndRenderPass()
         num_renderpass_images = 0;
     }
 
+
+u64 Scheduler::StatsQueued() {
+    if (!VideoCommon::BackStats::Enabled()) {
+        return 0;
+    }
+    std::scoped_lock ql{queue_mutex};
+    return work_queue.size();
+}
 
 void Scheduler::AcquireNewChunk() {
     std::scoped_lock rl{reserve_mutex};
