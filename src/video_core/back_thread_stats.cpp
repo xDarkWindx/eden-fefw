@@ -254,6 +254,15 @@ void Report() {
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);
+    const u64 unregistered = Take(shared.cpu_write_unregistered);
+    const u64 held = Take(shared.cpu_write_held);
+    const u64 written = Take(shared.cpu_write_written);
+    LOG_INFO(Render_Vulkan,
+             "Guest CPU writes to cached pages: buffer cache answered unregistered {:.0f}/s, held "
+             "{:.0f}/s, written {:.0f}/s; held on one of the core's last 16 held pages {:.0f}/s; held "
+             "without asking (EDEN_CPU_WRITE_PAGES) {:.0f}/s",
+             per_s(unregistered), per_s(held), per_s(written), per_s(Take(shared.cpu_write_would_hit)),
+             per_s(Take(shared.cpu_write_skipped)));
     LOG_INFO(Render_Vulkan,
              "Cache locks: {}; {}; {}; {}. Split front: {:.0f} drains/s waiting {:.0f} us/s, ring "
              "space {:.0f} us/s",

@@ -293,6 +293,19 @@ Rodada 8 mede o tempo da frente esperando o jogo submeter command lists (`PopWai
 dormindo com canal suspenso, e o tempo em que ela está ocupada (parsing, macros, envio). Se a frente espera o
 jogo nesses intervalos, quem limita ali é a CPU do jogo (que espera os locks dos caches ~1,2 s/s).
 
+### 3.12 Rodada 8: a ociosidade é a GPU emulada esperando o jogo
+
+- A frente espera o jogo submeter ~26-27 vezes/s (≈ 1 por frame), **128-146 ms/s**, ~5 ms por frame; a thread
+  de trás fica ociosa 128-142 ms/s e dorme ~21-24 vezes/s. A ociosidade (~13%) é a espera, a cada frame, pela
+  próxima submissão do jogo, não os `Drain`. A frente fica ocupada só ~16-17% do tempo (o resto é `Drain`).
+- Nesses ~5 ms por frame quem limita é a CPU do jogo, que perde ~1,1-1,2 s/s nos locks dos caches
+  (`OnCPUWrite`, ~140 mil/s).
+- `HandleRasterizerWrite` (`core/memory.cpp`) já guarda por núcleo a última página em que o `OnCPUWrite`
+  respondeu "segura" e nunca a invalida; uma escrita segurada é aplicada antes da próxima submissão
+  (`OnCachedWrites` → `CachedWriteMemory`, que também trata a região que deixou de ser da GPU). Rodada 9 mede os
+  três resultados do `OnCPUWrite` (não registrada, segurada, marcada) e quantas seguradas cairiam nas 16 últimas
+  páginas do núcleo, e traz o experimento `EDEN_CPU_WRITE_PAGES=N` (N páginas, mesmo contrato).
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

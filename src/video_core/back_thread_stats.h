@@ -183,6 +183,13 @@ struct Shared {
     std::atomic<u64> front_guest_wait{};   ///< The GPU thread (front) waiting for guest submissions
     std::atomic<u64> front_guest_waits{};
     std::atomic<u64> front_pending_sleep{}; ///< ... sleeping 1 ms with a native channel suspended
+    // Guest CPU writes to GPU-cached pages (core/memory.cpp HandleRasterizerWrite) and what the
+    // buffer cache answered (BufferCache::OnCPUWrite).
+    std::atomic<u64> cpu_write_unregistered{}; ///< No buffer there (the texture cache is told)
+    std::atomic<u64> cpu_write_held{};         ///< GPU-modified: held until the next submission
+    std::atomic<u64> cpu_write_written{};      ///< Marked CPU-modified (the texture cache is told)
+    std::atomic<u64> cpu_write_would_hit{};    ///< Held, on one of the core's last 16 held pages
+    std::atomic<u64> cpu_write_skipped{};      ///< Held without asking (EDEN_CPU_WRITE_PAGES)
     std::atomic<u64> drain_ticks{};
     std::atomic<u64> space_ticks{};
 };

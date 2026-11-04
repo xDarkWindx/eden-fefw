@@ -19,6 +19,7 @@
 #include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -157,12 +158,22 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+    namespace BackStats = VideoCommon::BackStats;
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
+        if (BackStats::Enabled()) {
+            BackStats::Add(BackStats::shared.cpu_write_unregistered, 1);
+        }
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        if (BackStats::Enabled()) {
+            BackStats::Add(BackStats::shared.cpu_write_held, 1);
+        }
         return true;
+    }
+    if (BackStats::Enabled()) {
+        BackStats::Add(BackStats::shared.cpu_write_written, 1);
     }
     WriteMemory(device_addr, size);
     return false;

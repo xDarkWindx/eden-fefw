@@ -31,6 +31,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -725,13 +726,33 @@ struct Memory::Impl {
             // It is often the case the games like to access wildly different addresses. Hence why I propose
             // we should let the compiler just do it's thing...
             if (current_area.last_address != subaddress) {
-                // Short circuit the need to check for address/size
-                auto const do_collection = (address != 0 && size != 0)
-                    && system.GPU().OnCPUWrite(address, size);
-                if (do_collection) {
+                namespace BackStats = VideoCommon::BackStats;
+                // EDEN_CPU_WRITE_PAGES: the core's last held pages, not only the last one, are
+                // held without asking again (the same contract as last_address, which is never
+                // reset either: a held write is applied before the next submission, through
+                // OnCachedWrites, whether or not the GPU still owns the page then).
+                const u32 pages = CpuWritePages();
+                const bool remembered = (pages > 1 || BackStats::Enabled()) &&
+                                        current_area.Remembers(subaddress);
+                if (pages > 1 && remembered) {
                     current_area.last_address = subaddress;
+                    if (BackStats::Enabled()) {
+                        BackStats::Add(BackStats::shared.cpu_write_skipped, 1);
+                    }
                 } else {
-                    return;
+                    // Short circuit the need to check for address/size
+                    auto const do_collection = (address != 0 && size != 0)
+                        && system.GPU().OnCPUWrite(address, size);
+                    if (!do_collection) {
+                        return;
+                    }
+                    current_area.last_address = subaddress;
+                    if (BackStats::Enabled() && remembered) {
+                        BackStats::Add(BackStats::shared.cpu_write_would_hit, 1);
+                    }
+                    if ((pages > 1 || BackStats::Enabled()) && !remembered) {
+                        current_area.Remember(subaddress, pages > 1 ? pages : 16);
+                    }
                 }
             }
             gpu_dirty_managers[core].Collect(address, size);
@@ -740,7 +761,45 @@ struct Memory::Impl {
 
     struct GPUDirtyState {
         PAddr last_address;
+        /// Recently held pages (EDEN_CPU_WRITE_PAGES, and the statistics), round robin.
+        std::array<PAddr, 64> recent{};
+        u32 filled{};
+        u32 next{};
+
+        [[nodiscard]] bool Remembers(PAddr page) const {
+            for (u32 index = 0; index < filled; ++index) {
+                if (recent[index] == page) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void Remember(PAddr page, u32 capacity) {
+            if (filled < capacity) {
+                recent[filled++] = page;
+                return;
+            }
+            recent[next] = page;
+            next = next + 1 < capacity ? next + 1 : 0;
+        }
     };
+
+    /// EDEN_CPU_WRITE_PAGES=N (1-64, default 1): how many of a core's last held pages are held
+    /// again without asking the GPU caches (1: only the last one, as before).
+    static u32 CpuWritePages() {
+        static const u32 pages = [] {
+            const char* const value = std::getenv("EDEN_CPU_WRITE_PAGES");
+            const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
+            const u32 result = parsed < 1 ? 1U : parsed > 64 ? 64U : static_cast<u32>(parsed);
+            if (result != 1) {
+                LOG_INFO(HW_Memory, "EDEN_CPU_WRITE_PAGES={}: held guest writes remember {} pages per core",
+                         result, result);
+            }
+            return result;
+        }();
+        return pages;
+    }
 
     void InvalidateGPUMemory(u8* p, size_t size) {
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
