@@ -47,7 +47,14 @@ public:
                                                 std::memory_order_relaxed));
     }
 
+    /// Bumped by every Gather: what a writer remembered about pages it collected before is stale
+    /// once their writes were applied (core/memory.cpp, EDEN_CPU_WRITE_PAGES).
+    [[nodiscard]] u64 GatherEpoch() const {
+        return gather_epoch.load(std::memory_order_relaxed);
+    }
+
     void Gather(std::function<void(PAddr, size_t)>& callback) {
+        gather_epoch.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
@@ -115,6 +122,7 @@ private:
 
     std::atomic<TransformAddress> current{};
     std::mutex guard;
+    std::atomic<u64> gather_epoch{};
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
 };

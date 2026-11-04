@@ -200,17 +200,24 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     if (satisfies(word_before)) {
                         BackStats::Add(BackStats::shared.acquire_ready_before, 1);
                     }
-                    if (word_before != word) {
+                    // The raw word again: `word` may come from a readback of a GPU buffer, which
+                    // is not a change the drain made (counted apart, semaphore_readbacks).
+                    const u32 word_after = dma_pusher.memory_manager.Read<u32>(
+                        regs.semaphore_address.SemaphoreAddress());
+                    if (word_before != word_after) {
                         BackStats::Add(BackStats::shared.acquire_changed, 1);
                         // The back is idle after the drain: its notes are safe to read here.
                         BackStats::Add(BackStats::shared.acquire_release_source[BackStats::LastRelease(
                                            regs.semaphore_address.SemaphoreAddress())],
                                        1);
                     }
-                    const size_t op_index = op == GpuSemaphoreOperation::AcquireEqual    ? 0
-                                            : op == GpuSemaphoreOperation::AcquireGequal ? 1
-                                                                                         : 2;
-                    BackStats::Add(BackStats::shared.acquire_ops[op_index], 1);
+                    if (op == GpuSemaphoreOperation::AcquireEqual) {
+                        BackStats::Add(BackStats::shared.acquire_ops[0], 1);
+                    } else if (op == GpuSemaphoreOperation::AcquireGequal) {
+                        BackStats::Add(BackStats::shared.acquire_ops[1], 1);
+                    } else if (op == GpuSemaphoreOperation::AcquireMask) {
+                        BackStats::Add(BackStats::shared.acquire_ops[2], 1);
+                    }
                 }
                 const bool ready_at_once = ready();
                 if (!ready_at_once) {

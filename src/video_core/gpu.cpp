@@ -234,7 +234,10 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
-        const u64 fence = RequestSyncOperation([this, &raster_area]() {
+        const u64 fence = RequestSyncOperation([this, raster_area]() {
+            // Guest writes still held for the caches go in first: the download would otherwise
+            // put the GPU's older copy over them (from PokeDinner).
+            InvalidateGPUCache();
             renderer->ReadRasterizer()->FlushRegion(raster_area.start_address, raster_area.end_address - raster_area.start_address);
         });
         gpu_thread.TickGPU(is_async);

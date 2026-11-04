@@ -25,6 +25,7 @@
 
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -259,8 +260,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         ++BackStats::draw_thread.draw_serial;
         BackStats::draw_thread.last = prepare_start;
     }
+    bool locked = false; ///< Statistics: whether the span before TickWork includes releasing the locks
     SCOPE_EXIT {
-        BackStats::Mark(BackStats::Unlock);
+        BackStats::Mark(locked ? BackStats::Unlock : BackStats::Tail);
         gpu.TickWork();
         BackStats::Mark(BackStats::TickWork);
         if (prepare_start != 0) {
@@ -294,6 +296,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     const BackStats::DrawLockHold lock_hold;
+    locked = true;
     BackStats::Mark(BackStats::LockWait);
     buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);
     // update engine as channel may be different.
@@ -416,6 +419,8 @@ void RasterizerVulkan::DrawTexture() {
         gpu.TickWork();
     };
     FlushWork();
+    // The engine's accumulated writes reach the caches first, as for the other draws.
+    gpu_memory->FlushCaching();
 
     std::scoped_lock l{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
@@ -1133,34 +1138,46 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         return;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
-    // EDEN_INLINE_DEFER=1 (from PokeDinner's EDEN_NX2_INLINE_DEFER): a write the buffer cache did
-    // not upload in place (no GPU-written data there) leaves the buffer, texture and shader caches'
-    // invalidation to the next FlushCaching, merged with the engine's other writes, instead of
-    // taking each cache's lock for every small inline write between draws. Guest memory has the
-    // words already; FlushCaching runs before draws, clears, dispatches, DMA and 2D copies.
-    static const bool defer = [] {
+    // EDEN_INLINE_DEFER (from PokeDinner's EDEN_NX2_INLINE_DEFER): a write the buffer cache did not
+    // upload in place (no GPU-written data there) leaves caches' invalidation to the next
+    // FlushCaching, merged with the engine's other writes, instead of taking each cache's lock for
+    // every small inline write between draws. Guest memory has the words already; FlushCaching
+    // runs before draws, clears, dispatches, DMA and 2D copies.
+    //  1: the buffer and shader caches only. Safe: such a buffer range holds no GPU data to
+    //     download over the words, and every buffer bind and pipeline lookup follows a
+    //     FlushCaching.
+    //  2: the texture cache too (PokeDinner's behaviour). A guest CPU read that downloads a
+    //     GPU-written image over these words before the next FlushCaching would undo them, and a
+    //     present could show the image as it was.
+    static const int defer = [] {
         const char* const value = std::getenv("EDEN_INLINE_DEFER");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr && (value[0] == '1' || value[0] == '2') ? value[0] - '0' : 0;
     }();
     bool uploaded;
     {
         std::unique_lock<std::recursive_mutex> lock{buffer_cache.mutex};
         uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
-        if (!uploaded && !defer) {
+        if (!uploaded && defer == 0) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
     }
     // Pending query results must not land over the new words later: drop them now.
     query_cache.InvalidateRegion(*cpu_addr, copy_size);
-    if (!uploaded && defer) {
+    if (!uploaded && defer != 0) {
+        // FlushCaching invalidates every cache over the range (texture cache included again in
+        // mode 1, which is harmless: the image was already told below).
         gpu_memory->AccumulateInvalidation(address, copy_size);
-        return;
+        if (defer == 2) {
+            return;
+        }
     }
     {
         std::scoped_lock lock_texture{texture_cache.mutex};
         texture_cache.WriteMemory(*cpu_addr, copy_size);
     }
-    pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
+    if (uploaded || defer == 0) {
+        pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
+    }
 }
 
 std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
@@ -1220,20 +1237,25 @@ void RasterizerVulkan::FlushWork() {
     // it starts on a frame while the rest is still being recorded. In Fortune's Weave the back
     // thread waits once a frame (Finish for the handle table) for all work submitted before it;
     // less of it still unsubmitted there means a shorter wait. Costs more queue submissions.
-    static const u32 draws_to_dispatch = [] {
+    // The counter is checked when it reaches CHECK_MASK modulo CHECK_MASK + 1: without the variable
+    // the comparison stays as it was (a flush every DRAWS_TO_DISPATCH + CHECK_MASK draws); with it,
+    // N is rounded up to a multiple of CHECK_MASK + 1 and the flush comes every N - 1 draws (the
+    // counter restarts at zero). Other submissions (FlushCommands) restart the count too.
+    static const u32 flush_at = [] {
         const char* const value = std::getenv("EDEN_FLUSH_DRAWS");
         const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
         if (parsed == 0) {
             return DRAWS_TO_DISPATCH;
         }
-        const u32 draws = static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL));
-        LOG_INFO(Render_Vulkan, "EDEN_FLUSH_DRAWS={}: submitting about every {} draws", draws, draws);
-        return draws;
+        constexpr u32 step = CHECK_MASK + 1;
+        const u32 draws = Common::AlignUp(static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL)), step);
+        LOG_INFO(Render_Vulkan, "EDEN_FLUSH_DRAWS: submitting every {} draws", draws);
+        return draws - 1;
     }();
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }
-    if (draw_counter < draws_to_dispatch) {
+    if (draw_counter < flush_at) {
         scheduler.DispatchWork();
         return;
     }

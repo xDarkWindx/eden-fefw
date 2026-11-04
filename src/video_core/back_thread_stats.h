@@ -286,13 +286,6 @@ inline void Max(std::atomic<u64>& counter, u64 value) {
     }
 }
 
-/// Starts the chain of draw spans.
-inline void Begin() {
-    if (Enabled()) {
-        draw_thread.last = Stamp();
-    }
-}
-
 /// Ends the current draw span in `bucket` and starts the next.
 inline void Mark(Draw bucket) {
     if (Enabled()) {

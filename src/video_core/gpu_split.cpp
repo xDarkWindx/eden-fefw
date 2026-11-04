@@ -91,6 +91,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ring = std::make_unique<u64[]>(RingWords);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
+    // Statistics: the back prepares draws from here on; this thread (the front) may have before.
+    VideoCommon::BackStats::is_draw_thread = false;
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
     const char* jit = std::getenv("EDEN_MME_JIT");
@@ -183,13 +185,15 @@ void GpuSplit::WaitForBack(u32 spin_limit, Done&& done) {
             Pause();
             continue;
         }
+        // Statistics: a stamp left by a call this front did not sleep through is not this sleep's.
+        consumed_notify_stamp.store(0, std::memory_order_relaxed);
         front_waiting.store(true, std::memory_order_seq_cst);
         consumed_cache = consumed.load(std::memory_order_seq_cst);
         if (!done()) {
             consumed.wait(consumed_cache, std::memory_order_acquire);
             if (VideoCommon::BackStats::Enabled()) {
                 namespace BackStats = VideoCommon::BackStats;
-                BackStats::Add(BackStats::shared.front_slept, 1);
+                ++front_sleeps;
                 if (const u64 stamp = consumed_notify_stamp.exchange(0, std::memory_order_relaxed)) {
                     BackStats::Add(BackStats::shared.front_wake, BackStats::Stamp() - stamp);
                     BackStats::Add(BackStats::shared.front_wake_count, 1);
@@ -243,8 +247,11 @@ void GpuSplit::Drain(u32 site) {
     Publish();
     namespace BackStats = VideoCommon::BackStats;
     const u64 drain_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
+    const u64 sleeps_before = front_sleeps;
     WaitForBack(16384, [&] { return consumed_cache == write_position; });
     if (drain_start != 0) {
+        // Only the drain's own sleeps (WaitForSpace sleeps in WaitForBack too).
+        BackStats::Add(BackStats::shared.front_slept, front_sleeps - sleeps_before);
         drained_stamp = BackStats::Stamp();
         // Only drains that waited: those leave the back with nothing to do until the front sends more.
         const u64 ticks = BackStats::Stamp() - drain_start;
@@ -371,6 +378,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if (available == read_position) {
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
                 // at `published`, so a publish in between ends the wait at once.
+                publish_notify_stamp.store(0, std::memory_order_relaxed);
                 back_waiting.store(true, std::memory_order_seq_cst);
                 const u32 seen = wake.load(std::memory_order_seq_cst);
                 available = published.load(std::memory_order_seq_cst);

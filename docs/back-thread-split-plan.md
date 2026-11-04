@@ -424,6 +424,29 @@ Com o `git.eden-emu.dev` liberado, a história desde o espelho de 2 de novembro 
 | `18b0671e1`, `808feaf3b` (Duck912) | Correções de renderização do FE no recompilador do PokeDinner | O nosso fork já renderiza o FE por outro caminho |
 | `690f80e15`, `0f14696044` | Pacing do vi2 deles (frame atual/anterior) | Ver 3.16: não se transporta |
 
+### 3.18 Revisão de correção do branch (2026-11-04)
+
+Revisão do diff `origin/main...perf/back-thread-split`, apontamentos conferidos no código:
+
+| Apontamento | Correção |
+| --- | --- |
+| `EDEN_INLINE_DEFER` adiava também a invalidação do cache de texturas; uma leitura da CPU que baixa uma imagem escrita pela GPU (`FlushRegion`), o `DrawTexture` (sem `FlushCaching`) ou o present podiam ver/devolver a imagem velha | Modo `1` agora adia só buffer e shader (seguro: a faixa não tem dados da GPU para baixar, e todo bind e busca de pipeline vem depois de um `FlushCaching`); o comportamento do PokeDinner ficou no modo `2`, com o risco documentado. `DrawTexture` passou a chamar `FlushCaching` como os outros draws |
+| `EDEN_CPU_WRITE_PAGES`: uma página lembrada nunca saía da lista | As páginas lembradas valem só até as escritas seguradas do núcleo serem aplicadas (`GPUDirtyMemoryManager::Gather`, a cada command list ou fence: uma época por núcleo); depois são consultadas de novo |
+| (achado ao conferir) A leitura da CPU que baixa dados da GPU sobre a memória do guest (`gpu.cpp`, `GetFlushArea` → `FlushRegion`) não aplicava antes as escritas seguradas: o download podia sobrescrevê-las. Já existia antes deste branch | `InvalidateGPUCache()` antes do `FlushRegion`, como o PokeDinner faz; o lambda copia a área em vez de referenciá-la |
+| `EDEN_FLUSH_DRAWS` dava período de N+32 (160 para 128) | Arredonda N para múltiplo de 32 e submete a cada N−1 draws; sem a variável, o comportamento é o de antes |
+| `is_draw_thread` ficava ligado na frente se ela preparou draws antes do split começar (estatística errada e corrida ao ler o `chunk` do scheduler) | Zerado na frente quando o split começa |
+| Carimbos de "acordar" deixados por uma espera que não dormiu eram usados pela próxima | Zerados antes de cada tentativa de dormir |
+| "front slept per drain" contava também as esperas por espaço no ring | Conta só as do `Drain` |
+| `acquire_changed` comparava a leitura crua com uma que pode vir de um readback de buffer da GPU; operações desconhecidas contavam como máscara | Compara com outra leitura crua; só as três operações conhecidas são contadas |
+| Saídas antes de pegar o lock caíam em `unlock` | Caem em `tail` |
+| Tabela de downloads repetida por especialização do `ConfigureImpl` | Uma só, numa função fora do template |
+| `Begin()` sem uso | Removido |
+
+Também conferido: a invalidação do shader cache em lote equivale à por região (uma entrada marcada sai do
+`invalidation_cache` na hora e `RemovePendingShaders` remove duplicatas); `StatsQueued` pega só o
+`queue_mutex`, sem ordem nova de locks; as anotações de release lidas pela frente só depois de um `Drain` (thread de
+trás parada, `consumed` com release/acquire).
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

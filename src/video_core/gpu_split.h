@@ -201,6 +201,7 @@ private:
     std::atomic<u64> consumed_notify_stamp{};
     std::atomic<u64> publish_notify_stamp{};
     u64 drained_stamp{}; ///< Front: when the last drain ended, until the next publish
+    u64 front_sleeps{};  ///< Front: sleeps in WaitForBack (statistics)
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

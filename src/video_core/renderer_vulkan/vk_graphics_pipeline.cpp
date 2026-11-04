@@ -57,6 +57,23 @@ using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
 constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
 
+/// Statistics (EDEN_BACK_THREAD_STATS): whether a buffer-backed handle table's bytes changed since
+/// its last download at the same address. One table for every ConfigureImpl specialization.
+void NoteHandleTableBytes(GPUVAddr base, std::span<const u8> bytes) {
+    struct LastTable {
+        GPUVAddr base;
+        u64 hash;
+    };
+    static thread_local std::array<LastTable, 16> last_tables{};
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    LastTable& slot = last_tables[(base >> 8) & (last_tables.size() - 1)];
+    auto& draw_stats = VideoCommon::BackStats::draw_thread;
+    if (slot.base == base) {
+        ++(slot.hash == hash ? draw_stats.table_same : draw_stats.table_changed);
+    }
+    slot = {base, hash};
+}
+
 DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
     DescriptorLayoutBuilder builder{device};
     for (size_t index = 0; index < infos.size(); ++index) {
@@ -523,20 +540,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         buffer_texture_bytes.resize(span);
                         gpu_memory->ReadBlockUnsafe(base, buffer_texture_bytes.data(), span);
                         if (index == 0 && VideoCommon::BackStats::Enabled()) {
-                            // Whether the GPU-written table changed since its last download here.
-                            struct LastTable {
-                                GPUVAddr base;
-                                u64 hash;
-                            };
-                            static thread_local std::array<LastTable, 16> last_tables{};
-                            const u64 hash = Common::CityHash64(
-                                reinterpret_cast<const char*>(buffer_texture_bytes.data()), span);
-                            LastTable& slot = last_tables[(base >> 8) & (last_tables.size() - 1)];
-                            auto& draw_stats = VideoCommon::BackStats::draw_thread;
-                            if (slot.base == base) {
-                                ++(slot.hash == hash ? draw_stats.table_same : draw_stats.table_changed);
-                            }
-                            slot = {base, hash};
+                            NoteHandleTableBytes(base, buffer_texture_bytes);
                         }
                     }
                     const u64 offset = source.offset + u64{index} * source.stride;

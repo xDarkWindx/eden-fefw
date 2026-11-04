@@ -732,6 +732,13 @@ struct Memory::Impl {
                 // reset either: a held write is applied before the next submission, through
                 // OnCachedWrites, whether or not the GPU still owns the page then).
                 const u32 pages = CpuWritePages();
+                if (pages > 1 || BackStats::Enabled()) {
+                    // Remembered pages hold only until this core's held writes are applied
+                    // (InvalidateGPUCache at each command list, or a fence): asked again after
+                    // that, so a page the GPU stopped owning, or that now backs a texture or a
+                    // shader, is not held past one application.
+                    current_area.ForgetBefore(gpu_dirty_managers[core].GatherEpoch());
+                }
                 const bool remembered = (pages > 1 || BackStats::Enabled()) &&
                                         current_area.Remembers(subaddress);
                 if (pages > 1 && remembered) {
@@ -765,6 +772,15 @@ struct Memory::Impl {
         std::array<PAddr, 64> recent{};
         u32 filled{};
         u32 next{};
+        u64 epoch{}; ///< GPUDirtyMemoryManager::GatherEpoch the recent pages were held in
+
+        void ForgetBefore(u64 current_epoch) {
+            if (epoch != current_epoch) {
+                epoch = current_epoch;
+                filled = 0;
+                next = 0;
+            }
+        }
 
         [[nodiscard]] bool Remembers(PAddr page) const {
             for (u32 index = 0; index < filled; ++index) {
