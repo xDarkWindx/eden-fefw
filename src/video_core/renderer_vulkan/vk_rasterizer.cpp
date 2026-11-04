@@ -1215,10 +1215,25 @@ void RasterizerVulkan::FlushWork() {
 #endif // __ANDROID__
 
     static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
+    // EDEN_FLUSH_DRAWS=N (from PokeDinner 226162edf, EDEN_NX2_FLUSH_DRAWS there, 128 for native
+    // titles): submit to the host GPU about every N draws instead of every DRAWS_TO_DISPATCH, so
+    // it starts on a frame while the rest is still being recorded. In Fortune's Weave the back
+    // thread waits once a frame (Finish for the handle table) for all work submitted before it;
+    // less of it still unsubmitted there means a shorter wait. Costs more queue submissions.
+    static const u32 draws_to_dispatch = [] {
+        const char* const value = std::getenv("EDEN_FLUSH_DRAWS");
+        const unsigned long parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
+        if (parsed == 0) {
+            return DRAWS_TO_DISPATCH;
+        }
+        const u32 draws = static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL));
+        LOG_INFO(Render_Vulkan, "EDEN_FLUSH_DRAWS={}: submitting about every {} draws", draws, draws);
+        return draws;
+    }();
     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
         return;
     }
-    if (draw_counter < DRAWS_TO_DISPATCH) {
+    if (draw_counter < draws_to_dispatch) {
         scheduler.DispatchWork();
         return;
     }

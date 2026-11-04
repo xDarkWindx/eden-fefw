@@ -411,6 +411,19 @@ memória esparsa do Switch 2, áudio). O que toca nosso gargalo:
 | `GpuSplit::WaitForWriters` | Espera parcial do split: só até o último compute/cópia enviado, para ler command lists escritas pela GPU | Não se aplica aos acquires (a leitura do semáforo usa o rasterizador, que precisa da thread de trás parada) |
 | Upscale temporal (`AccelerateTemporalUpscale`) | Substituto do DLSS do Switch 2 via Fermi2D | Fora do escopo; pode importar quando a GPU real virar o limite perto de 30 FPS |
 
+### 3.17 PokeDinner, com a história (servidor liberado)
+
+Com o `git.eden-emu.dev` liberado, a história desde o espelho de 2 de novembro tem 499 commits. Além da 3.16:
+
+| Commit | O que faz | Situação aqui |
+| --- | --- | --- |
+| `226162edf` (snowstormxd, de selevet-eglantine) | Títulos nativos submetem à GPU a cada 128 draws em vez de 4096 | Portado atrás de `EDEN_FLUSH_DRAWS=N` (padrão 4096): deve encurtar o `Finish` por frame, que espera tudo que ainda não foi submetido |
+| `202c6b035` | Reaproveita a alocação de um uniform buffer pequeno com os mesmos bytes no mesmo command buffer | Não portado: troca uma cópia de até ~4 KB por uma comparação de custo parecido |
+| `46b2577bf` | Retornos antecipados em laços de buffers com máscara zero | Não portado: ganho desprezível |
+| `92d49d8a0`, `d125cfb41` (Duck912) | Substituto temporal do DLSS do FE (jitter + vetores de movimento, histórico reprojetado) | Qualidade de imagem e GPU, não a thread de trás; o nosso fork não tem. Candidato à parte |
+| `18b0671e1`, `808feaf3b` (Duck912) | Correções de renderização do FE no recompilador do PokeDinner | O nosso fork já renderiza o FE por outro caminho |
+| `690f80e15`, `0f14696044` | Pacing do vi2 deles (frame atual/anterior) | Ver 3.16: não se transporta |
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
