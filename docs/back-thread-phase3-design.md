@@ -5,11 +5,13 @@ das rodadas 1-14 de `docs/back-thread-split-plan.md` (seções 3.7-3.22), na pra
 
 ## 1. Onde estamos e o que falta
 
-- Pior ponto da praça (vista aberta): **25 FPS, 41,7 ms por frame** (era 16 FPS na 1.10). A tela emulada só aceita
-  33,3 ms (30 FPS) ou 50 ms (20 FPS) por frame; frames de 41,7 ms de média são uma mistura dos dois.
+- **Pior ponto da praça (o escolhido para medir): 20-21 FPS** há várias rodadas. A thread de trás trabalha ali
+  ~43-45 ms por frame (~3.700 draws a ~90% ocupada). Outros trechos melhoraram mais (um foi de 22 para 30, a vista
+  aberta comparada com a 1.10 de 16 para 25), mas o pior ponto ainda não cruza o degrau seguinte.
+- A tela emulada só aceita 33,3 ms (30 FPS) ou 50 ms (20 FPS) por frame; médias entre os dois saem como mistura.
 - A thread de trás da GPU (`GpuSplit::BackLoop`) é o limite. Para 30 FPS estáveis no pior ponto, o trabalho dela
-  por frame precisa cair **~20-25%** (e a GPU real, hoje ~67% a 20 FPS, vai a ~85-100% a 30 FPS na resolução atual:
-  ver 6).
+  por frame precisa cair **~25-27%** (de ~44 para menos de 33 ms). A GPU real, hoje ~67% a 20 FPS, iria a ~100% a 30
+  FPS na resolução atual: ver 6.
 - Distribuição medida (pior ponto, % do tempo de parede, ~90% ocupada; rodadas 12-14):
 
 | Bloco | % | Origem |
@@ -21,7 +23,7 @@ das rodadas 1-14 de `docs/back-thread-split-plan.md` (seções 3.7-3.22), na pra
 | Ociosa | ~7-10 | pacing da tela e esperas pelo jogo |
 
 As micro-otimizações renderam ~1-8% cada e estão perto do fim: o que sobra está espalhado em pedaços de 2-8%. Os
-~20-25% que faltam só vêm de tirar um bloco inteiro da thread de trás. Dois caminhos: (B) mover o rasterizador para
+~25-27% que faltam só vêm de tirar um bloco inteiro da thread de trás. Dois caminhos: (B) mover o rasterizador para
 outra thread, (C) parar de montar descritores de banco na CPU. Um terceiro, menor (C0), aparece no meio.
 
 ## 2. Opção B: segundo split (engine | rasterizador)
@@ -87,7 +89,8 @@ outros (~4%). Com B:
   inline do lado do cache (~5%) ≈ **75-79%** do tempo de hoje.
 
 Teto: ~1/0,77 ≈ **×1,27-1,33**, antes das bolhas dos ~780 `Drain`/s em pipeline mais fundo (estimadas em 2-5%).
-Resultado provável: **×1,2-1,3**. No pior ponto da praça: 41,7 → ~32-35 ms, o que fica **no limite** dos 30 FPS.
+Resultado provável: **×1,2-1,3**. No pior ponto da praça: ~44 → ~34-37 ms de trabalho, **ainda acima dos 33 ms**:
+sozinho, B não leva o pior ponto a 30 FPS estáveis (passaria a alternar 20/30 com mais frames em 30).
 
 ### 2.5 Riscos e custo
 
@@ -139,7 +142,7 @@ Fica: preparar as imagens do banco quando a geração muda (já amortizado, 99% 
 Se os draws com banco forem a maior parte de `handles` (~10%), `push images` (~7,5%), `resolve` (~4%) e da
 comparação/cópia de payload (~1,5%): **~18-23% da thread de trás**, mais o `Finish` por frame (~1-2%). **Portão G1:
 medir essa fração** (os blocos hoje não separam draws com e sem banco). Resultado provável: **×1,2-1,3**, sem pipeline
-mais fundo nem bolhas novas. O lock dos caches também fica menos tempo seguro (menos disputa com as threads do
+mais fundo nem bolhas novas. No pior ponto: ~44 → ~34-37 ms, **também acima dos 33 ms** sozinho. O lock dos caches também fica menos tempo seguro (menos disputa com as threads do
 jogo).
 
 Custo do lado da GPU: indexação não uniforme custa algo nos shaders desses draws; na NVIDIA costuma ser pequeno,
@@ -182,7 +185,7 @@ fica só com buffers e texturas comuns.
 | | B (segundo split) | C (heap bindless) | C0 (set por banco) |
 | --- | --- | --- | --- |
 | Ganho provável | ×1,2-1,3 | ×1,2-1,3 | ×1,08-1,12 |
-| Chega a 30 no pior ponto? | no limite | no limite, sem bolhas novas | não |
+| Chega a 30 no pior ponto? | sozinho, não (~34-37 ms) | sozinho, não (~34-37 ms) | não |
 | Onde mexe | engine + rasterizador inteiros | recompilador + cache de texturas (só bancos) | layout de pipeline + descritores de banco |
 | Risco | alto, global (ordem, deadlock) | alto, local (shader, heap, recursos do dispositivo) | moderado |
 | Esforço | semanas | semanas | dias |
@@ -208,6 +211,11 @@ fica só com buffers e texturas comuns.
 | G4 | Ocupação da GPU real no pior ponto (perfil de GPU ou `EDEN_GPU_PROFILE`) | Se a GPU já passa de ~80%: qualquer opção precisa de resolução menor para os 30 |
 
 ## 8. Recomendação (a criticar)
+
+Nenhuma das opções, sozinha, leva o pior ponto (20-21 FPS, ~44 ms de trabalho por frame) a 30 estáveis: cada uma dá
+~34-37 ms. Os 30 ali exigem **C e B juntos** (multiplicam: ~44 / (1,25 × 1,25) ≈ 28 ms), ou uma delas mais as
+sobras menores, e a GPU real acompanhando (G4). Fora do pior ponto, qualquer uma já põe mais trechos em 30.
+
 
 1. Rodar o build de medição dos portões G1-G4.
 2. Se G1 der o esperado (≥ 15%): fazer **C0** primeiro (dias, risco moderado, ~8-11%, e é a base do heap), medir, e
