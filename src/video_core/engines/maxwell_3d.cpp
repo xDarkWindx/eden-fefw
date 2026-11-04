@@ -18,6 +18,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/gpu_split.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -796,7 +797,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
     if (!front) [[unlikely]] {
         // Copy the back's state and take the macros over while it is idle (state writes it
         // still holds in its method sink first).
-        split.Drain();
+        split.Drain(VideoCommon::BackStats::DrainFront3D);
         ConsumeSink(system);
         front = std::make_unique<FrontState>();
         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
@@ -1031,7 +1032,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     // their place in the stream: the back executes everything before them first, and the caches
     // that may hold newer words are its state (idle from here until the front sends more).
     const TuringMacroInterpreter::MemoryRead memory_read = [&](u64 address, std::span<u32> words) {
-        split.Drain();
+        split.Drain(VideoCommon::BackStats::DrainMacroMemory);
         return ReadMacroMemory(address, words);
     };
     auto& dram = native_interpreter.dram;

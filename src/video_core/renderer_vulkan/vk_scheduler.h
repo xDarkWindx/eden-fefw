@@ -139,7 +139,9 @@ public:
                 Flush();
             }
             const VideoCommon::BackStats::WaitTimer wait_timer{
-                VideoCommon::BackStats::shared.wait_tick, StatsQueued(), retained};
+                VideoCommon::BackStats::is_draw_thread ? VideoCommon::BackStats::shared.wait_tick
+                                                       : VideoCommon::BackStats::shared.wait_tick_other,
+                StatsQueued(), retained};
             master_semaphore->Wait(tick);
         }
         if (Settings::values.use_speed_limit.GetValue() && target_fps > 0.0) {

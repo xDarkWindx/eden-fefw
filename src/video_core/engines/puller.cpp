@@ -19,6 +19,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -53,8 +54,8 @@ void OnBack(const Func& func) {
     }
 }
 
-void DrainBack() {
-    VideoCommon::GpuSplit::Get().Drain();
+void DrainBack(VideoCommon::BackStats::DrainSite site) {
+    VideoCommon::GpuSplit::Get().Drain(site);
 }
 
 } // Anonymous namespace
@@ -67,7 +68,7 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
     }
 
     // Binding changes engine state the back thread uses (macro modes, tiling).
-    DrainBack();
+    DrainBack(VideoCommon::BackStats::DrainBind);
     if (dma_pusher.channel_state.native_abi) dma_pusher.memory_manager.EnableNativeTiling();
     const auto engine_id = static_cast<EngineID>(engine);
     bound_engines[method_call.subchannel] = engine_id;
@@ -141,7 +142,7 @@ bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadNativeSemaphoreWord asks are its state).
-    DrainBack();
+    DrainBack(VideoCommon::BackStats::DrainNativeAcquire);
     return native_acquire && !dma_pusher.memory_manager.IsShuttingDown() &&
            native_acquire->Matches(ReadNativeSemaphoreWord(dma_pusher, native_acquire->address));
 }
@@ -170,7 +171,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     } else {
         // Acquires read what the back may still have to write: let it finish first. From here
         // on the back is idle, and the front may use the rasterizer until it sends more.
-        DrainBack();
+        DrainBack(VideoCommon::BackStats::DrainSemaphoreAcquire);
         do {
             u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             if (dma_pusher.channel_state.native_abi) {
@@ -235,7 +236,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
-    DrainBack();
+    DrainBack(VideoCommon::BackStats::DrainAcquire);
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
     while (word != value) {

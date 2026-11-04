@@ -51,10 +51,13 @@ extern const int mode;
 
 /// Consecutive spans of RasterizerVulkan::PrepareDraw, each attributed by Mark to one bucket.
 enum Draw : u32 {
-    FlushWork,     ///< FlushWork, FlushCaching
+    FlushWork,     ///< FlushWork (dispatching to the worker, flushing every 4096 draws)
+    FlushCaching,  ///< gpu_memory->FlushCaching (accumulated invalidations)
     Pipeline,      ///< pipeline_cache.CurrentGraphicsPipeline
     LockWait,      ///< Acquiring buffer_cache.mutex + texture_cache.mutex
-    Handles,       ///< ConfigureImpl: VPRS, storage buffers, texture handles, compact tables
+    Setup,         ///< ConfigureImpl: VPRS, SynchronizeDescriptors, uniform buffer state
+    StorageBind,   ///< ConfigureImpl: binding storage buffers
+    Handles,       ///< ConfigureImpl: texture handles, compact tables
     Resolve,       ///< ConfigureImpl: view and sampler resolution, banks
     BindStage,     ///< ConfigureImpl: texture and image buffers
     Buffers,       ///< UpdateGraphicsBuffers, BindHostGeometryBuffers, descriptor queue Acquire
@@ -70,7 +73,8 @@ enum Draw : u32 {
     Queries,       ///< Query segment, transform feedback, counters
     DrawFunc,      ///< Recording the draw
     FlushStorage,  ///< FlushStorageWrites
-    Tail,          ///< Unlock, early exits, failed configures
+    Tail,          ///< Early exits, failed configures, up to releasing the locks
+    Unlock,        ///< Releasing the cache locks (wakes a waiting guest thread, if any)
     TickWork,      ///< gpu.TickWork at the end
     DrawCount,
 };
@@ -88,6 +92,8 @@ struct DrawThread {
     // Descriptors of graphics draws.
     std::array<u64, 4> paths{}; ///< Descriptor buffer, push descriptor, descriptor set, none
     u64 buffer_reused{};
+    u64 set_reused{};           ///< Descriptor set draws that kept the last set (same payload)
+    u64 set_rebound{};          ///< ... that wrote a new set because the pipeline was bound again
     u64 buffer_allocated{};
     u64 buffer_entries{};       ///< Entries written into new allocations (one vkGetDescriptorEXT each)
     u64 copied_bytes{};         ///< Cached compact-table entries copied (AddEntries)
@@ -142,7 +148,9 @@ struct Shared {
     std::atomic<u64> dispatch_queue_max{};
     WaitCounters finish;
     WaitCounters wait_worker;
-    WaitCounters wait_tick;
+    WaitCounters wait_tick;       ///< On the draw thread
+    WaitCounters wait_tick_other; ///< On other threads (fence release, present, ...)
+    std::array<LockCounters, 9> drain_sites{}; ///< GpuSplit::Drain by caller (DrainSite)
     // Cache locks taken outside draws: by other threads, and by the draw thread itself.
     LockCounters cpu_write;
     LockCounters cached_writes;
@@ -154,6 +162,19 @@ struct Shared {
     std::atomic<u64> space_ticks{};
 };
 extern Shared shared;
+
+/// Callers of GpuSplit::Drain (the front waits for the back and the back then runs dry).
+enum DrainSite : u32 {
+    DrainOther,
+    DrainBind,             ///< Puller::ProcessBindMethod
+    DrainNativeAcquire,    ///< Puller::CanResumeNativeAcquire
+    DrainSemaphoreAcquire, ///< Puller semaphore acquire (ProcessSemaphoreTriggerMethod)
+    DrainAcquire,          ///< Puller::ProcessSemaphoreAcquire
+    DrainMacroMemory,      ///< A front macro reads memory (FIFO DMA)
+    DrainFront3D,          ///< Maxwell3D takes its macros to the front
+    DrainFrontCompute,     ///< KeplerCompute takes its macros to the front
+    DrainSignalSync,       ///< DmaPusher: a command list asks for a sync
+};
 
 /// Whether this thread prepares draws (set by PrepareDraw).
 inline thread_local bool is_draw_thread{};
@@ -246,7 +267,9 @@ public:
     DrawLockHold() : start{Enabled() ? Stamp() : 0} {
         in_draw_lock = true;
     }
+    /// Ends the Tail span here, so that the next span (Unlock) is the release itself.
     ~DrawLockHold() {
+        Mark(Tail);
         in_draw_lock = false;
         if (start != 0) {
             draw_thread.lock_hold += Stamp() - start;

@@ -470,6 +470,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return word;
     }};
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        VideoCommon::BackStats::Mark(VideoCommon::BackStats::Handles);
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
         if constexpr (Spec::has_storage_buffers) {
@@ -481,6 +482,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 ++ssbo_index;
             }
         }
+        VideoCommon::BackStats::Mark(VideoCommon::BackStats::StorageBind);
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             ASSERT(cbufs[desc.cbuf_index].enabled);
@@ -773,6 +775,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
         return true;
     }};
+    VideoCommon::BackStats::Mark(VideoCommon::BackStats::Setup);
     if constexpr (Spec::enabled_stages[0]) {
         config_stage(0);
     }
@@ -1090,6 +1093,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     bool update_descriptors = true;
     if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        // The comparison runs only when the pipeline stays bound and the sizes match.
+        const bool compares = !bind_pipeline && last_descriptor_payload.size() == num_descriptor_entries;
         update_descriptors =
             bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
             std::memcmp(last_descriptor_payload.data(), entries,
@@ -1098,9 +1103,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
         if (BackStats::Enabled()) {
-            draw_stats.compared_bytes += payload_bytes;
+            if (compares) {
+                draw_stats.compared_bytes += payload_bytes;
+            }
             if (update_descriptors) {
                 draw_stats.assigned_bytes += payload_bytes;
+            } else {
+                ++draw_stats.set_reused;
+            }
+            if (bind_pipeline) {
+                ++draw_stats.set_rebound;
             }
         }
         BackStats::Mark(BackStats::DescCompare);

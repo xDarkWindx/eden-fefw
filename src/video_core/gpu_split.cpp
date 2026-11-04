@@ -203,7 +203,7 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain() {
+void GpuSplit::Drain(u32 site) {
     if (!active) {
         return;
     }
@@ -212,12 +212,17 @@ void GpuSplit::Drain() {
         return;
     }
     Publish();
-    {
-        const VideoCommon::BackStats::ScopedSharedTime drain_time{VideoCommon::BackStats::shared.drain_ticks};
-        WaitForBack(16384, [&] { return consumed_cache == write_position; });
-    }
-    if (VideoCommon::BackStats::Enabled()) {
-        VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.drains, 1);
+    namespace BackStats = VideoCommon::BackStats;
+    const u64 drain_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
+    WaitForBack(16384, [&] { return consumed_cache == write_position; });
+    if (drain_start != 0) {
+        // Only drains that waited: those leave the back with nothing to do until the front sends more.
+        const u64 ticks = BackStats::Stamp() - drain_start;
+        BackStats::Add(BackStats::shared.drains, 1);
+        BackStats::Add(BackStats::shared.drain_ticks, ticks);
+        auto& counters = BackStats::shared.drain_sites[site < BackStats::shared.drain_sites.size() ? site : 0];
+        BackStats::Add(counters.count, 1);
+        BackStats::Add(counters.ticks, ticks);
     }
     publish_every = 8;
 }

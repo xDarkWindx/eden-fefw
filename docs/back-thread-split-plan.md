@@ -194,6 +194,32 @@ ocupado da thread de trás):
 - Limitações: os carimbos custam ~20 por draw (~1-2%); `Wait(tick)` também conta as esperas de dentro do
   `Finish`; "in draw lock" só vale para o lock de `PrepareDraw`, não para o de `Clear`/`DispatchCompute`/DMA.
 
+### 3.7 Rodada 1 (praça, 2026-11-04, `0ce86c7`)
+
+Duas janelas de 4 s, `=1` e `=2` (concordam dentro de ~1 ponto): 68,8-71 mil draws/s (a medição custa pouco:
+~72 mil sem ela).
+
+| Medido | Valor | Leitura |
+| --- | --- | --- |
+| Thread de trás ocupada / ociosa | 86% / 13-14% | **Não está a 100%.** Ela fica sem trabalho 13% do tempo. |
+| Frente: `Drain` que esperou | ~810-840/s (~27 por frame), 70% do tempo da frente | Cada `Drain` esvazia o ring; quando a frente volta, a de trás está ociosa até chegar trabalho. Provável origem da ociosidade: até ×1,15 se as bolhas sumissem. Rodada 2 diz quem drena. |
+| Caminho de descritores | buffer **0/s**, push 62-64 mil/s, set 6,9-7,1 mil/s (≈ os draws com tabela) | **1a e 1b, como desenhados, não se aplicam nesta máquina:** nenhum draw usa descriptor buffer. Os draws com banco vão por descriptor set (escrita já no worker). |
+| `desc compare` (+ `assign`, caminho set) | 1,4-1,5% | Pouco. O `memcpy` dos acertos (`AddEntries`) está dentro de `push images` (8,0-8,4%). |
+| Worker do Vulkan | 24% ocupado, fila média 0,4-0,5 (máx. 10-16), comando mais velho ≤ 1 frame, gravação → submit ~170 µs | Folga. |
+| `Finish` | ~21/s (1 por frame), 37-40 ms/s (~4%), **todo dentro do lock do draw** | O `DownloadMemory` da tabela de handles. As threads do jogo esperam junto. |
+| `Wait(tick)` | 185-191/s, 440-450 ms/s | Grande, mas sem atribuição de thread (provavelmente as threads de fence). Rodada 2 separa. |
+| Espera da thread de trás pelo lock | `lock wait` 4,1-4,3% (+ `tail` 3,1-3,7%, que inclui soltar o lock) | ≥ 3%: o item L passa no critério. |
+| Threads do jogo nos locks | `OnCPUWrite` ~140 mil/s, **~1,2 s/s de espera somada** | Disputa forte: o draw segura os locks 43-45% do tempo. |
+| Maiores trechos | handles 13,8-14,9, flush work 8,4, push images 8,0-8,4, stage buffers 6,9-7,2, buffers 5,9-6,2, resolve 3,8-4,4 | `flush work` (8,4%) é inesperado; a rodada 2 separa `FlushWork` de `FlushCaching`. |
+| Fora dos draws | other busy 19-20%, inline upload 3,5-3,8%, compute 3,0-3,7% | Métodos da engine. |
+
+Pela tabela 3.5: 1a/1b ficam suspensos (sem descriptor buffer); o item L passa (≥ 3%); B passa (handles +
+pipeline + estados dinâmicos + fora de draws ≈ 36% ≥ 35%). Candidato novo, fora do plano original: **reduzir as
+bolhas dos `Drain`** (até 13% de ociosidade). A rodada 2 (`EDEN_BACK_THREAD_STATS`, mesmo interruptor) acrescenta:
+`Drain` por chamador, `Wait(tick)` na thread do draw contra as outras, `FlushWork` separado de `FlushCaching`,
+`setup` e `storage bind` separados de `handles`, `unlock` separado de `tail`, e descriptor sets mantidos contra
+reescritos por bind de pipeline.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

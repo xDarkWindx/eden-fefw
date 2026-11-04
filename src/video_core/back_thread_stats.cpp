@@ -29,11 +29,16 @@ std::chrono::steady_clock::time_point window_time{};
 u64 window_stamp{};
 
 constexpr std::array<const char*, DrawCount> DRAW_NAMES{
-    "flush work",    "pipeline",        "lock wait",     "handles",     "resolve",
-    "bind stage",    "buffers",         "stage buffers", "push images", "post configure",
-    "desc compare",  "desc allocate",   "desc write",    "desc assign", "desc record",
-    "dynamic states", "queries",        "draw func",     "flush storage", "tail",
-    "tick work",
+    "flush work",     "flush caching", "pipeline",      "lock wait",      "setup",
+    "storage bind",   "handles",       "resolve",       "bind stage",     "buffers",
+    "stage buffers",  "push images",   "post configure", "desc compare",  "desc allocate",
+    "desc write",     "desc assign",   "desc record",   "dynamic states", "queries",
+    "draw func",      "flush storage", "tail",          "unlock",         "tick work",
+};
+
+constexpr std::array<const char*, 9> DRAIN_NAMES{
+    "other",   "bind",     "native acquire", "semaphore acquire", "acquire",
+    "macro memory", "front 3D", "front compute", "signal sync",
 };
 
 } // Anonymous namespace
@@ -107,11 +112,11 @@ void Report() {
     const u64 paths = d.paths[PathBuffer] + d.paths[PathPush] + d.paths[PathSet] + d.paths[PathNone];
     LOG_INFO(Render_Vulkan,
              "Back thread descriptors: buffer {:.0f}/s, push {:.0f}/s, set {:.0f}/s, none {:.0f}/s "
-             "(of {:.0f}/s); buffer allocations reused {:.1f}%, {:.0f} new/s with {:.0f} entries "
-             "each; per draw {:.1f} KB copied, {:.1f} KB compared, {:.1f} KB assigned; ring "
+             "(of {:.0f}/s); sets kept {:.0f}/s, rewritten for a pipeline bind {:.0f}/s; buffer "
+             "allocations reused {:.1f}%, {:.0f} new/s with {:.0f} entries each; per draw {:.1f} KB copied, {:.1f} KB compared, {:.1f} KB assigned; ring "
              "exhausted {:.1f}/s, ring frame wait {:.0f} us/s",
              per_s(d.paths[PathBuffer]), per_s(d.paths[PathPush]), per_s(d.paths[PathSet]),
-             per_s(d.paths[PathNone]), per_s(paths),
+             per_s(d.paths[PathNone]), per_s(paths), per_s(d.set_reused), per_s(d.set_rebound),
              d.buffer_reused + d.buffer_allocated != 0
                  ? static_cast<double>(d.buffer_reused) * 100.0 /
                        static_cast<double>(d.buffer_reused + d.buffer_allocated)
@@ -139,7 +144,9 @@ void Report() {
     const std::string finish = wait_text("Finish", shared.finish);
     const std::string wait_worker = wait_text("WaitWorker", shared.wait_worker);
     const std::string wait_tick = wait_text("Wait(tick, also inside Finish)", shared.wait_tick);
-    LOG_INFO(Render_Vulkan, "Back thread waits: {}; {}; {}", finish, wait_worker, wait_tick);
+    const std::string wait_tick_other = wait_text("Wait(tick) on other threads", shared.wait_tick_other);
+    LOG_INFO(Render_Vulkan, "Back thread waits: {}; {}; {}; {}", finish, wait_worker, wait_tick,
+             wait_tick_other);
 
     const u64 worker_busy = Take(shared.worker_busy);
     const u64 worker_idle = Take(shared.worker_idle);
@@ -171,6 +178,17 @@ void Report() {
     const std::string cached_writes = lock_text("cached writes", shared.cached_writes);
     const std::string other_locks = lock_text("other", shared.other_locks);
     const std::string draw_thread_locks = lock_text("draw thread outside draws", shared.draw_thread_locks);
+    std::string drain_sites;
+    for (size_t site = 0; site < DRAIN_NAMES.size(); ++site) {
+        const u64 count = Take(shared.drain_sites[site].count);
+        const u64 ticks = Take(shared.drain_sites[site].ticks);
+        if (count != 0) {
+            drain_sites += fmt::format("{}{} {:.0f}/s {:.0f} us/s", drain_sites.empty() ? "" : ", ",
+                                       DRAIN_NAMES[site], per_s(count), us_per_s(ticks));
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Split drains by caller (count/s, front waiting): {}",
+             drain_sites.empty() ? std::string{"none"} : drain_sites);
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);

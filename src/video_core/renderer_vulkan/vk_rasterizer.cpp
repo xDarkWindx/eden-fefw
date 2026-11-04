@@ -259,7 +259,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         BackStats::draw_thread.last = prepare_start;
     }
     SCOPE_EXIT {
-        BackStats::Mark(BackStats::Tail);
+        BackStats::Mark(BackStats::Unlock);
         gpu.TickWork();
         BackStats::Mark(BackStats::TickWork);
         if (prepare_start != 0) {
@@ -280,8 +280,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         }
     };
     FlushWork();
-    gpu_memory->FlushCaching();
     BackStats::Mark(BackStats::FlushWork);
+    gpu_memory->FlushCaching();
+    BackStats::Mark(BackStats::FlushCaching);
 
     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
     BackStats::Mark(BackStats::Pipeline);

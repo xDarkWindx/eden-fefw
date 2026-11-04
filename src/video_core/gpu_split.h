@@ -110,8 +110,9 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
-    /// Waits until the back executed everything sent so far.
-    void Drain();
+    /// Waits until the back executed everything sent so far. `site`: the caller, for statistics
+    /// (VideoCommon::BackStats::DrainSite).
+    void Drain(u32 site = 0);
 
 private:
     enum class Kind : u64 {
