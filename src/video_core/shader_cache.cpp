@@ -34,6 +34,20 @@ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
     RemovePendingShaders();
 }
 
+void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    // From PokeDinner: FlushCaching applies the engine's constant buffer writes to every cache
+    // before each draw; one lock and one removal pass for all of them instead of one per range.
+    if (sequences.empty()) {
+        return;
+    }
+    std::scoped_lock lock{invalidation_mutex};
+    for (const auto& [addr, size] : sequences) {
+        DropRejections(addr, size);
+        InvalidatePagesInRegion(addr, size);
+    }
+    RemovePendingShaders();
+}
+
 void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
     std::scoped_lock lock{invalidation_mutex};
     DropRejections(addr, size);

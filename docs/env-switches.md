@@ -9,6 +9,7 @@ Desde 2026-11-03 o fork não segue mais upstream, e o código de diagnóstico da
 | `EDEN_TEXTURE_TABLE_STATS=1` | Loga a cada 4 s as estatísticas das tabelas de texturas e dos bancos. |
 | `EDEN_BACK_THREAD_STATS=1/2` | Loga a cada 4 s onde a thread que prepara os draws gasta o tempo (trechos do `PrepareDraw`, descritores, esperas no scheduler, worker do Vulkan, locks dos caches, frente do split). `2` serializa os carimbos (`lfence`), para conferir um número decisivo. Custa ~1-2%: medir draws/s com ele desligado. Ver `docs/back-thread-split-plan.md`, fase 0. |
 | `EDEN_CPU_WRITE_PAGES=N` | Experimento (padrão 1): as últimas N páginas (1-64) por núcleo em que uma escrita da CPU do jogo foi segurada são seguradas de novo sem consultar o buffer cache (hoje só a última). Menos idas ao lock dos caches; as escritas seguradas são aplicadas antes da próxima submissão, como já acontece. |
+| `EDEN_INLINE_DEFER=1` | Experimento (desligado por padrão; vem do `EDEN_NX2_INLINE_DEFER` do PokeDinner, lá ligado): um upload inline que não precisa ir direto para o buffer (região sem dados escritos pela GPU) deixa a invalidação dos caches de buffer, textura e shader para o próximo `FlushCaching`, junto com as escritas de constant buffer. |
 | `EDEN_GPU_SPLIT=0/1/2` | GPU emulada em uma thread (0), métodos na thread de trás (1) ou também macros na da frente (2, padrão). |
 | `EDEN_MME_JIT=0` | Macros nativas no interpretador em vez do código compilado. |
 | `EDEN_NATIVE_FRONTEND=lower/ampere/auto/compare` | Frontend de shaders nativos (padrão `lower`). |

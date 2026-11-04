@@ -68,6 +68,9 @@ public:
     /// @param size Number of bytes of the invalidation
     void InvalidateRegion(VAddr addr, size_t size);
 
+    /// InvalidateRegion for each range, under one lock and one removal pass.
+    void InvalidateRegions(std::span<const std::pair<DAddr, std::size_t>> sequences);
+
     /// @brief Unmarks a memory region as cached and marks it for removal
     /// @param addr Start address of the CPU write operation
     /// @param size Number of bytes of the CPU write operation

@@ -857,12 +857,10 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
             buffer_cache.WriteMemory(addr, size);
         }
     }
-    {
-        for (const auto& [addr, size] : sequences) {
-            query_cache.InvalidateRegion(addr, size);
-            pipeline_cache.InvalidateRegion(addr, size);
-        }
+    for (const auto& [addr, size] : sequences) {
+        query_cache.InvalidateRegion(addr, size);
     }
+    pipeline_cache.InvalidateRegions(sequences);
 }
 
 void RasterizerVulkan::OnCachedWrites(std::span<const std::pair<DAddr, u64>> writes) {
@@ -1135,18 +1133,34 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         return;
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    // EDEN_INLINE_DEFER=1 (from PokeDinner's EDEN_NX2_INLINE_DEFER): a write the buffer cache did
+    // not upload in place (no GPU-written data there) leaves the buffer, texture and shader caches'
+    // invalidation to the next FlushCaching, merged with the engine's other writes, instead of
+    // taking each cache's lock for every small inline write between draws. Guest memory has the
+    // words already; FlushCaching runs before draws, clears, dispatches, DMA and 2D copies.
+    static const bool defer = [] {
+        const char* const value = std::getenv("EDEN_INLINE_DEFER");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool uploaded;
     {
         std::unique_lock<std::recursive_mutex> lock{buffer_cache.mutex};
-        if (!buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
+        uploaded = buffer_cache.InlineMemory(*cpu_addr, copy_size, memory);
+        if (!uploaded && !defer) {
             buffer_cache.WriteMemory(*cpu_addr, copy_size);
         }
+    }
+    // Pending query results must not land over the new words later: drop them now.
+    query_cache.InvalidateRegion(*cpu_addr, copy_size);
+    if (!uploaded && defer) {
+        gpu_memory->AccumulateInvalidation(address, copy_size);
+        return;
     }
     {
         std::scoped_lock lock_texture{texture_cache.mutex};
         texture_cache.WriteMemory(*cpu_addr, copy_size);
     }
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
-    query_cache.InvalidateRegion(*cpu_addr, copy_size);
 }
 
 std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(

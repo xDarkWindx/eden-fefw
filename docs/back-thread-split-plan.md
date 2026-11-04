@@ -395,6 +395,22 @@ na hora contra os adiados para uma fence; e as leituras de semáforo que buscam 
 (`FlushRegion`). A medição por entrada custa um carimbo por entrada do ring (~2-3% a mais com a estatística
 ligada).
 
+### 3.16 Revisão do PokeDinner (2026-11-04)
+
+`git.eden-emu.dev` é bloqueado pela rede da sessão; lido o espelho `github.com/969981/PokeDinner-a-Eglantine-Fork`
+(snapshot do master do Forgejo `216b5034c60a`, 3 de novembro), comparado com o espelho `pokedinner` deste
+repositório (2 de novembro): ~13,5 mil linhas em 211 arquivos (boa parte de mesh shaders, upscale temporal,
+memória esparsa do Switch 2, áudio). O que toca nosso gargalo:
+
+| Mudança | O que faz | Situação aqui |
+| --- | --- | --- |
+| Upload inline adiado (`EDEN_NX2_INLINE_DEFER`, ligado lá) | Upload inline sem dados da GPU na região só escreve a memória e acumula a invalidação para o próximo `FlushCaching` ("milhares de escritas inline entre draws, ~10% da thread da GPU" no título deles) | Portado atrás de `EDEN_INLINE_DEFER=1` (desligado). Mesmo contrato das escritas de constant buffer: todos os consumidores chamam `FlushCaching` antes (draw, clear, compute, condicional, DMA, 2D, iguais nas duas bases); o acumulado é por canal |
+| `ShaderCache::InvalidateRegions` | `InnerInvalidation` invalida o shader cache com um lock e uma passada de remoção para todas as regiões | Portado (mesma semântica, com o `DropRejections` que a nossa versão tem) |
+| `RemovePendingShaders` com busca binária acima de 16 | Menos custo quando muitos shaders são removidos | Não portado (raro em regime) |
+| `EDEN_NX2_FRAMES_AHEAD` (pacing) | Na apresentação do vi2 deles o jogo espera a fence do frame atual; com o modo ligado espera a do anterior (o jogo prepara N+1 enquanto a GPU emulada faz N), voltando a esperar o atual se a GPU estiver atrás | Não se transporta: nossa apresentação é o `BufferQueue` do nvnflinger (até 2 pendentes, sem espera direta). A pista vale: descobrir **o que o jogo espera** nos ~5-6 ms por frame em que a GPU emulada fica parada |
+| `GpuSplit::WaitForWriters` | Espera parcial do split: só até o último compute/cópia enviado, para ler command lists escritas pela GPU | Não se aplica aos acquires (a leitura do semáforo usa o rasterizador, que precisa da thread de trás parada) |
+| Upscale temporal (`AccelerateTemporalUpscale`) | Substituto do DLSS do Switch 2 via Fermi2D | Fora do escopo; pode importar quando a GPU real virar o limite perto de 30 FPS |
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é
