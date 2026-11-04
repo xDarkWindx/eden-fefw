@@ -484,6 +484,19 @@ removeu o retorno antecipado geral de `ProcessDirtyRegisters` de propósito (`af
 Switch 1). Rodada 13: tamanho dos lotes de invalidação (regiões, regiões depois de juntar as contíguas, páginas
 distintas) nas escritas seguradas (~7,5%) e no `flush caching` (~8%).
 
+### 3.21 Rodada 13: lotes de invalidação
+
+- Escritas seguradas do jogo (~7,5% da thread de trás no início de cada lista): 332 lotes/s, **401 regiões por
+  lote, 37,8 depois de juntar as contíguas**, 14 páginas distintas. Cada região passava sozinha pelos caches de
+  textura, buffer e shader.
+- `flush caching`: 59 mil lotes/s, 3,7 regiões por lote, 2,3 depois de juntar: o custo é por lote (locks), juntar
+  quase não muda.
+- Feito (padrão, `EDEN_HELD_WRITE_MERGE=0` desliga): `GPU::InvalidateGPUCache` ordena o lote e junta as regiões
+  contíguas ou sobrepostas **dentro da mesma página de 4 KB** (união exata, os mesmos bytes; dentro da página,
+  uma região nunca atravessa dois buffers do buffer cache, criados em fronteiras de página). Teste fora da árvore:
+  20 mil lotes aleatórios (até 600 regiões em blocos de 64 B), mesma cobertura e nenhuma região atravessando
+  página, com ASan/UBSan.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

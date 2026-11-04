@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
 #include <condition_variable>
 #include <list>
@@ -131,9 +132,34 @@ struct GPU::Impl {
             cached_writes.emplace_back(static_cast<DAddr>(address), static_cast<u64>(size));
         });
         system.GatherGPUDirtyMemory(callback_writes);
-        if (!cached_writes.empty()) {
-            renderer->ReadRasterizer()->OnCachedWrites(cached_writes);
+        if (cached_writes.empty()) {
+            return;
         }
+        // Touching and overlapping writes to one 4 KiB page become one range: in the city plaza
+        // Fortune's Weave's batches had ~400 ranges that joined to ~38, and each range went through
+        // the texture, buffer and shader caches on its own. Joining stays an exact union (the same
+        // bytes, copied from guest memory), and within a page, so a range never spans two buffer
+        // cache buffers (created on page boundaries). EDEN_HELD_WRITE_MERGE=0 turns it off.
+        static const bool merge = [] {
+            const char* const value = std::getenv("EDEN_HELD_WRITE_MERGE");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (merge && cached_writes.size() > 1) {
+            std::ranges::sort(cached_writes);
+            size_t out = 0;
+            for (size_t in = 1; in < cached_writes.size(); ++in) {
+                auto& last = cached_writes[out];
+                const auto& [address, size] = cached_writes[in];
+                const u64 last_end = last.first + last.second;
+                if ((address >> 12) == (last.first >> 12) && address <= last_end) {
+                    last.second = (std::max)(last_end, address + size) - last.first;
+                } else {
+                    cached_writes[++out] = cached_writes[in];
+                }
+            }
+            cached_writes.resize(out + 1);
+        }
+        renderer->ReadRasterizer()->OnCachedWrites(cached_writes);
     }
 
     /// Signal the ending of command list.
