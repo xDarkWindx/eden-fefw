@@ -1142,30 +1142,39 @@ private:
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result.raw);
     }
+    static constexpr u32 SdrPeakLuminanceNits = 400;
+    static constexpr u32 HdrPaperWhiteNits = 203;
+
     void GetHdrStatus(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
         const u64 name = u64{packet[2]} | (u64{packet[3]} << 32);
         Result result = Kernel::ResultInvalidCombination;
         u64 format{};
+        u32 peak_nits{};
         if (packet[0] == 0x78 && packet[1] == 2) {
             result = Result{ErrorModule::VI, 7};
             if (name == 0x00746c7561666564ULL && m_default_display && m_display_service) {
-                // The display backend exposes SDR output only.
+                // The display backend exposes SDR output only. The u16 after the format is the
+                // panel's peak luminance in nits; a connected display never reports 0, so answer a
+                // typical SDR panel's peak.
                 format = 1;
+                peak_nits = SdrPeakLuminanceNits;
                 result = ResultSuccess;
             }
         }
-        LOG_DEBUG(Service_AM, "VI2 HDR status name={:#x}, format={:#x}, result={:#x}", name,
-                  format, result.raw);
+        LOG_DEBUG(Service_AM, "VI2 HDR status name={:#x}, format={:#x}, peak={}, result={:#x}", name,
+                  format, peak_nits, result.raw);
         IPC::ResponseBuilder rb{ctx, 5};
         rb.Push(result.raw);
         rb.Push(format);
-        rb.Push<u32>(0);
+        rb.Push<u32>(peak_nits);
     }
 
     // Commands 105 (u16 reply) and 354 (u64 reply) share one request: the display name, looked up in the
     // vi2 server's display table (name of all zero bytes -> VI 4, unknown name -> VI 7). The reply is a
     // field of the display's driver record, which reads as 0 (105) and 1 (354) while no record exists.
+    // 105 is the HDR paper white in nits; a connected display has a record, so it answers the BT.2408
+    // reference white instead of 0.
     void ReplyDisplayState(HLERequestContext& ctx, u32 header, u32 reply_words, u64 value) {
         const auto* packet = ctx.CommandBuffer();
         const u64 name = u64{packet[2]} | (u64{packet[3]} << 32);
@@ -1186,7 +1195,7 @@ private:
     }
 
     void GetDisplayState105(HLERequestContext& ctx) {
-        ReplyDisplayState(ctx, 0x79, 3, 0);
+        ReplyDisplayState(ctx, 0x79, 3, HdrPaperWhiteNits);
     }
 
     // Command 107 (DragXDrive): request header 0x7b with the display name, reply header 0x7b with seven
