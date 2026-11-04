@@ -23,6 +23,7 @@ add_executable(tests
     core/builtin_font.cpp
     core/applet_id.cpp
     core/program_metadata.cpp
+    core/nup_container.cpp
     core/native_gpu_characteristics.cpp
     core/graphics_supervisor.cpp
     core/internal_network/network.cpp
@@ -39,6 +40,8 @@ create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+# core/nup_container.cpp hashes the containers it builds.
+target_link_libraries(tests PRIVATE OpenSSL::Crypto)
 
 add_test(NAME tests COMMAND tests)
 

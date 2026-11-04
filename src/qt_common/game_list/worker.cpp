@@ -212,6 +212,21 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
+    // A NUP carries its update inside the container, so the patch manager does not see it;
+    // show the version the container reports instead.
+    FileSys::NACP nacp{};
+    if (file_type == Loader::FileType::NUP &&
+        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+        const std::string version_string = nacp.GetVersionString();
+        if (!version_string.empty()) {
+            if (!patch_versions.isEmpty()) {
+                patch_versions += QLatin1Char('\n');
+            }
+            patch_versions += QStringLiteral("Update (%1)").arg(
+                QString::fromStdString(version_string));
+        }
+    }
+
     u64 play_time = play_time_manager.GetPlayTime(program_id);
     return QList<QStandardItem*>{
         new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
@@ -361,7 +376,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::string& dir_pa
 
             if (target == ScanTarget::PopulateGameList &&
                 (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
-                 file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ) &&
+                 file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
+                 file_type == Loader::FileType::NUP) &&
                 !Loader::IsBootableGameContainer(file, file_type)) {
                 return true;
             }
