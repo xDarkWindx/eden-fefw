@@ -45,6 +45,8 @@ void DmaPusher::DispatchCalls() {
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer([gpu = &system.GPU()] {
+            const VideoCommon::BackStats::ScopedSharedTime list_end{
+                VideoCommon::BackStats::shared.list_end};
             gpu->FlushCommandsBatched();
             gpu->OnCommandListEnd();
         });

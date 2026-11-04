@@ -17,6 +17,7 @@
 #include <thread>
 #include <queue>
 
+#include "video_core/back_thread_stats.h"
 #include "common/common_types.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -80,8 +81,14 @@ public:
     void SignalFenceCoalesced(std::function<void()>&& func) {
         const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if (delay_fence) {
+            if (BackStats::Enabled()) {
+                BackStats::Add(BackStats::shared.coalesced_delayed, 1);
+            }
             SignalFence(std::move(func));
             return;
+        }
+        if (BackStats::Enabled()) {
+            BackStats::Add(BackStats::shared.coalesced_now, 1);
         }
         func();
         coalesced_pending = true;
@@ -96,6 +103,9 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
+        if (BackStats::Enabled()) {
+            BackStats::Add(BackStats::shared.fences_signaled, 1);
+        }
         // This fence is created after every coalesced signal, so it covers them.
         coalesced_pending = false;
         coalesced_count = 0;

@@ -43,6 +43,15 @@ char SplitMode() {
     return mode;
 }
 
+/// Engine::ConsumeSink (the methods queued while not executable), timed with the stats on.
+void ConsumeSinkTimed(Tegra::Engines::EngineInterface* engine, Core::System& system) {
+    if (engine->method_sink.empty()) {
+        return;
+    }
+    const VideoCommon::BackStats::ScopedTime sink_time{VideoCommon::BackStats::draw_thread.sink_ticks};
+    engine->ConsumeSink(system);
+}
+
 } // Anonymous namespace
 
 GpuSplit GpuSplit::instance;
@@ -303,12 +312,12 @@ size_t GpuSplit::Execute(const u64* entry) {
         auto* const engine = back_engine;
         if ((head & Direct) != 0) {
             // A macro's write: a failure counts until the macro ends (the front sends that).
-            engine->ConsumeSink(*system);
+            ConsumeSinkTimed(engine, *system);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
-            engine->ConsumeSink(*system);
+            ConsumeSinkTimed(engine, *system);
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
             }
@@ -322,7 +331,7 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
-        engine->ConsumeSink(*system);
+        ConsumeSinkTimed(engine, *system);
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
         }
@@ -386,9 +395,23 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             BackStats::draw_thread.back_loop = true;
         }
         u64 last_store = read_position;
+        u64 entry_start = busy_start;
         while (read_position != available) {
             const size_t index = read_position & RingMask;
+            // Statistics: the entry's kind (method, macro write, multi-word method, call, other).
+            const u64 head = ring[index];
+            const size_t kind = (head & 0xf) == static_cast<u64>(Kind::Method)
+                                    ? ((head & Direct) != 0 ? 1 : 0)
+                                : (head & 0xf) == static_cast<u64>(Kind::Multi) ? 2
+                                : (head & 0xf) == static_cast<u64>(Kind::Call)  ? 3
+                                                                                : 4;
             const size_t size = Execute(&ring[index]);
+            if (entry_start != 0) {
+                const u64 now = BackStats::Stamp();
+                BackStats::draw_thread.ring_ticks[kind] += now - entry_start;
+                ++BackStats::draw_thread.ring_count[kind];
+                entry_start = now;
+            }
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
             if (read_position - last_store >= 4096 && read_position != available) {

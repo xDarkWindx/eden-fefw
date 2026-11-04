@@ -336,7 +336,7 @@ por frame**. Ganhos menores só aparecem como média (22-24 FPS alternando).
 
 | Bloco | % | Natureza |
 | --- | --- | --- |
-| Métodos da engine fora de draws ("other busy") | ~20 | **Ainda não decomposto** |
+| Fora de draws ("other busy") | ~20 | **Ainda não decomposto**; inclui trabalho do rasterizador (escritas seguradas no início de cada lista, fences e flush no fim, chamadas adiadas), não só a engine |
 | Handles (inclui o `Finish` da tabela, 4-12%) | 12-21 | Memória do guest, `Build`, espera da GPU |
 | `FlushCaching` (escritas de constant buffer da engine) | 7-8 | Invalidação + locks |
 | Push images, stage buffers, buffers | ~21 | Caches de textura e buffer |
@@ -354,8 +354,12 @@ releases vêm da conclusão de compute na GPU), giro maior (não era latência d
 ampla.
 
 **Restrições estruturais que apareceram:**
-1. ~800 acquires/s esperam compute terminar na GPU (QMD): o jogo encadeia compute → gráfico várias vezes por
-   frame. Cada um esvazia o split. Qualquer estágio novo de thread paga um esvaziamento a mais por acquire.
+1. ~800 acquires/s esperam um release de QMD de compute que **a thread de trás** grava ao processar o dispatch.
+   (Correção da revisão: com Fence Behavior Default e GPU fora de High, `SignalFenceCoalesced` roda o callback
+   na hora, `fence_manager.h:80-89`; o "QMD add" não espera a GPU. O `Drain` espera a thread de trás chegar ao
+   release, não a conclusão física do dispatch. Os contadores por origem só associam a mudança do valor ao último
+   release anotado; não medem espera de GPU.) A frente continua sem saber o valor (vem do QMD lido na thread de
+   trás). Cada acquire esvazia o split; qualquer estágio novo paga um esvaziamento a mais.
 2. Uma vez por frame, a tabela de handles escrita por compute é baixada com `Finish` dentro do lock: a thread de
    trás espera a GPU ali, e mais quanto mais adiantada estiver.
 3. A tela emulada quantiza: só um salto grande muda o FPS de forma estável.
@@ -363,17 +367,33 @@ ampla.
    configurações (a saída nativa é 3840x2160). A resolução interna vai pesar no último passo.
 
 **Caminhos, em ordem de custo:**
-- **Micro (2-5% cada):** `Finish` só da cópia da tabela; `Build` incremental; `IsRegionGpuModified` por página;
+- **Micro (2-5% cada):** reduzir o `Finish` da tabela (não é troca local: a cópia entra no command buffer
+  principal depois de todo o trabalho anterior, `vk_buffer_cache.cpp:490-499`; só antecipar a cópia para logo
+  depois do último escritor, evitar downloads redundantes ou reorganizar submissões reduz a espera); `Build` incremental; `IsRegionGpuModified` por página;
   cópias do caminho set; mais disputa de lock. Juntos talvez 10-15%: média 22-24 FPS, não 30.
 - **Decompor os ~20% de "other busy"** antes de qualquer decisão estrutural: é o maior bloco sem diagnóstico.
-- **Estrutural (B-split, rasterizador numa thread própria):** teto ~×1,4-1,5 se o estágio do rasterizador ficar
-  com ~65% e o da engine com ~35%. Custa replicar o estado do Maxwell3D por log de escritas e paga um
-  esvaziamento a mais em cada um dos ~800 acquires/s. É o único caminho visto que alcança 30 FPS sozinho.
+- **Estrutural (B-split, rasterizador numa thread própria):** o teto de ~×1,4-1,5 **não está sustentado**: parte
+  do "other busy" é do rasterizador e iria para a thread dele. E registradores não bastam: a engine grava
+  memória do guest entre draws (`ProcessCBMultiData` → `WriteBlockCached`, `maxwell_3d.cpp:702-715`), e o
+  rasterizador lê essa memória no draw (`FlushCaching`, `Configure`); um draw A ainda não preparado leria os bytes
+  do draw B. O desenho teria de levar essas escritas no fluxo ordenado, versionar os dados ou sincronizar antes
+  de sobrescrever; e preservar a fronteira de `ProcessDirtyRegisters` (draw adiado antes da escrita,
+  `maxwell_3d.cpp:344-353`).
 - **Heap bindless (C):** tiraria push images, resolve e parte de handles (~15-20%). Semanas no recompilador.
 
 **Riscos de visão de túnel:** tudo foi medido só na praça (palácio, batalha e seleção ainda não); o
 `EDEN_CPU_WRITE_PAGES` muda quando as escritas do jogo chegam aos caches da GPU (precisa de validação visual
 ampla); e a medição custa ~1-2%.
+
+### 3.15 Rodada 11 (revisada)
+
+Além do que a 3.13 lista, a mesma rodada mede: o tempo da thread de trás por tipo de entrada do ring (método,
+escrita de macro, método multi-palavra, chamada adiada), o `ConsumeSink`, o início de lista (escritas seguradas)
+e o fim de lista (fences e flush) separados das demais chamadas; o resíduo da engine (métodos menos draws,
+clears, compute, DMA e upload inline, agora também descontados do "other busy"); os sinais coalescidos que rodam
+na hora contra os adiados para uma fence; e as leituras de semáforo que buscam o valor num buffer da GPU
+(`FlushRegion`). A medição por entrada custa um carimbo por entrada do ring (~2-3% a mais com a estatística
+ligada).
 
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 

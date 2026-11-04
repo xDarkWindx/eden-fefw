@@ -23,6 +23,7 @@
 #include "core/frontend/graphics_context.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/cdma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/control/scheduler.h"
@@ -119,6 +120,8 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        const VideoCommon::BackStats::ScopedSharedTime list_start{
+            VideoCommon::BackStats::shared.list_start};
         // Collected first and applied as one batch: every region used to lock the texture and
         // buffer caches on its own, and each unlock woke a guest CPU thread waiting for them.
         // Per thread: fences can also apply them (fence_manager.h).

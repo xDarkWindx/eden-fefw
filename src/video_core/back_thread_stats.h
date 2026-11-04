@@ -108,6 +108,10 @@ struct DrawThread {
     u32 report_check{};
     // Kept across reports.
     u64 draw_serial{};          ///< Draws prepared so far
+    // GpuSplit::BackLoop by ring entry: method, macro write, multi-word method, call, other.
+    std::array<u64, 5> ring_ticks{};
+    std::array<u64, 5> ring_count{};
+    u64 sink_ticks{};           ///< Engine::ConsumeSink (inside the method entries)
     u64 last_compute_serial{};  ///< draw_serial at the last compute dispatch
     // Handle tables a compute shader wrote (buffer-backed texture arrays, downloaded per frame).
     u64 table_downloads{};
@@ -205,6 +209,16 @@ struct Shared {
     std::atomic<u64> cpu_write_would_hit{};    ///< Held, on one of the core's last 16 held pages
     std::atomic<u64> cpu_write_skipped{};      ///< Held without asking (EDEN_CPU_WRITE_PAGES)
     // BufferCache::IsRegionGpuModified (under the buffer cache lock, any thread).
+    // Calls the front queues around command lists (any thread runs them without the split).
+    std::atomic<u64> list_start{};   ///< GPU::InvalidateGPUCache: applying held guest writes
+    std::atomic<u64> list_end{};     ///< FlushCommandsBatched + OnCommandListEnd
+    // FenceManager::SignalFenceCoalesced (native QMD release adds): run now or at a fence.
+    std::atomic<u64> coalesced_now{};
+    std::atomic<u64> coalesced_delayed{};
+    std::atomic<u64> fences_signaled{};
+    // ReadNativeSemaphoreWord: words read back from a GPU-modified buffer (FlushRegion).
+    std::atomic<u64> semaphore_readbacks{};
+    std::atomic<u64> semaphore_readback_ticks{};
     std::atomic<u64> gpu_modified_queries{};
     std::atomic<u64> gpu_modified_true{};
     std::atomic<u64> gpu_modified_one_page{}; ///< Queries within one 4 KiB page

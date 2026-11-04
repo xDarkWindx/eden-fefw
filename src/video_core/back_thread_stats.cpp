@@ -96,11 +96,12 @@ void Report() {
     const u64 compute = Take(shared.compute);
     const u64 dma = Take(shared.dma);
     const u64 inline_upload = Take(shared.inline_upload);
-    const u64 known = d.prepare + composite + clear + compute;
+    // DMA and inline uploads run inside engine methods, outside PrepareDraw: subtracted too.
+    const u64 known = d.prepare + composite + clear + compute + dma + inline_upload;
     LOG_INFO(Render_Vulkan,
              "Back thread: {:.0f} draws/s; busy {}; prepare draw {:.1f}% ({:.2f} us/draw, spans "
              "{:.1f}%), composite {:.1f}%, clear {:.1f}%, compute {:.1f}%, dma {:.1f}%, inline "
-             "upload {:.1f}%, other busy {}; draw lock held {:.1f}%",
+             "upload {:.1f}%, other busy (all of the above subtracted) {}; draw lock held {:.1f}%",
              per_s(d.draws),
              d.back_loop ? fmt::format("{:.1f}% (idle {:.1f}%)", pct(d.back_busy), pct(d.back_idle))
                          : std::string{"n/a (split off)"},
@@ -111,6 +112,33 @@ void Report() {
                          : std::string{"n/a"},
              pct(d.lock_hold));
     LOG_INFO(Render_Vulkan, "Back thread draw spans (% of wall time): {}", spans);
+
+    // The ring's entries as the back executed them. Draws, clears, compute, DMA and inline uploads
+    // run inside method entries; composites and TickWork inside calls (or inside draws).
+    const u64 method_like = d.ring_ticks[0] + d.ring_ticks[1] + d.ring_ticks[2];
+    const u64 inside_methods = d.prepare + clear + compute + dma + inline_upload;
+    const u64 list_start = Take(shared.list_start);
+    const u64 list_end = Take(shared.list_end);
+    LOG_INFO(Render_Vulkan,
+             "Back thread ring (% of wall time, entries/s): methods {:.1f}% {:.0f}/s, macro writes "
+             "{:.1f}% {:.0f}/s, multi-word {:.1f}% {:.0f}/s, calls {:.1f}% {:.0f}/s, other {:.1f}%; "
+             "methods minus draws/clears/compute/DMA/inline {:.1f}% (method sink {:.1f}%); calls: "
+             "list start (held guest writes) {:.1f}%, list end (fences, batched flush) {:.1f}%, rest "
+             "{:.1f}%",
+             pct(d.ring_ticks[0]), per_s(d.ring_count[0]), pct(d.ring_ticks[1]), per_s(d.ring_count[1]),
+             pct(d.ring_ticks[2]), per_s(d.ring_count[2]), pct(d.ring_ticks[3]), per_s(d.ring_count[3]),
+             pct(d.ring_ticks[4]),
+             method_like > inside_methods ? pct(method_like - inside_methods) : 0.0, pct(d.sink_ticks),
+             pct(list_start), pct(list_end),
+             d.ring_ticks[3] > list_start + list_end ? pct(d.ring_ticks[3] - list_start - list_end)
+                                                     : 0.0);
+    const u64 readbacks = Take(shared.semaphore_readbacks);
+    LOG_INFO(Render_Vulkan,
+             "Fences: coalesced signals run at once {:.0f}/s, at a fence {:.0f}/s; fences {:.0f}/s; "
+             "semaphore readbacks from GPU buffers {:.1f}/s, {:.0f} us/s",
+             per_s(Take(shared.coalesced_now)), per_s(Take(shared.coalesced_delayed)),
+             per_s(Take(shared.fences_signaled)), per_s(readbacks),
+             us_per_s(Take(shared.semaphore_readback_ticks)));
 
     const u64 paths = d.paths[PathBuffer] + d.paths[PathPush] + d.paths[PathSet] + d.paths[PathNone];
     LOG_INFO(Render_Vulkan,

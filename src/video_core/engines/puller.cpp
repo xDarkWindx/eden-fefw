@@ -34,7 +34,13 @@ constexpr u32 Gf100BindValidMask =  0x1f0000 | Gf100BindClassMask;
 u32 ReadNativeSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
     const auto cpu_address = dma_pusher.memory_manager.GpuToCpuAddress(address);
     if (cpu_address && dma_pusher.rasterizer->MustFlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+        namespace BackStats = VideoCommon::BackStats;
+        const u64 readback_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
         dma_pusher.rasterizer->FlushRegion(*cpu_address, sizeof(u32), VideoCommon::CacheType::BufferCache);
+        if (readback_start != 0) {
+            BackStats::Add(BackStats::shared.semaphore_readbacks, 1);
+            BackStats::Add(BackStats::shared.semaphore_readback_ticks, BackStats::Stamp() - readback_start);
+        }
         const u32 value = dma_pusher.memory_manager.Read<u32>(address);
         LOG_WARNING(HW_GPU, "Native semaphore buffer readback: address={:#x}, current={}", address, value);
         return value;
