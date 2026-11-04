@@ -157,6 +157,10 @@ struct Shared {
     std::atomic<u64> acquire_ready_after_fences{};
     std::atomic<u64> acquire_suspended{};
     std::atomic<u64> acquire_fence_ticks{}; ///< The front in ReleaseFences(true) for an acquire
+    // The semaphore word read from guest memory before the drain (statistics only).
+    std::atomic<u64> acquire_ready_before{}; ///< Already satisfied before draining
+    std::atomic<u64> acquire_changed{};      ///< The drain changed the word
+    std::array<std::atomic<u64>, 3> acquire_ops{}; ///< Equal, greater or equal, mask
     // Cache locks taken outside draws: by other threads, and by the draw thread itself.
     LockCounters cpu_write;
     LockCounters cached_writes;

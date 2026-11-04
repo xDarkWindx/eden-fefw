@@ -220,6 +220,23 @@ bolhas dos `Drain`** (até 13% de ociosidade). A rodada 2 (`EDEN_BACK_THREAD_STA
 `setup` e `storage bind` separados de `handles`, `unlock` separado de `tail`, e descriptor sets mantidos contra
 reescritos por bind de pipeline.
 
+### 3.8 Rodada 3 (praça, `ae52996` e `050a4e1`)
+
+- `FlushCaching` (8,5%) aplica as escritas de constant buffer da engine (`ProcessCBMultiData` →
+  `WriteBlockCached`) via `InnerInvalidation`, que pega e solta cada lock de cache **fora** do lock do draw.
+- **Experimento F** (`EDEN_FLUSH_IN_DRAW_LOCK=1`, pegar o lock antes): `flush caching` 8,5 → 3,6%, mas `lock
+  wait` 4,1 → 6,7% e `unlock` 3,3 → 5,4%; o custo por draw ficou igual (8,50-8,69 → 8,54 µs), o lock passou a
+  ficar mais tempo seguro (44,6-45,6 → 47,1%) e a espera das threads do jogo em `OnCPUWrite` subiu de ~1,3 para
+  ~2,1 s/s. O custo só mudou de lugar: **revertido** (`00dd52f`). Conclusão: o gargalo é a disputa com as threads
+  do jogo (~135-140 mil `OnCPUWrite`/s, cada uma pegando `buffer_cache.mutex` só para consultar se a região é
+  registrada e modificada pela GPU, `buffer_cache.h:159-169`), não o número de aquisições da thread de trás.
+- **Acquires:** 743-788/s, todos de semáforo nativo, **100% prontos logo depois do `Drain`** (nenhum precisou
+  esperar fences, nenhum suspendeu). A rodada 4 mede se o valor **já estava pronto antes** do `Drain` (leitura
+  simples da memória do guest, só com a estatística ligada), se o `Drain` mudou o valor e o tipo de operação
+  (igual, maior ou igual, máscara). Se estiver pronto antes e for "maior ou igual" sobre sequências crescentes,
+  há um caminho para pular o `Drain` (ganho potencial: a ociosidade de 10-15% da thread de trás).
+- `Wait(tick)` das outras threads: ~115-120/s, ~360-410 ms/s; não é a thread de trás.
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

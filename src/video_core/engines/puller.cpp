@@ -171,18 +171,36 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     } else {
         // Acquires read what the back may still have to write: let it finish first. From here
         // on the back is idle, and the front may use the rasterizer until it sends more.
+        // Statistics only: the word as guest memory holds it before the drain (a plain read; the
+        // back may be writing it, which is what the drain is for).
+        const bool probe = VideoCommon::BackStats::Enabled() && dma_pusher.channel_state.native_abi;
+        const u32 word_before =
+            probe ? dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()) : 0;
         DrainBack(VideoCommon::BackStats::DrainSemaphoreAcquire);
         do {
             u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
             if (dma_pusher.channel_state.native_abi) {
                 word = ReadNativeSemaphoreWord(dma_pusher, regs.semaphore_address.SemaphoreAddress());
-                const auto ready = [&] {
-                    if (op == GpuSemaphoreOperation::AcquireEqual) return word == regs.semaphore_sequence;
-                    if (op == GpuSemaphoreOperation::AcquireGequal) return word >= regs.semaphore_sequence;
-                    if (op == GpuSemaphoreOperation::AcquireMask) return (word & regs.semaphore_sequence) != 0;
+                const auto satisfies = [&](u32 value) {
+                    if (op == GpuSemaphoreOperation::AcquireEqual) return value == regs.semaphore_sequence;
+                    if (op == GpuSemaphoreOperation::AcquireGequal) return value >= regs.semaphore_sequence;
+                    if (op == GpuSemaphoreOperation::AcquireMask) return (value & regs.semaphore_sequence) != 0;
                     return false;
                 };
+                const auto ready = [&] { return satisfies(word); };
                 namespace BackStats = VideoCommon::BackStats;
+                if (probe) {
+                    if (satisfies(word_before)) {
+                        BackStats::Add(BackStats::shared.acquire_ready_before, 1);
+                    }
+                    if (word_before != word) {
+                        BackStats::Add(BackStats::shared.acquire_changed, 1);
+                    }
+                    const size_t op_index = op == GpuSemaphoreOperation::AcquireEqual    ? 0
+                                            : op == GpuSemaphoreOperation::AcquireGequal ? 1
+                                                                                         : 2;
+                    BackStats::Add(BackStats::shared.acquire_ops[op_index], 1);
+                }
                 const bool ready_at_once = ready();
                 if (!ready_at_once) {
                     const BackStats::ScopedSharedTime fence_time{BackStats::shared.acquire_fence_ticks};

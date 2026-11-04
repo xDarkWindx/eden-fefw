@@ -191,11 +191,20 @@ void Report() {
     const u64 acquire_after_fences = Take(shared.acquire_ready_after_fences);
     const u64 acquire_suspended = Take(shared.acquire_suspended);
     const u64 acquire_fence_ticks = Take(shared.acquire_fence_ticks);
+    const u64 acquire_ready_before = Take(shared.acquire_ready_before);
+    const u64 acquire_changed = Take(shared.acquire_changed);
+    const u64 op_equal = Take(shared.acquire_ops[0]);
+    const u64 op_gequal = Take(shared.acquire_ops[1]);
+    const u64 op_mask = Take(shared.acquire_ops[2]);
     LOG_INFO(Render_Vulkan,
              "Split drains by caller (count/s, front waiting): {}. Native acquires: ready {:.0f}/s, "
-             "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s",
+             "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s; "
+             "before the drain: ready {:.0f}/s, word changed by the drain {:.0f}/s; ops equal "
+             "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s",
              drain_sites.empty() ? std::string{"none"} : drain_sites, per_s(acquire_ready),
-             per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks));
+             per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks),
+             per_s(acquire_ready_before), per_s(acquire_changed), per_s(op_equal), per_s(op_gequal),
+             per_s(op_mask));
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);
