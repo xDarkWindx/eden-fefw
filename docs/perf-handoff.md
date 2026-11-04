@@ -256,3 +256,23 @@ atualizar o `upstream-patch` para o Duck912.
   `PrepareImageView` por draw que percebe isso) — risco de view apagada; ou um heap bindless persistente no Vulkan
   (recompilador + cache de texturas). Ambos grandes. Branch não vai para o main sem A/B com ganho consistente
   (`EDEN_NO_COMPACT_TEXTURE_TABLES=1` no mesmo build).
+
+## Sessão de 2026-11-04: thread de trás da GPU (release 1.12)
+
+- Tudo em `docs/back-thread-split-plan.md` (rodadas 1-14, seções 3.7-3.22) e `docs/back-thread-phase3-design.md`
+  (próxima etapa, revisado duas vezes). Branch de trabalho: `perf/back-thread-split`; `main` = `740b932003` (1.12).
+- Ligado por padrão na 1.12: envio à GPU a cada 128 draws em títulos do Switch 2 (`EDEN_FLUSH_DRAWS=4096` volta),
+  junção das escritas seguradas do jogo por página (`EDEN_HELD_WRITE_MERGE=0` desliga), escritas seguradas
+  aplicadas antes de baixar dados da GPU, `FlushCaching` no `DrawTexture`, invalidação do shader cache em lote.
+- Rejeitados com dados: `EDEN_CPU_WRITE_PAGES` (jogo "parece 10 FPS"), pegar o lock antes do `FlushCaching`, pular o
+  `Drain` dos acquires (os releases vêm de QMD de compute), girar mais no split, 1a/1b (a RTX não usa descriptor
+  buffer), `Build` incremental, reaproveitar descriptor sets, pular escritas de registrador redundantes na thread de
+  trás (a frente já faz). `EDEN_INLINE_DEFER` não ganhou no saldo (desligado).
+- Estado: pior ponto da praça 20-21 FPS (~44 ms de trabalho por frame na thread de trás); outros trechos subiram
+  (22→30, 16→25 na vista aberta contra a 1.10). Faltam ~25-27% no pior ponto.
+- Próximo: build de medição do portão G1 (fração de handles/resolve/push images/payload nos draws com banco) e G4
+  (GPU real); desenho do allocator do C0 (set de descritores persistente por banco) para revisão; depois C0 atrás
+  de interruptor. Instrumentação: `EDEN_BACK_THREAD_STATS=1` (`back_thread_stats.*`).
+- Verificação na sessão: g++ `-fsyntax-only -Wall` e clang com os avisos do MSVC filtrados pelas linhas alteradas
+  (fmt 11, Vulkan-Headers, VMA, xbyak e SDL clonados no scratchpad; `libboost-dev`); harness de TSan do relatório.
+  O `git.eden-emu.dev` precisa estar liberado na rede do ambiente para ler o PokeDinner (já está).
