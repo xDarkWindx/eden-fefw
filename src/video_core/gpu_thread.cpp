@@ -16,6 +16,7 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/gpu.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/gpu_split.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
@@ -46,6 +47,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 scheduler.ResumePending(system.GPU());
                 if (!state.queue.TryPop(next)) {
                     split.Publish();
+                    const VideoCommon::BackStats::ScopedSharedTime sleep_time{
+                        VideoCommon::BackStats::shared.front_pending_sleep};
                     std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     continue;
                 }
@@ -55,6 +58,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     split.Publish();
                 } else {
                     rasterizer->OnGpuThreadIdle();
+                }
+                namespace BackStats = VideoCommon::BackStats;
+                const BackStats::ScopedSharedTime wait_time{BackStats::shared.front_guest_wait};
+                if (BackStats::Enabled()) {
+                    BackStats::Add(BackStats::shared.front_guest_waits, 1);
                 }
                 state.queue.PopWait(next, stop_token);
             }

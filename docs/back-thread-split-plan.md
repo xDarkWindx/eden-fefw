@@ -273,6 +273,26 @@ satisfaz e não há release anotado.
   experimento `EDEN_SPLIT_SPIN=N` (giro N vezes maior nos dois lados). Custo: um núcleo girando enquanto espera;
   há folga (CPU ~33%), mas o giro no irmão SMT da thread de trás roubaria ciclos dela.
 
+### 3.11 Rodada 7: não é latência de acordar
+
+| Medido | Sem giro extra | `EDEN_SPLIT_SPIN=8` |
+| --- | --- | --- |
+| Draws/s | 74,5 mil | 75,1 mil |
+| Thread de trás ociosa | 13,0% | 12,2% |
+| Frente acorda depois da chamada | 6,6 µs | 6,1 µs |
+| Fim do `Drain` → próxima publicação | 1,0 µs | 0,9 µs |
+| Episódios de ociosidade da de trás | 2087/s, 62 µs cada | 2110/s, 58 µs cada |
+| ... em que ela dormiu | 1% (acorda em 8,5 µs) | 1% |
+
+A hipótese caiu: os dois lados acordam em poucos µs, e a de trás quase nunca dorme. Ela fica ociosa ~2,7 vezes
+por `Drain`, ~60 µs cada, **girando à espera da frente**: nesses momentos a frente não tem trabalho para mandar.
+`EDEN_SPLIT_SPIN` foi removido. (O "slept in 170% of drains" contava cada vez que a frente dormiu: ela acorda e
+volta a dormir durante um `Drain`, porque a de trás devolve espaço do ring a cada 4096 palavras.)
+
+Rodada 8 mede o tempo da frente esperando o jogo submeter command lists (`PopWait` em `gpu_thread.cpp`) e
+dormindo com canal suspenso, e o tempo em que ela está ocupada (parsing, macros, envio). Se a frente espera o
+jogo nesses intervalos, quem limita ali é a CPU do jogo (que espera os locks dos caches ~1,2 s/s).
+
 ## 4. Fase 1a: identidade do payload, sem cópia nem comparação nos acertos
 
 Só no caminho de descriptor buffer do **graphics**, que é onde ninguém lê o payload quando a alocação é

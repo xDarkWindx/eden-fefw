@@ -43,23 +43,6 @@ char SplitMode() {
     return mode;
 }
 
-/// EDEN_SPLIT_SPIN=N (1-64, default 1): both sides of the split spin N times longer before
-/// sleeping. A native acquire drains the back about 800 times per second in Fortune's Weave; when
-/// the front sleeps through the drain and the back then sleeps waiting for the front, each handoff
-/// pays two wake-ups while the back has nothing to do. Spinning costs a host core instead.
-u32 SpinScale() {
-    static const u32 scale = [] {
-        const char* const value = std::getenv("EDEN_SPLIT_SPIN");
-        const long parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
-        const u32 result = parsed < 1 ? 1U : parsed > 64 ? 64U : static_cast<u32>(parsed);
-        if (result != 1) {
-            LOG_INFO(HW_GPU, "GPU thread split: spinning {}x longer before sleeping", result);
-        }
-        return result;
-    }();
-    return scale;
-}
-
 } // Anonymous namespace
 
 GpuSplit GpuSplit::instance;
@@ -97,8 +80,6 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }
     system = &system_;
     ring = std::make_unique<u64[]>(RingWords);
-    // Set before the back thread starts (it reads it from then on).
-    spin_scale = SpinScale();
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
 #ifdef ARCHITECTURE_x86_64
@@ -253,7 +234,7 @@ void GpuSplit::Drain(u32 site) {
     Publish();
     namespace BackStats = VideoCommon::BackStats;
     const u64 drain_start = BackStats::Enabled() ? BackStats::Stamp() : 0;
-    WaitForBack(16384 * spin_scale, [&] { return consumed_cache == write_position; });
+    WaitForBack(16384, [&] { return consumed_cache == write_position; });
     if (drain_start != 0) {
         drained_stamp = BackStats::Stamp();
         // Only drains that waited: those leave the back with nothing to do until the front sends more.
@@ -374,8 +355,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 ++BackStats::draw_thread.back_idle_episodes;
             }
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            const u32 spin_limit = 8192 * spin_scale;
-            for (u32 spins = 0; spins < spin_limit && available == read_position; ++spins) {
+            for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }

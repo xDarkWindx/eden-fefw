@@ -180,6 +180,9 @@ struct Shared {
     std::atomic<u64> front_wake_count{};
     std::atomic<u64> drain_to_publish{}; ///< From a drain's end to the front's next publish
     std::atomic<u64> drain_to_publish_count{};
+    std::atomic<u64> front_guest_wait{};   ///< The GPU thread (front) waiting for guest submissions
+    std::atomic<u64> front_guest_waits{};
+    std::atomic<u64> front_pending_sleep{}; ///< ... sleeping 1 ms with a native channel suspended
     std::atomic<u64> drain_ticks{};
     std::atomic<u64> space_ticks{};
 };

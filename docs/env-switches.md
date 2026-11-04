@@ -8,7 +8,6 @@ Desde 2026-11-03 o fork não segue mais upstream, e o código de diagnóstico da
 | `EDEN_NO_HEAP_REUSE=1` | Desliga o reaproveitamento de bancos de texturas e dos descritores (para isolar textura errada). |
 | `EDEN_TEXTURE_TABLE_STATS=1` | Loga a cada 4 s as estatísticas das tabelas de texturas e dos bancos. |
 | `EDEN_BACK_THREAD_STATS=1/2` | Loga a cada 4 s onde a thread que prepara os draws gasta o tempo (trechos do `PrepareDraw`, descritores, esperas no scheduler, worker do Vulkan, locks dos caches, frente do split). `2` serializa os carimbos (`lfence`), para conferir um número decisivo. Custa ~1-2%: medir draws/s com ele desligado. Ver `docs/back-thread-split-plan.md`, fase 0. |
-| `EDEN_SPLIT_SPIN=N` | Experimento: as duas metades do split giram N vezes mais (1-64) antes de dormir: a frente esperando um `Drain`, a de trás com o ring vazio. Troca acordar por ocupar um núcleo. |
 | `EDEN_GPU_SPLIT=0/1/2` | GPU emulada em uma thread (0), métodos na thread de trás (1) ou também macros na da frente (2, padrão). |
 | `EDEN_MME_JIT=0` | Macros nativas no interpretador em vez do código compilado. |
 | `EDEN_NATIVE_FRONTEND=lower/ampere/auto/compare` | Frontend de shaders nativos (padrão `lower`). |

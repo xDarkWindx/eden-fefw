@@ -201,9 +201,6 @@ private:
     std::atomic<u64> consumed_notify_stamp{};
     std::atomic<u64> publish_notify_stamp{};
     u64 drained_stamp{}; ///< Front: when the last drain ended, until the next publish
-    /// EDEN_SPLIT_SPIN: how many times longer both sides spin before sleeping (front in Drain,
-    /// back with an empty ring).
-    u32 spin_scale{1};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

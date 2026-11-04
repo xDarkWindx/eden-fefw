@@ -220,21 +220,37 @@ void Report() {
     const u64 front_wake_count = Take(shared.front_wake_count);
     const u64 drain_to_publish = Take(shared.drain_to_publish);
     const u64 drain_to_publish_count = Take(shared.drain_to_publish_count);
+    const u64 front_guest_waits = Take(shared.front_guest_waits);
+    const u64 front_guest_wait = Take(shared.front_guest_wait);
+    const u64 front_pending_sleep = Take(shared.front_pending_sleep);
+    // The front's wall time minus its waits (drains, ring space, guest submissions, suspended
+    // channels): parsing command lists, running macros and sending to the back.
+    const u64 front_waits = shared.drain_ticks.load(std::memory_order_relaxed) +
+                            shared.space_ticks.load(std::memory_order_relaxed) + front_guest_wait +
+                            front_pending_sleep;
+    const std::string front_busy =
+        d.back_loop ? fmt::format("{:.1f}%", static_cast<double>(front_waits) < wall_ticks
+                                                 ? 100.0 - pct(front_waits)
+                                                 : 0.0)
+                    : std::string{"n/a"};
     const auto avg_us = [ticks_per_us](u64 ticks, u64 count) {
         return count != 0 ? static_cast<double>(ticks) / ticks_per_us / static_cast<double>(count)
                           : 0.0;
     };
     LOG_INFO(Render_Vulkan,
-             "Split handoffs: front slept in {:.0f}% of drains, woke {:.1f} us after the back's call; "
+             "Split handoffs: front slept {:.2f} times per drain, woke {:.1f} us after the back's call; "
              "drain end to next publish {:.1f} us; back idle {:.0f} times/s ({:.1f} us each), slept "
-             "{:.0f}% of them, woke {:.1f} us after the front's call",
-             drains_seen != 0 ? static_cast<double>(front_slept) * 100.0 / static_cast<double>(drains_seen) : 0.0,
+             "{:.0f}% of them, woke {:.1f} us after the front's call; front waiting for guest "
+             "submissions {:.0f} times/s, {:.0f} us/s, sleeping on suspended channels {:.0f} us/s; "
+             "front otherwise busy {}",
+             drains_seen != 0 ? static_cast<double>(front_slept) / static_cast<double>(drains_seen) : 0.0,
              avg_us(front_wake, front_wake_count), avg_us(drain_to_publish, drain_to_publish_count),
              per_s(d.back_idle_episodes), avg_us(d.back_idle, d.back_idle_episodes),
              d.back_idle_episodes != 0 ? static_cast<double>(d.back_slept) * 100.0 /
                                              static_cast<double>(d.back_idle_episodes)
                                        : 0.0,
-             avg_us(d.back_wake, d.back_wake_count));
+             avg_us(d.back_wake, d.back_wake_count), per_s(front_guest_waits),
+             us_per_s(front_guest_wait), us_per_s(front_pending_sleep), front_busy);
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);
