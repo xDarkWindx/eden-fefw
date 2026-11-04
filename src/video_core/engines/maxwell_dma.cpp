@@ -10,6 +10,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
+#include "video_core/back_thread_stats.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
@@ -353,10 +354,12 @@ void MaxwellDMA::ReleaseSemaphore() {
     case LaunchDMA::SemaphoreType::NONE:
         break;
     case LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE: {
+        VideoCommon::BackStats::NoteRelease(address, VideoCommon::BackStats::ReleaseDma);
         rasterizer->Query(address, VideoCommon::QueryType::Payload, flags, payload, 0);
         break;
     }
     case LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE: {
+        VideoCommon::BackStats::NoteRelease(address, VideoCommon::BackStats::ReleaseDma);
         rasterizer->Query(address, VideoCommon::QueryType::Payload,
                           flags | VideoCommon::QueryPropertiesFlags::HasTimeout, payload, 0);
         break;

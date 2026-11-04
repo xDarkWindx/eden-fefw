@@ -69,6 +69,8 @@ int SkipAcquireDrainMode() {
         if (value == nullptr || value[0] < '1' || value[0] > '2') {
             return 0;
         }
+        LOG_INFO(HW_GPU, "EDEN_SKIP_ACQUIRE_DRAIN={}: native acquires may skip the split drain",
+                 value[0]);
         return value[0] - '0';
     }();
     return mode;
@@ -262,6 +264,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = dma_pusher.channel_state.native_abi && (regs.semaphore_trigger & (1U << 24))
             ? VideoCommon::QueryPropertiesFlags::IsAFence : VideoCommon::QueryPropertiesFlags::HasTimeout;
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
+            VideoCommon::BackStats::NoteRelease(sequence_address, VideoCommon::BackStats::ReleasePuller);
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
         NotePendingRelease(dma_pusher, sequence_address, payload);
@@ -297,6 +300,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     }
                     if (word_before != word) {
                         BackStats::Add(BackStats::shared.acquire_changed, 1);
+                        // The back is idle after the drain: its notes are safe to read here.
+                        BackStats::Add(BackStats::shared.acquire_release_source[BackStats::LastRelease(
+                                           regs.semaphore_address.SemaphoreAddress())],
+                                       1);
                     }
                     const size_t op_index = op == GpuSemaphoreOperation::AcquireEqual    ? 0
                                             : op == GpuSemaphoreOperation::AcquireGequal ? 1
@@ -359,6 +366,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
+        VideoCommon::BackStats::NoteRelease(sequence_address, VideoCommon::BackStats::ReleasePuller);
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });

@@ -167,11 +167,13 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
+                    VideoCommon::BackStats::NoteRelease(address, VideoCommon::BackStats::ReleaseQmdAdd);
                     rasterizer->SignalFenceCoalesced([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;
                         memory_manager.Write<u32>(address, value);
                     });
                 } else {
+                    VideoCommon::BackStats::NoteRelease(address, VideoCommon::BackStats::ReleaseQmd);
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                 }

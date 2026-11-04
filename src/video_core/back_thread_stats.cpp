@@ -45,6 +45,7 @@ constexpr std::array<const char*, 9> DRAIN_NAMES{
 
 extern const int mode = ReadMode();
 DrawThread draw_thread;
+std::array<ReleaseNote, 1024> release_notes{};
 Shared shared;
 
 void Report() {
@@ -201,12 +202,20 @@ void Report() {
              "ready after releasing fences {:.0f}/s, suspended {:.0f}/s; releasing fences {:.0f} us/s; "
              "before the drain: ready {:.0f}/s, word changed by the drain {:.0f}/s; ops equal "
              "{:.0f}/s, gequal {:.0f}/s, mask {:.0f}/s. Skipped drains: pending release {:.0f}/s, "
-             "memory {:.0f}/s, failed in-order checks {}",
+             "memory {:.0f}/s, failed in-order checks {}. Acquires the drain satisfied, by the last "
+             "release there: puller {:.0f}/s, DMA {:.0f}/s, compute QMD {:.0f}/s, compute QMD add "
+             "{:.0f}/s, 3D report {:.0f}/s, unknown {:.0f}/s",
              drain_sites.empty() ? std::string{"none"} : drain_sites, per_s(acquire_ready),
              per_s(acquire_after_fences), per_s(acquire_suspended), us_per_s(acquire_fence_ticks),
              per_s(acquire_ready_before), per_s(acquire_changed), per_s(op_equal), per_s(op_gequal),
              per_s(op_mask), per_s(Take(shared.skip_pending)), per_s(Take(shared.skip_memory)),
-             shared.skip_failures.load(std::memory_order_relaxed));
+             shared.skip_failures.load(std::memory_order_relaxed),
+             per_s(Take(shared.acquire_release_source[ReleasePuller])),
+             per_s(Take(shared.acquire_release_source[ReleaseDma])),
+             per_s(Take(shared.acquire_release_source[ReleaseQmd])),
+             per_s(Take(shared.acquire_release_source[ReleaseQmdAdd])),
+             per_s(Take(shared.acquire_release_source[Release3D])),
+             per_s(Take(shared.acquire_release_source[ReleaseUnknown])));
     const u64 drains = Take(shared.drains);
     const u64 drain_ticks = Take(shared.drain_ticks);
     const u64 space_ticks = Take(shared.space_ticks);

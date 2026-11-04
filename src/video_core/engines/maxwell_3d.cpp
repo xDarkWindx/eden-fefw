@@ -577,6 +577,7 @@ void Maxwell3D::ProcessQueryGet() {
         if (regs.report_semaphore.query.short_query != 0) {
             flags |= VideoCommon::QueryPropertiesFlags::IsAFence;
         }
+        VideoCommon::BackStats::NoteRelease(sequence_address, VideoCommon::BackStats::Release3D);
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Acquire:

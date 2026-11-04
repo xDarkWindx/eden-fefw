@@ -165,6 +165,9 @@ struct Shared {
     std::atomic<u64> skip_pending{};  ///< Acquires satisfied by a release still queued for the back
     std::atomic<u64> skip_memory{};   ///< ... by the word already in guest memory (mode 2)
     std::atomic<u64> skip_failures{}; ///< In-order checks on the back that found the acquire unmet
+    /// Acquires whose word the drain changed, by the source of the last release the back executed
+    /// at that address (ReleaseSource).
+    std::array<std::atomic<u64>, 6> acquire_release_source{};
     // Cache locks taken outside draws: by other threads, and by the draw thread itself.
     LockCounters cpu_write;
     LockCounters cached_writes;
@@ -189,6 +192,35 @@ enum DrainSite : u32 {
     DrainFrontCompute,     ///< KeplerCompute takes its macros to the front
     DrainSignalSync,       ///< DmaPusher: a command list asks for a sync
 };
+
+/// Who released a semaphore (statistics only).
+enum ReleaseSource : u32 {
+    ReleaseUnknown,  ///< No release seen at the address (or forgotten by a collision)
+    ReleasePuller,   ///< Puller semaphore release or WriteLong trigger
+    ReleaseDma,      ///< MaxwellDMA semaphore
+    ReleaseQmd,      ///< Native compute QMD release (written when the back runs it)
+    ReleaseQmdAdd,   ///< Native compute QMD release that adds at a fence
+    Release3D,       ///< Maxwell3D report semaphore
+};
+
+/// The last release the back executed at each address (draw thread, which runs the engines; the
+/// front reads it only after a drain, while the back is idle).
+struct ReleaseNote {
+    u64 address{};
+    ReleaseSource source{};
+};
+extern std::array<ReleaseNote, 1024> release_notes;
+
+inline void NoteRelease(u64 gpu_address, ReleaseSource source) {
+    if (Enabled()) {
+        release_notes[(gpu_address >> 2) & (release_notes.size() - 1)] = {gpu_address, source};
+    }
+}
+
+[[nodiscard]] inline ReleaseSource LastRelease(u64 gpu_address) {
+    const ReleaseNote& note = release_notes[(gpu_address >> 2) & (release_notes.size() - 1)];
+    return note.address == gpu_address ? note.source : ReleaseUnknown;
+}
 
 /// Whether this thread prepares draws (set by PrepareDraw).
 inline thread_local bool is_draw_thread{};
