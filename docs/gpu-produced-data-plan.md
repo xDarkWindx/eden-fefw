@@ -211,8 +211,9 @@ esta é uma escolha, documentada.
      `ReleaseFences`). Para servir de dependência, precisa virar uma espera real pela condição
      (syncpoint ≥ valor), usando o valor que sobe na conclusão na GPU (`IncrementHost` na fence,
      `fence_manager.h:142-146`). O valor que o jogo vê sobe antes (`IncrementGuest`, `:143`). Riscos:
-     incrementos vindos de outros clientes do host1x, valores que nunca chegam (precisa de limite de tempo,
-     contador e log) e custo no FE.
+     incrementos vindos de outros clientes do host1x, valores que nunca chegam e custo no FE. Ao estourar o
+     limite de tempo, a dependência continua não satisfeita: o canal fica suspenso com diagnóstico
+     (`docs/architecture-plan.md`, 12.2 c); seguir sem ela é opção explícita de compatibilidade.
    - WFI: grava um evento no fluxo do Vulkan (`vk_rasterizer.cpp:1125-1145`); serve de marco de ordem, não
      de conclusão.
    - Bit de sync da entrada: drena só com "Sync Memory Operations"; sem isso, é só marco de ordem.
