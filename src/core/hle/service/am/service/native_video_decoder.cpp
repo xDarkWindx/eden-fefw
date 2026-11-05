@@ -113,6 +113,28 @@ public:
         process->Close(kernel);
     }
 private:
+    // Stop and Finalize end the frames for images the client already gave back, so complete
+    // their fences: Donkey Kong Bananza's movie player waits on them when its menu closes, and
+    // froze with the audio still playing. As in Eglantine's decoder (Stop 207, Finalize 115).
+    // Those images count as handed out (with no new frame), so a later release gives each a
+    // fresh value and the sequence stays in step with the syncpoint.
+    void CompleteHandedOutFences() {
+        if (!operation_syncpoint) return;
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        const u32 target = static_cast<u32>(next_completion_value);
+        u32 completed = 0;
+        while (static_cast<s32>(syncpoints.GetGuestSyncpointValue(*operation_syncpoint) - target) < 0 &&
+               completed < 0x10000) {
+            syncpoints.IncrementGuest(*operation_syncpoint);
+            syncpoints.IncrementHost(*operation_syncpoint);
+            ++completed;
+        }
+        for (auto& image : registered_images) image.available = false;
+        if (completed) {
+            LOG_INFO(Service_AM, "native video completed {} pending image fence(s) on stop", completed);
+        }
+    }
+
     void Reset() {
         // Joins the decode worker (requests stop first), so nothing below races with it.
         decode_worker = std::jthread{};
@@ -743,6 +765,7 @@ private:
                     result = decoder->SignalEOS() == libgav1::kStatusOk ? ResultSuccess : Kernel::ResultInvalidState;
                 }
                 if (result.IsSuccess()) {
+                    CompleteHandedOutFences();
                     started = false;
                     flushed = false;
                     pending_inputs.clear();
@@ -921,7 +944,10 @@ private:
     void Finalize(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
         const Result result = packet[0] == 0x83 && packet[1] == 0 ? ResultSuccess : Kernel::ResultInvalidCombination;
-        if (result.IsSuccess()) Reset();
+        if (result.IsSuccess()) {
+            CompleteHandedOutFences();
+            Reset();
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(result.raw);
     }
@@ -1142,9 +1168,25 @@ Result NativeVideoService::QueryVideoImage(u32 image_id, std::array<u64, 16>& de
     const std::scoped_lock lock{state->mutex};
     for (const auto& pool : state->pools) {
         if (image_id < pool->first_image_id || image_id - pool->first_image_id >= pool->count) continue;
-        R_UNLESS(pool->layout.nv12, Kernel::ResultNotImplemented);
         const u64 offset = u64{image_id - pool->first_image_id} * pool->layout.image_stride;
         R_UNLESS(offset + pool->layout.image_bytes <= std::numeric_limits<u32>::max(), Kernel::ResultInvalidSize);
+        if (!pool->layout.nv12) {
+            // Code 5 pools (BGRA8, 0x9 in the descriptor, as in Eglantine): format, offset and pitch.
+            // Donkey Kong Bananza queries one when its tutorial menu opens and aborted on the
+            // 2001-0033 this used to return. The frames here are written as RGBA in the GPU's
+            // block-linear layout, which suits sampling, so a client reading the bytes through
+            // this pitch-linear description on the CPU would see them scrambled.
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true)) {
+                LOG_INFO(Service_AM, "native video CPU descriptor of a BGRA pool (image {}): the image is stored "
+                                     "block-linear RGBA, pitch {}", image_id, pool->layout.row_bytes);
+            }
+            descriptor = {};
+            descriptor[0] = (u64{pool->packed_dimensions} << 32) | 0x9;
+            descriptor[1] = (u64{pool->layout.image_bytes} << 32) | offset;
+            descriptor[2] = pool->layout.row_bytes;
+            R_SUCCEED();
+        }
         // Layout of the NV12 record returned by gsv (run in emulation over a size grid): dimensions
         // and format 0xa, then luma size and image offset, luma pitch, chroma size and offset,
         // chroma pitch.
