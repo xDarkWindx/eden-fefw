@@ -265,9 +265,10 @@ acquire de syncpoint muda o comportamento de todos os jogos que usam syncpoint, 
 chave própria, com A/B no FE.
 
 **Chave e padrão:** `EDEN_GPU_LISTS=0/1`, padrão 0 até passar nos casos dirigidos e no Bananza. Depois
-disso, o padrão é `exact-drain` se couber no orçamento (`docs/architecture-plan.md` 12.1), mesmo com um custo
-pequeno no FE; `after-satisfied-dependency` não é candidata a padrão enquanto a garantia acima não estiver
-demonstrada.
+disso, `exact-drain` é a referência correta e o candidato a padrão (`docs/architecture-plan.md` 12.3), mesmo
+com um custo pequeno no FE dentro do orçamento (12.1). Acima do orçamento, a pendência é registrada e as
+opções de compatibilidade ficam explícitas e opt-in; `submitted` não volta como padrão.
+`after-satisfied-dependency` não é candidata a padrão enquanto a garantia acima não estiver demonstrada.
 
 ### 4.3 Releitura de macro
 
@@ -378,4 +379,4 @@ dele.
 | 5 | Acquire de syncpoint satisfeito pelo valor do host (`IncrementHost`), não pelo do guest | Necessário: `other_channel_guest_value` falha (`DependencyViolated`) em todos os escalonamentos menos `eager`: a entrada começa antes de a GPU concluir. As palavras ainda saem certas, porque a cópia é ordenada; o que se viola é a dependência | Reforça 4.2, item 2, e o passo 5.5 |
 | 6 | Bug do cache (revisão do T1): a validade cobria só as faixas copiadas | Sim. Uma transferência vazia (o filtro não achou nada) ficava válida para sempre, e uma entrada em duas páginas não perdia a validade quando um produtor escrevia na página que o filtro tinha descartado. Com `exact-drain`, `stale_empty_transfer` e `stale_two_pages` falhavam (20/20 no `eager`, 28–37% no aleatório) | `Transfer` separa `requested` (o que foi copiado) de `covered` (a região inteira da entrada no fetch); `valid_until` cobre `covered`, e o contrato lê a validade antes do filtro. Os dois casos passam em todos os escalonamentos |
 | 7 | Negativos só diziam "falhou", sem dizer por quê | Sim | Negativos tipados: cada um declara o tipo de falha (`WordMismatch`, `DependencyViolated`...), e qualquer outro tipo reprova o teste |
-
+| 8 | (revisão do T1) Regra por dependências retirada da preferência de padrões; exact-drain como referência; custo não torna exato um caminho potencialmente incorreto | Decisão do usuário e do revisor, sobre o resultado do T1 (`no_dependency`, `producer_after_wait_new_page`) | 4.2 (chave e padrão) e `docs/architecture-plan.md` 12.3 e 13.2 alinhados |

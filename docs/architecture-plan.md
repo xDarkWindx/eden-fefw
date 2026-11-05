@@ -378,11 +378,10 @@ aparecer como a perda de um degrau em parte dos frames; o número observado tamb
 
 ### 12.3 O que muda nos padrões
 
-- `list_fetch`: o padrão, depois de validado, é o modo exato mais barato que passar nos casos dirigidos, se
-  couber no orçamento. Ordem de preferência: exato por dependências; exato por espera em toda entrada
-  com produtor na fila (`exact-drain`); e só se os dois estourarem o orçamento, `submitted` com o
-  verificador por amostragem (que detecta, mas não previne), por decisão do usuário.
-- `macro_params`: mesma regra.
+- `list_fetch`: o candidato inicial a padrão é `exact-drain`, depois de corrigida a validade das transferências e validado o protocolo completo: produtores cobertos, cópia ordenada na posição da entrada, conclusão na GPU e publicação. O drain sozinho não garante coerência.
+  A regra por dependências permanece experimental. Ela só pode substituir `exact-drain` nos caminhos em que uma condição verificável garanta a mesma versão dos bytes; nos demais, o consumidor recorre ao caminho conservador.
+  Se o custo do caminho validado exceder o orçamento (12.1), a pendência é registrada e qualquer opção de compatibilidade fica explícita e opt-in. O custo não transforma um caminho potencialmente incorreto em exato.
+- `macro_params`: mesma regra de `list_fetch`.
 - `cpu_buffer_read=learned` é uma **concessão de precisão que já existe** (no Vulkan, a primeira leitura
   pela CPU de um buffer escrito pela GPU não baixa nada, `vk_rasterizer.cpp:883-908`), não uma política
   comprovadamente segura. Um dado velho pode decidir uma alocação, um endereço ou uma sequência de comandos
@@ -427,9 +426,12 @@ corrigida localmente, com evidência, sem contaminar o resto**.
 
 - **Escopo:** o contrato de memória e o de sincronização, só para command lists.
   - `Dependência` com as condições que existem hoje (semáforo, syncpoint, WFI, bit de sync) e a regra de
-    visibilidade como **um único ponto trocável**: a hipótese "o produtor só é visível ao fetch depois de uma
-    dependência satisfeita" mora num lugar só. Se cair, troca-se essa regra pela conservadora
-    (`exact-drain`), e nenhum consumidor muda.
+    visibilidade como **um único ponto trocável** (`VisibilityRule`). A regra conservadora (`exact-drain`) é
+    a referência e o padrão. A regra por dependências ("o produtor só é visível ao fetch depois de uma
+    dependência satisfeita") é uma otimização experimental atrás do mesmo ponto, aplicável só onde uma
+    condição verificável garanta a mesma versão dos bytes; nenhum consumidor muda ao trocar de regra. A
+    evidência é o T1 (`tools/gpu-contract-harness/`): os casos `no_dependency` e
+    `producer_after_wait_new_page` falham com a regra por dependências e passam com `exact-drain`.
   - `Transferência` com faixas, produtores incluídos, versão, fence e validade.
   - O consumidor "busca de command list" usando só essas duas interfaces.
 - **Fora do escopo:** mudar o comportamento do emulador. O protótipo entra desligado, primeiro como o build
@@ -439,3 +441,4 @@ corrigida localmente, com evidência, sem contaminar o resto**.
   recursos retidos, custo sem uso, caminhos afetados) está escrita para ele.
 - **Roda na nuvem:** harness e casos não precisam do PC do usuário. O jogo só entra depois, para a matriz
   do Bananza e o A/B do FE.
+| (revisão do T1) Regra por dependências retirada da preferência de padrões; exact-drain como referência; custo não torna exato um caminho potencialmente incorreto | 12.3 (`list_fetch`, `macro_params`) e 13.2 |
