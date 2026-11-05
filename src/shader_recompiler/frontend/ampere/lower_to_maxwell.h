@@ -1751,20 +1751,33 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         }
         case 0x305: case 0xb05: { // F2I NTZ, register/constant-buffer source
-            const bool half = opcode == 0x305 && insn.words[2] == 0x0010f000;
-            const bool small = insn.words[2] == 0x00212800;
-            const bool floor = (insn.words[2] & ~0x10100U) == 0x00207000;
-            const bool nearest = (insn.words[2] & ~0x10100U) == 0x00203000;
-            if ((!half && !small && !floor && !nearest && (insn.words[2] & ~0x10100U) != 0x0020f000) || (opcode == 0x305 && (insn.words[1] & 0xffffff00U))) {
+            const u32 mode = insn.words[2];
+            // F16 source: bit 72 signs the result as in the other forms, bit 60 picks H0/H1.
+            const bool half = opcode == 0x305 && (mode & ~0x100U) == 0x0010f000;
+            const bool small = mode == 0x00212800;
+            const bool floor = (mode & ~0x10100U) == 0x00207000;
+            const bool nearest = (mode & ~0x10100U) == 0x00203000;
+            const bool round_up = (mode & ~0x10100U) == 0x0020b000;
+            // F2I.S8 (Donkey Kong Bananza) and F2I.U16/S16.TRUNC, from Eglantine.
+            const bool signed_byte = opcode == 0x305 && mode == 0x0021e100;
+            const bool short_trunc = opcode == 0x305 && (mode & ~0x100U) == 0x0021e800;
+            // Bit 62: |Rs| on the register form (F2I.FTZ.U16.NTZ R26, |R42|).
+            const bool absolute = opcode == 0x305 && !half && insn.Bits(62, 1);
+            if ((!half && !small && !floor && !nearest && !round_up && !signed_byte && !short_trunc &&
+                 (mode & ~0x10100U) != 0x0020f000) ||
+                (opcode == 0x305 && (insn.words[1] & (half ? 0xefffff00U : absolute ? 0xbfffff00U : 0xffffff00U)))) {
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
             u32 source = opcode == 0xb05 ? materialize(2, 0, 252, insn.Bits(62, 1) != 0, insn.Bits(63, 1) != 0) // [merge-audit-f2i]
                                      : insn.Bits(32, 8);
             if (half) {
-                extract_half({source, 2, false, false}, 0, 252);
+                extract_half({source, insn.Bits(60, 1) ? 3U : 2U, false, false}, 0, 252);
                 source = 252;
             }
+            // R252 rather than Eglantine's R249: programs here may use registers up to R249.
+            // The unsigned path below reads it into R250 before reusing R252.
+            if (absolute) source = materialize(0, source, 252, true, false);
             if (!is_signed) {
                 // Clear NaNs without consuming a guest predicate. Clamp the
                 // conversion below 2^32, retaining an overflow mask for saturation.
@@ -1772,7 +1785,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                      (u64{source} << 20) | (u64{7} << 39) | (u64{7} << 48));
                 emit(0x5c40000000000000ULL | predicate | 250 | (u64{source} << 8) |
                      (u64{250} << 20) | (u64{7} << 48));
-                if (!small) {
+                if (!small && !short_trunc) {
                 mov_imm(252, 0x4f800000);
                 emit(0x5800000000000000ULL | predicate | 251 | (u64{250} << 8) |
                      (u64{252} << 20) | (u64{7} << 39) | (u64{6} << 48));
@@ -1782,10 +1795,16 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 }
                 source = 250;
             }
-            emit(base(0x5cb0000000000000ULL) | (u64{small ? 1U : 2U} << 8) | (u64{2} << 10) |
+            emit(base(0x5cb0000000000000ULL) | (u64{small || signed_byte || short_trunc ? 1U : 2U} << 8) | (u64{2} << 10) |
                  (u64{is_signed} << 12) | (u64{source} << 20) |
-                 (u64{small || nearest ? 0U : floor ? 1U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
-            if (!is_signed && !small) {
+                 (u64{small || nearest ? 0U : floor ? 1U : round_up ? 2U : 3U} << 39) |
+                 (u64{insn.Bits(80, 1)} << 44));
+            if (signed_byte) {
+                // Convert to signed 16 bits, then saturate to the signed 8-bit range.
+                emit(base(0x5ce0000000000000ULL) | (u64{1} << 10) | (u64{1} << 12) |
+                     (u64{1} << 13) | (dest << 20) | (u64{1} << 50));
+            }
+            if (!is_signed && !small && !short_trunc) {
                 emit(base(0x5c40000000000000ULL) | (dest << 8) | (u64{251} << 20) |
                      (u64{1} << 41) | (u64{7} << 48));
             }

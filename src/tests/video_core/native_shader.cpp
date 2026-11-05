@@ -7022,6 +7022,31 @@ TEST_CASE("Native Array2D explicit-LOD sample keeps layer XY LOD and a source-al
     REQUIRE(copies == std::vector<std::pair<u32, u32>>{{250, 6}, {251, 7}, {252, 4}, {253, 5}, {4, 250}});
 }
 
+TEST_CASE("Native float to signed byte conversion saturates through a 16-bit conversion", "[native-shader]") {
+    // F2I.S8 R21 = R3 (Donkey Kong Bananza graphics): F2I to S16, then I2I.SAT to S8 in place.
+    const std::array<Native, 2> input{{{{0x00157305, 0x00000003, 0x0021e100, 0x0001e400}},
+                                       VertexTransform.back()}};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    std::vector<u64> conversions;
+    for (const u64 word : lowered.instructions) {
+        const auto opcode = Shader::Maxwell::Decode(word);
+        if (opcode == Shader::Maxwell::Opcode::F2I_reg || opcode == Shader::Maxwell::Opcode::I2I_reg)
+            conversions.push_back(word);
+    }
+    REQUIRE(conversions.size() == 2);
+    REQUIRE(Shader::Maxwell::Decode(conversions[0]) == Shader::Maxwell::Opcode::F2I_reg);
+    REQUIRE((conversions[0] & 0xff) == 21);           // destination
+    REQUIRE(((conversions[0] >> 20) & 0xff) == 3);    // source
+    REQUIRE(((conversions[0] >> 8) & 3) == 1);        // 16-bit result
+    REQUIRE(((conversions[0] >> 12) & 1) == 1);       // signed
+    REQUIRE(Shader::Maxwell::Decode(conversions[1]) == Shader::Maxwell::Opcode::I2I_reg);
+    REQUIRE((conversions[1] & 0xff) == 21);
+    REQUIRE(((conversions[1] >> 20) & 0xff) == 21);
+    REQUIRE(((conversions[1] >> 50) & 1) == 1);       // saturate
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);
