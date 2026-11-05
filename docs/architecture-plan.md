@@ -300,6 +300,11 @@ o padrão antes de medir.
 4. Que efeitos do nível High faltam no inventário do passo 1, além dos listados na seção 3.5?
 5. O replay deve começar pela captura no nível do GPFIFO com estado inicial coerente, ou por um subconjunto
    (um único draw com seus recursos)?
+6. **Tempo observado pelo jogo.** O controle de resolução dinâmica do Ocarina se guia pelo tempo de GPU
+   medido e fica no piso de 854x480 sob emulação (Lichii 99ac3d5, descrito pelo usuário, não li o commit).
+   Que tempo de GPU e de frame o jogo deve observar, e isso pede um contrato próprio ou cabe no de
+   apresentação (seção 2.2)? Sem desenho ainda. Onde este fork produz esses tempos está localizado em
+   `docs/gpu-contract-inventory.md`, seção 7 (pendência P1).
 
 ## 10. Revisões: o que mudou e por quê
 
@@ -338,17 +343,22 @@ não reproduzida):
 | b6706b0 | `WaitIfEqual64` (arbitragem tipo 3) no kernel | Serviços/kernel | Continua por jogo, como esperado |
 | 9e33027 | Primeira escrita: argumentos de draw de 4 palavras em página nova, lidos antes de o compute rodar; contornado esperando escritores só em entradas de até 8 palavras | L1/L2 | Coberto pelo protocolo de dependências, sem limiar de tamanho (é o contraexemplo da revisão 2, item 2, num jogo real) |
 | b13c4c1 | Escrita da CPU ao lado de bytes da GPU na mesma página; o rastreio por página perdia os bytes da GPU | L1 | Coberto pela autoridade por faixas exatas (3.2), não por página |
-| 3165a2b (#103) | Desempenho da correção anterior (Ocarina: thread de trás esperando 60% do tempo) | L1 | O mesmo item: com faixas exatas, a escrita da CPU vai ao buffer sem download |
-| 15126fb | Downloads pendentes da mesma faixa se confundindo (device lost) | L1 | Coberto pelas transferências com faixas e versão próprias (3.2) |
+| 3165a2b (#103) | Desempenho da correção anterior (Ocarina: thread de trás esperando 60% do tempo) | L1 | O mesmo item: com faixas exatas, a escrita da CPU vai ao buffer sem download. Agora também fonte do caso `pending_download_vs_cpu_write` do harness (download antigo pendente contra escrita nova da CPU) |
+| b8c812b | Gathers do upscaler 1080p do Ocarina (descrito pelo usuário; não li o commit) | L0 | Continua por jogo, como esperado; **fonte para o corpus de shaders** |
+| 9feec26 | Espera de eventos `MWAITX` no host (descrito pelo usuário; não li o commit) | Infraestrutura | Não é por jogo: é infraestrutura do host, fora das camadas de coerência |
+| 99ac3d5 | Patch de executável embutido, por título e build id, que desliga a resolução dinâmica (descrito pelo usuário; não li o commit) | L5 (patches/plugins) | **Exemplo para a camada de patches/plugins** (3.6): código por título, desligável, com log. Não prova nada de coerência nem de sincronização. Ver a pergunta 6 da seção 9 |
+| 15126fb | Downloads pendentes da mesma faixa se confundindo (device lost) | L1 | Coberto pelas transferências com faixas e versão próprias (3.2); fonte do caso `pending_download_single_set` do harness (um conjunto por download) |
 | 92a1a0f | Draws com contagens de lixo quando o compute produtor foi rejeitado | Princípio 4 | Vira regra geral: consumidor de produtor rejeitado falha fechado |
 
-Resumo: de 12 commits, 7 são o trabalho esperado (ISA e kernel) e 5 são contornos de coerência e ordem que
-esta arquitetura pretende tornar desnecessários. "Pretende": nada disso está implementado, e o protocolo
+Resumo: de 15 commits, 8 são o trabalho esperado (ISA, kernel e o corpus de shaders), 1 é infraestrutura do
+host, 1 é um patch por título (exemplo da L5) e 5 são contornos de coerência e ordem que esta arquitetura
+pretende tornar desnecessários. "Pretende": nada disso está implementado, e o protocolo
 ainda tem perguntas abertas (seção 9 e `docs/gpu-produced-data-plan.md`, seção 7).
 
 Este fork: o `WriteMemory` daqui não baixa a página (`buffer_cache.h:132-138`), então o b13c4c1 não se
-aplica como está; falta verificar se o upload de páginas marcadas pela CPU sobrescreve bytes da GPU no
-mesmo buffer. Esse é o caso dirigido "escrita parcial de página" do outro plano.
+aplica como está. O upload de páginas marcadas pela CPU **não** sobrescreve bytes da GPU no mesmo buffer
+(`SynchronizeBuffer` subtrai as faixas exatas, `buffer_cache.h:1993-2000`; resposta e ressalvas em
+`docs/gpu-contract-inventory.md`, 4.3). Esse é o caso dirigido "escrita parcial de página" do outro plano.
 
 ## 12. Proteção antecipada
 

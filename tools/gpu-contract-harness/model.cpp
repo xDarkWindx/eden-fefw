@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -35,6 +36,10 @@ const char* ScheduleName(Schedule s) {
         return "eager";
     }
     return "?";
+}
+
+const char* HostModeName(HostMode m) {
+    return m == HostMode::Early ? "early" : "deferred";
 }
 
 const char* FailureKindName(FailureKind kind) {
@@ -132,7 +137,18 @@ private:
     std::atomic<std::size_t> tail_{0};
 };
 
-enum class RingKind { None, Produce, Marker, SyncptIncr, SemRelease, Copy, FetchMarker, Stop };
+enum class RingKind {
+    None,
+    Produce,
+    Marker,
+    SyncptIncr,
+    SemRelease,
+    Copy,
+    FetchMarker,
+    NoteRead, // the guest CPU read these words (they are worth downloading)
+    Fence,    // a fence: queue the download of the GPU written, CPU read words
+    Stop
+};
 
 struct RingItem {
     RingKind kind = RingKind::None;
@@ -146,7 +162,16 @@ struct RingItem {
     std::vector<std::uint32_t> included;
 };
 
-enum class GpuKind { None, Write, Copy, SyncptIncr, SemRelease, Stop };
+enum class GpuKind { None, Write, Copy, SyncptIncr, SemRelease, Download, Stop };
+
+// One queued download: the words copied GPU -> staging when the fence's copy executes, and
+// applied to guest memory when the fence completes. `live` says which words are still wanted:
+// a CPU write over a word cancels it.
+struct Download {
+    std::vector<std::uint32_t> words; // sorted, unique
+    std::vector<Word> staged;
+    std::vector<std::uint8_t> live;
+};
 
 struct GpuCmd {
     GpuKind kind = GpuKind::None;
@@ -156,6 +181,7 @@ struct GpuCmd {
     std::vector<std::uint32_t> phys; // Write: one address per value
     std::vector<Word> values;
     std::shared_ptr<Transfer> transfer;
+    std::shared_ptr<Download> download;
 };
 
 class Jitter {
@@ -192,6 +218,7 @@ struct ChannelState {
     bool waiting = false;
     bool suspended = false;
     bool continued = false;
+    OpKind parked_kind = OpKind::Wfi; // the acquire the channel is parked on, when it is
     Clock::time_point wait_start{};
     std::vector<Dependency> new_dependencies;
 };
@@ -222,6 +249,15 @@ private:
     Model& m_;
 };
 
+class ModelDirect final : public contracts::DirectHostRead {
+public:
+    explicit ModelDirect(Model& m) : m_{m} {}
+    std::vector<Word> ReadHostDirect(const std::vector<std::uint32_t>& phys) override;
+
+private:
+    Model& m_;
+};
+
 class ModelBack final : public contracts::BackProgress {
 public:
     explicit ModelBack(Model& m) : m_{m} {}
@@ -234,14 +270,17 @@ private:
 class Model {
 public:
     Model(const Case& c, const contracts::VisibilityRule& rule, Schedule schedule,
-          std::uint64_t seed)
-        : case_{c}, rule_{rule}, schedule_{schedule}, knobs_{c.knobs}, seed_{seed},
-          front_jitter_{seed * 3 + 1}, memory_{*this}, back_progress_{*this},
-          consumer_{rule, memory_, back_progress_, c.knobs.honor_valid_until} {
+          HostMode host_mode, std::uint64_t seed)
+        : case_{c}, rule_{rule}, schedule_{schedule}, host_mode_{host_mode}, knobs_{c.knobs},
+          seed_{seed}, front_jitter_{seed * 3 + 1}, memory_{*this}, back_progress_{*this},
+          direct_{*this},
+          consumer_{rule, memory_, back_progress_, c.knobs.honor_valid_until,
+                    c.knobs.trust_syncpoint_as_ready ? &direct_ : nullptr} {
         guest_.resize(kWords);
         host_.resize(kWords);
         cpu_dirty_.assign(kWords, 0);
         gpu_modified_.assign(kWords, 0);
+        cpu_read_.assign(kWords, 0);
         for (std::uint32_t pa = 0; pa < kWords; ++pa) {
             guest_[pa] = Original(pa);
             host_[pa] = Original(pa);
@@ -316,6 +355,15 @@ public:
         while (back_pos_.load(std::memory_order_acquire) < position && !Hung()) {
             std::this_thread::yield();
         }
+    }
+
+    std::vector<Word> ReadHostDirect(const std::vector<std::uint32_t>& phys) {
+        std::lock_guard lock{host_mutex_};
+        std::vector<Word> out(phys.size());
+        for (std::size_t i = 0; i < phys.size(); ++i) {
+            out[i] = host_[phys[i]];
+        }
+        return out;
     }
 
     std::shared_ptr<Transfer> Request(const std::vector<PhysRange>& covered) {
@@ -512,7 +560,8 @@ private:
             return true;
         case OpKind::SyncptIncr: {
             // Fast signals the guest value before the GPU gets there (SignalFenceCoalesced,
-            // IncrementGuest); the host value follows at GPU completion (IncrementHost).
+            // IncrementGuest). The host value (IncrementHost) follows when the back thread
+            // records the increment (host-early) or when the GPU executes it (host-deferred).
             guest_syncpoint_[op.index].fetch_add(1, std::memory_order_acq_rel);
             RingItem item;
             item.kind = RingKind::SyncptIncr;
@@ -532,6 +581,13 @@ private:
         case OpKind::SemAcquire: {
             std::string why;
             if (DependencySatisfied(op, &why)) {
+                if (op.kind == OpKind::SyncptAcquire && host_mode_ == HostMode::Early &&
+                    gpu_executed_.load(std::memory_order_acquire) <
+                        gpu_enqueued_.load(std::memory_order_acquire)) {
+                    // The syncpoint is satisfied while the GPU has not executed what the
+                    // back thread recorded: order is proven, completion is not.
+                    result_.syncpoint_ahead_of_gpu = true;
+                }
                 if (ch.suspended) {
                     result_.suspend_diagnostic += " [resumed later: " + why + "]";
                     ch.suspended = false;
@@ -540,6 +596,7 @@ private:
                 PassDependency(ch, op);
                 return true;
             }
+            ch.parked_kind = op.kind;
             if (!ch.waiting) {
                 ch.waiting = true;
                 ch.wait_start = Clock::now();
@@ -589,11 +646,19 @@ private:
             }
             {
                 std::lock_guard lock{guest_mutex_};
+                std::lock_guard dl{dl_mutex_};
                 for (std::size_t i = 0; i < phys.size(); ++i) {
                     guest_[phys[i]] = op.values[i];
                     if (held.entries.empty()) {
                         cpu_dirty_[phys[i]] = 1;
+                        // The write supersedes what the GPU wrote there (WriteMemory subtracts
+                        // the written range from gpu_modified_ranges); a held write does it
+                        // when it is applied, here when it is uploaded.
+                        gpu_modified_[phys[i]] = 0;
                     }
+                }
+                if (knobs_.cancel_pending_downloads) {
+                    CancelPendingDownloadsLocked(phys);
                 }
             }
             for (std::uint32_t page = op.pa / kPageWords;
@@ -637,8 +702,89 @@ private:
         case OpKind::Fetch:
             DoFetch(channel, ch, op);
             return true;
+        case OpKind::CpuRead: {
+            RingItem item;
+            item.kind = RingKind::NoteRead;
+            std::vector<std::uint32_t> phys(op.len);
+            for (std::uint32_t i = 0; i < op.len; ++i) {
+                phys[i] = op.pa + i;
+            }
+            item.ranges = Coalesce(phys);
+            Push(std::move(item));
+            return true;
+        }
+        case OpKind::Fence: {
+            RingItem item;
+            item.kind = RingKind::Fence;
+            Push(std::move(item));
+            return true;
+        }
+        case OpKind::WaitBack:
+            WaitBackPassed(tail_seq_);
+            return true;
+        case OpKind::WaitDownloads:
+            WaitBackPassed(tail_seq_);
+            while (downloads_applied_.load(std::memory_order_acquire) <
+                       downloads_queued_.load(std::memory_order_acquire) &&
+                   !Hung()) {
+                RaiseGpu(tail_seq_);
+                std::this_thread::yield();
+            }
+            return true;
+        case OpKind::CheckGuest: {
+            std::lock_guard lock{guest_mutex_};
+            for (std::size_t i = 0; i < op.expected.size(); ++i) {
+                if (guest_[op.pa + i] != op.expected[i]) {
+                    std::ostringstream s;
+                    s << "guest memory word " << (op.pa + i) << ": got 0x" << std::hex
+                      << guest_[op.pa + i] << ", expected 0x" << op.expected[i] << std::dec;
+                    Fail(FailureKind::WordMismatch, s.str());
+                    break;
+                }
+            }
+            return true;
+        }
+        case OpKind::CheckHost: {
+            WaitBackPassed(tail_seq_);
+            while (gpu_executed_.load(std::memory_order_acquire) <
+                       gpu_enqueued_.load(std::memory_order_acquire) &&
+                   !Hung()) {
+                RaiseGpu(tail_seq_);
+                std::this_thread::yield();
+            }
+            std::lock_guard lock{host_mutex_};
+            for (std::size_t i = 0; i < op.expected.size(); ++i) {
+                if (host_[op.pa + i] != op.expected[i]) {
+                    std::ostringstream s;
+                    s << "host buffer word " << (op.pa + i) << ": got 0x" << std::hex
+                      << host_[op.pa + i] << ", expected 0x" << op.expected[i] << std::dec;
+                    Fail(FailureKind::WordMismatch, s.str());
+                    break;
+                }
+            }
+            return true;
+        }
         }
         return true;
+    }
+
+    // A CPU write over a word cancels the pending downloads of it: the old GPU data must not
+    // land over the new bytes (ClearDownload, buffer_cache.h:209-216). Caller holds guest_mutex_
+    // and dl_mutex_.
+    void CancelPendingDownloadsLocked(const std::vector<std::uint32_t>& phys) {
+        for (auto& d : pending_downloads_) {
+            for (std::uint32_t w : phys) {
+                const auto it = std::lower_bound(d->words.begin(), d->words.end(), w);
+                if (it != d->words.end() && *it == w) {
+                    d->live[static_cast<std::size_t>(it - d->words.begin())] = 0;
+                }
+            }
+        }
+        if (knobs_.single_pending_set) {
+            for (std::uint32_t w : phys) {
+                shared_pending_.erase(w);
+            }
+        }
     }
 
     void DoFetch(std::uint32_t channel, ChannelState& ch, const Op& op) {
@@ -747,8 +893,22 @@ private:
                 // Every runnable channel is parked: the satisfier may only be waiting for
                 // back or GPU progress, so let them run everything pushed so far. A parked
                 // channel never blocks the others; they already ran above.
+                // The GPU is only let run when something parked can depend on it: a semaphore
+                // (the GPU releases it), a syncpoint in host-deferred mode (the GPU raises
+                // the host value), or when everything left is suspended. In host-early mode a
+                // syncpoint needs only the back thread, so the GPU keeps lagging.
+                bool gpu_needed = all_remaining_suspended;
+                for (const ChannelState& parked : channels_) {
+                    if (!parked.done && (parked.parked_kind == OpKind::SemAcquire ||
+                                         (parked.parked_kind == OpKind::SyncptAcquire &&
+                                          host_mode_ == HostMode::Deferred))) {
+                        gpu_needed = true;
+                    }
+                }
                 RaiseBack(tail_seq_);
-                RaiseGpu(tail_seq_);
+                if (gpu_needed) {
+                    RaiseGpu(tail_seq_);
+                }
                 if (all_remaining_suspended && Idle()) {
                     return; // nothing left that could ever satisfy them
                 }
@@ -779,26 +939,30 @@ private:
         GpuCmd cmd;
         cmd.kind = GpuKind::Write;
         cmd.seq = seq;
-        std::lock_guard lock{guest_mutex_};
-        for (const PhysRange& r : ranges) {
-            for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
-                if (!cpu_dirty_[pa]) {
-                    continue;
-                }
-                std::uint32_t begin = pa;
-                std::uint32_t end = pa + 1;
-                if (knobs_.page_granular_upload) {
-                    begin = pa / kPageWords * kPageWords;
-                    end = begin + kPageWords;
-                }
-                for (std::uint32_t a = begin; a < end; ++a) {
-                    cmd.phys.push_back(a);
-                    cmd.values.push_back(guest_[a]);
-                    cpu_dirty_[a] = 0;
-                    gpu_modified_[a] = 0; // CPU data supersedes what the GPU wrote there
+        {
+            std::lock_guard lock{guest_mutex_};
+            std::lock_guard dl{dl_mutex_};
+            for (const PhysRange& r : ranges) {
+                for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
+                    if (!cpu_dirty_[pa]) {
+                        continue;
+                    }
+                    std::uint32_t begin = pa;
+                    std::uint32_t end = pa + 1;
+                    if (knobs_.page_granular_upload) {
+                        begin = pa / kPageWords * kPageWords;
+                        end = begin + kPageWords;
+                    }
+                    for (std::uint32_t a = begin; a < end; ++a) {
+                        cmd.phys.push_back(a);
+                        cmd.values.push_back(guest_[a]);
+                        cpu_dirty_[a] = 0;
+                        gpu_modified_[a] = 0; // CPU data supersedes what the GPU wrote there
+                    }
                 }
             }
         }
+        // Pushed with no lock held: the GPU thread takes both to apply downloads.
         if (!cmd.phys.empty()) {
             PushGpu(std::move(cmd));
         }
@@ -823,15 +987,18 @@ private:
                 GpuCmd cmd;
                 cmd.kind = GpuKind::Write;
                 cmd.seq = seq;
-                for (const PhysRange& r : item->ranges) {
-                    for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
-                        cmd.phys.push_back(pa);
-                        gpu_modified_[pa] = 1;
-                    }
-                    for (std::uint32_t page = r.begin / kPageWords;
-                         page <= (r.end - 1) / kPageWords; ++page) {
-                        gpu_written_[page].store(1, std::memory_order_release);
-                        page_epoch_[page].fetch_add(1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard dl{dl_mutex_};
+                    for (const PhysRange& r : item->ranges) {
+                        for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
+                            cmd.phys.push_back(pa);
+                            gpu_modified_[pa] = 1;
+                        }
+                        for (std::uint32_t page = r.begin / kPageWords;
+                             page <= (r.end - 1) / kPageWords; ++page) {
+                            gpu_written_[page].store(1, std::memory_order_release);
+                            page_epoch_[page].fetch_add(1, std::memory_order_acq_rel);
+                        }
                     }
                 }
                 cmd.values = std::move(item->values);
@@ -843,6 +1010,12 @@ private:
             case RingKind::Marker:
                 break;
             case RingKind::SyncptIncr: {
+                if (host_mode_ == HostMode::Early) {
+                    // The SignalFence callback runs when the fence is signalled, that is, now
+                    // that the back thread records the increment: before the GPU gets there.
+                    host_syncpoint_[item->index].fetch_add(1, std::memory_order_acq_rel);
+                    break;
+                }
                 GpuCmd cmd;
                 cmd.kind = GpuKind::SyncptIncr;
                 cmd.seq = seq;
@@ -862,6 +1035,7 @@ private:
             case RingKind::Copy: {
                 Transfer& t = *item->transfer;
                 UploadCpuWrites(seq, t.requested);
+                std::unique_lock<std::mutex> dl{dl_mutex_};
                 // The owner decides the exact ranges: requested words the GPU wrote.
                 for (const PhysRange& r : t.requested) {
                     for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
@@ -880,11 +1054,54 @@ private:
                         t.included_producers.push_back(p.id);
                     }
                 }
+                dl.unlock();
                 GpuCmd cmd;
                 cmd.kind = GpuKind::Copy;
                 cmd.seq = seq;
                 cmd.transfer = item->transfer;
                 PushGpu(std::move(cmd));
+                break;
+            }
+            case RingKind::NoteRead: {
+                std::lock_guard dl{dl_mutex_};
+                for (const PhysRange& r : item->ranges) {
+                    for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
+                        cpu_read_[pa] = 1;
+                    }
+                }
+                break;
+            }
+            case RingKind::Fence: {
+                // Download at the fence only the words the GPU wrote and the CPU reads
+                // (buffer_cache_base.h:552-562 for Switch 2 channels).
+                std::shared_ptr<Download> download;
+                {
+                    std::lock_guard dl{dl_mutex_};
+                    std::vector<std::uint32_t> words;
+                    for (std::uint32_t pa = 0; pa < kWords; ++pa) {
+                        if (gpu_modified_[pa] && cpu_read_[pa]) {
+                            words.push_back(pa);
+                        }
+                    }
+                    if (!words.empty()) {
+                        download = std::make_shared<Download>();
+                        download->staged.assign(words.size(), 0);
+                        download->live.assign(words.size(), 1);
+                        if (knobs_.single_pending_set) {
+                            shared_pending_.insert(words.begin(), words.end());
+                        }
+                        download->words = std::move(words);
+                        pending_downloads_.push_back(download);
+                        downloads_queued_.fetch_add(1, std::memory_order_acq_rel);
+                    }
+                }
+                if (download) {
+                    GpuCmd cmd;
+                    cmd.kind = GpuKind::Download;
+                    cmd.seq = seq;
+                    cmd.download = std::move(download);
+                    PushGpu(std::move(cmd));
+                }
                 break;
             }
             case RingKind::FetchMarker:
@@ -937,17 +1154,58 @@ private:
             }
             const GpuKind kind = cmd->kind;
             switch (kind) {
-            case GpuKind::Write:
+            case GpuKind::Write: {
+                std::lock_guard lock{host_mutex_};
                 for (std::size_t i = 0; i < cmd->phys.size(); ++i) {
                     host_[cmd->phys[i]] = cmd->values[i];
                 }
                 break;
+            }
             case GpuKind::Copy: {
                 Transfer& t = *cmd->transfer;
-                for (const PhysRange& r : t.ranges) {
-                    t.words.emplace_back(host_.begin() + r.begin, host_.begin() + r.end);
+                {
+                    std::lock_guard lock{host_mutex_};
+                    for (const PhysRange& r : t.ranges) {
+                        t.words.emplace_back(host_.begin() + r.begin, host_.begin() + r.end);
+                    }
                 }
                 t.completion_fence->signaled.store(true, std::memory_order_release);
+                break;
+            }
+            case GpuKind::Download: {
+                Download& d = *cmd->download;
+                {
+                    // GPU -> staging, ordered in the stream after every earlier write.
+                    std::lock_guard lock{host_mutex_};
+                    for (std::size_t i = 0; i < d.words.size(); ++i) {
+                        d.staged[i] = host_[d.words[i]];
+                    }
+                }
+                // The fence completes some time after the copy; the CPU may write meanwhile.
+                if (schedule_ == Schedule::Random) {
+                    jitter.Maybe();
+                }
+                {
+                    std::lock_guard lock{guest_mutex_};
+                    std::lock_guard dl{dl_mutex_};
+                    for (std::size_t i = 0; i < d.words.size(); ++i) {
+                        // Single set (before 15126fb): whichever download completes first
+                        // consumes the pending entry of the word, old or new.
+                        const bool live = knobs_.single_pending_set
+                                              ? shared_pending_.erase(d.words[i]) > 0
+                                              : d.live[i] != 0;
+                        if (live) {
+                            guest_[d.words[i]] = d.staged[i];
+                        }
+                    }
+                    pending_downloads_.erase(std::remove_if(pending_downloads_.begin(),
+                                                            pending_downloads_.end(),
+                                                            [&](const auto& p) {
+                                                                return p.get() == &d;
+                                                            }),
+                                             pending_downloads_.end());
+                }
+                downloads_applied_.fetch_add(1, std::memory_order_acq_rel);
                 break;
             }
             case GpuKind::SyncptIncr:
@@ -999,11 +1257,13 @@ private:
     const Case& case_;
     const contracts::VisibilityRule& rule_;
     const Schedule schedule_;
+    const HostMode host_mode_;
     const ModelKnobs knobs_;
     const std::uint64_t seed_;
     Jitter front_jitter_;
     ModelMemory memory_;
     ModelBack back_progress_;
+    ModelDirect direct_;
     contracts::ListFetchConsumer consumer_;
     Clock::time_point deadline_;
 
@@ -1013,8 +1273,21 @@ private:
     std::vector<Word> guest_;
     std::vector<std::uint8_t> cpu_dirty_;
 
-    std::vector<Word> host_;                 // GPU thread only
-    std::vector<std::uint8_t> gpu_modified_; // back thread only (exact ranges, owner)
+    // The host buffer: written by the GPU thread, read by it and, for the negative control and
+    // the final check, by the front under the same lock.
+    std::mutex host_mutex_;
+    std::vector<Word> host_;
+
+    // The owner's exact ranges and the downloads, shared by the back thread (records, queues),
+    // the GPU thread (applies) and the front (CPU writes cancel): the buffer cache's mutex.
+    // Lock order: guest_mutex_, then dl_mutex_; host_mutex_ is a leaf.
+    std::mutex dl_mutex_;
+    std::vector<std::uint8_t> gpu_modified_;
+    std::vector<std::uint8_t> cpu_read_;
+    std::vector<std::shared_ptr<Download>> pending_downloads_;
+    std::set<std::uint32_t> shared_pending_;
+    std::atomic<std::uint64_t> downloads_queued_{0};
+    std::atomic<std::uint64_t> downloads_applied_{0};
 
     // Page filter: set by the back thread when it records a GPU write.
     std::array<std::atomic<std::uint8_t>, kPages> gpu_written_{};
@@ -1067,12 +1340,15 @@ bool ModelMemory::IsValid(const Transfer& transfer) const {
 void ModelBack::WaitBackPassed(Seq position) {
     m_.WaitBackPassed(position);
 }
+std::vector<Word> ModelDirect::ReadHostDirect(const std::vector<std::uint32_t>& phys) {
+    return m_.ReadHostDirect(phys);
+}
 
 } // namespace
 
 RunResult RunCase(const Case& c, const contracts::VisibilityRule& rule, Schedule schedule,
-                  std::uint64_t seed) {
-    auto model = std::make_unique<Model>(c, rule, schedule, seed);
+                  HostMode host_mode, std::uint64_t seed) {
+    auto model = std::make_unique<Model>(c, rule, schedule, host_mode, seed);
     return model->Run();
 }
 

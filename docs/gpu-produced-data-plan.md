@@ -19,6 +19,8 @@ dirigidos.
 tarefa T1) e a revisão dele. O que mudou está na seção 11; as seções 4.2, 5 e 7 foram corrigidas no lugar.
 A principal mudança: `exact-drain` passa a ser a regra exata e o padrão do consumidor; a regra "depois de
 dependência satisfeita" vira otimização condicionada, desligada por padrão.
+Atualização (mesma data): o item 2 da 4.2 separa o valor do syncpoint, o processamento do produtor pela
+trás e a conclusão na GPU, e corrige quando o host sobe (seção 11, linha 9).
 
 Este plano é o primeiro caso concreto de `docs/architecture-plan.md`. O desenho daqui segue aquele.
 
@@ -215,11 +217,24 @@ esta é uma escolha, documentada. **Revisão 3:** com essa definição, a regra 
    - Acquire de semáforo: já é satisfeito hoje (a frente drena e confere o valor).
    - Acquire de syncpoint: **não é implementado** (`WaitFence` comentado, `puller.cpp:126-132`; só agenda
      `ReleaseFences`). Para servir de dependência, precisa virar uma espera real pela condição
-     (syncpoint ≥ valor), usando o valor que sobe na conclusão na GPU (`IncrementHost` na fence,
-     `fence_manager.h:142-146`). O valor que o jogo vê sobe antes (`IncrementGuest`, `:143`). Riscos:
-     incrementos vindos de outros clientes do host1x, valores que nunca chegam e custo no FE. Ao estourar o
-     limite de tempo, a dependência continua não satisfeita: o canal fica suspenso com diagnóstico
-     (`docs/architecture-plan.md`, 12.2 c); seguir sem ela é opção explícita de compatibilidade.
+     (syncpoint ≥ valor). **Três coisas que não podem ser confundidas (revisão 3, item 9 da seção 11):**
+     1. **O valor observado.** O guest sobe primeiro (`IncrementGuest`, `fence_manager.h:143`) e é o que o
+        jogo, o decodificador e as ações do composite veem (`memory_manager.cpp:281-285`,
+        `native_video_decoder.cpp:127,603`, `gpu.cpp:332-335`). O host (`IncrementHost`) é o que o evento
+        de espera do nvhost usa (`nvhost_ctrl.cpp:152,202`).
+     2. **O processamento do produtor pela thread de trás.** A instrução de incremento roda na trás, na
+        ordem do fluxo (`puller.cpp:133-138`): quando o incremento é processado, tudo o que veio antes dele
+        já foi gravado.
+     3. **A conclusão real do trabalho na GPU.** Só aqui o trabalho terminou.
+     **Quando o host sobe (verificado):** `IncrementHost` é o callback de `SignalFence`
+     (`fence_manager.h:144-145`). Com o comportamento de fence `Default` e o nível Fast, o callback roda **na
+     sinalização**, logo depois de `QueueFence` (`:128-130`): o host sobe antes da conclusão. Só com fences
+     adiadas (nível High, ou `GPU Fence Behavior` `Balanced` ou `Accurate`, `:113`) o callback espera a
+     fence completar (`:123-125`, `:216-239`) e o host sobe na conclusão. **Um acquire satisfeito pelo valor
+     do host prova ordem (2), não conclusão (3).** Riscos: incrementos vindos de outros clientes do host1x,
+     valores que nunca chegam e custo no FE. Ao estourar o limite de tempo, a dependência continua não
+     satisfeita: o canal fica suspenso com diagnóstico (`docs/architecture-plan.md`, 12.2 c); seguir sem ela
+     é opção explícita de compatibilidade.
    - WFI: grava um evento no fluxo do Vulkan (`vk_rasterizer.cpp:1125-1145`); serve de marco de ordem, não
      de conclusão.
    - Bit de sync da entrada: drena só com "Sync Memory Operations"; sem isso, é só marco de ordem.
@@ -230,6 +245,17 @@ esta é uma escolha, documentada. **Revisão 3:** com essa definição, a regra 
    cópia (GPU → buffer da entrada, com barreira) nessa posição; a frente lê depois da fence da cópia. Custo:
    uma ida e volta (thread de trás + GPU) por entrada **candidata**. Cópias preservadas na hora do produtor
    (como o 8f1435f do Lichii) são uma otimização posterior, com o mesmo critério de versão.
+   **Regra (revisão 3): a transferência tem conclusão própria.** A conclusão é a fence da cópia ordenada
+   depois do produtor, e a garantia de que os bytes estão prontos **não pode depender da política de
+   callbacks antecipados** (nem do valor do syncpoint, nem do modo de fence). O syncpoint dá a ordem (o
+   produtor está antes da cópia no fluxo); a fence da cópia dá a conclusão. Para um **produtor de outro
+   canal**, o protocolo precisa **identificar qual trabalho satisfaz a dependência** (a instrução de
+   incremento ou o release daquele canal) e garantir que esse trabalho está **antes da cópia no fluxo**;
+   esperar a fence da cópia **não resolve uma dependência ausente**, porque a cópia fica na posição da
+   entrada, e um produtor depois dessa posição não está nela (`other_channel_missing_dependency`).
+   **Política de fence:** mudar as fences globalmente para `Accurate` **não é a solução**: não cria a
+   dependência que falta, e muda o custo de todos os jogos. Qualquer mudança de política de fence é
+   **medida à parte no FE** (orçamento da seção 12.1 do plano de arquitetura), não decidida aqui.
 4. **Publicação:** buffer próprio da entrada, release/acquire. A frente sobrepõe as faixas ao snapshot.
 5. **Entradas retomadas** seguem a mesma regra, em vez da memória atual sem flush. Muda um caminho
    existente: atrás da chave, com contador.
@@ -380,3 +406,6 @@ dele.
 | 6 | Bug do cache (revisão do T1): a validade cobria só as faixas copiadas | Sim. Uma transferência vazia (o filtro não achou nada) ficava válida para sempre, e uma entrada em duas páginas não perdia a validade quando um produtor escrevia na página que o filtro tinha descartado. Com `exact-drain`, `stale_empty_transfer` e `stale_two_pages` falhavam (20/20 no `eager`, 28–37% no aleatório) | `Transfer` separa `requested` (o que foi copiado) de `covered` (a região inteira da entrada no fetch); `valid_until` cobre `covered`, e o contrato lê a validade antes do filtro. Os dois casos passam em todos os escalonamentos |
 | 7 | Negativos só diziam "falhou", sem dizer por quê | Sim | Negativos tipados: cada um declara o tipo de falha (`WordMismatch`, `DependencyViolated`...), e qualquer outro tipo reprova o teste |
 | 8 | (revisão do T1) Regra por dependências retirada da preferência de padrões; exact-drain como referência; custo não torna exato um caminho potencialmente incorreto | Decisão do usuário e do revisor, sobre o resultado do T1 (`no_dependency`, `producer_after_wait_new_page`) | 4.2 (chave e padrão) e `docs/architecture-plan.md` 12.3 e 13.2 alinhados |
+| 9 | (revisão do T1) O valor host do syncpoint não sobe na conclusão da GPU em Fast com fences `Default`: o item 2 da 4.2 dizia que sobe na conclusão (`fence_manager.h:142-146`) e confundia valor observado, processamento pela trás e conclusão | Sim, `fence_manager.h:123-130` (callback na sinalização) e `:113` (adiado só em High, `Balanced` ou `Accurate`). Nos modos adiados o callback espera a fence (`:123-125`) | 4.2, itens 2 e 3: as três coisas separadas; um acquire pelo host prova ordem, não conclusão; a transferência tem conclusão própria (a fence da cópia); produtor de outro canal exige dependência identificada; política de fence medida à parte. Harness: dois modos de incremento do host (`host-early`, `host-deferred`), todos os casos nos dois |
+| 10 | O harness não tinha o produtor de outro canal sem dependência nem o syncpoint que chega antes da GPU | Sim. `syncpoint_before_gpu` (passa nos dois modos: a entrada espera a fence da própria cópia), `syncpoint_trusted_as_ready` (negativo: falha com `WordMismatch` em `host-early`, passa em `host-deferred`) e `other_channel_missing_dependency` (falha com `WordMismatch` com as duas regras: esperar a cópia não substitui a dependência) | Requisito do consumidor: não ler bytes por causa de um syncpoint; conclusão pela fence da cópia |
+| 11 | O harness não tinha downloads da GPU para a memória do jogo (Lichii 3165a2b e 15126fb) | Sim. `pending_download_vs_cpu_write` passa (escrita nova sobrevive; o upload seguinte leva os bytes novos) em ordens em que o download conclui antes e depois da escrita. Negativos: sem cancelar os pendentes antes da escrita da CPU (`pending_download_no_cancel`, `WordMismatch`); com um conjunto único de faixas pendentes (`pending_download_single_set`, `WordMismatch`) | Requisitos do mecanismo de downloads: cancelar o pendente na escrita da CPU (`ClearDownload`, `buffer_cache.h:209-216`) e um conjunto por download. Fora do modelo: a janela da escrita **segurada** (README do harness) |

@@ -14,7 +14,7 @@ HARNESS_OUT=/algum/dir tools/gpu-contract-harness/run.sh
 O `run.sh` compila três vezes (`-O2`; `-fsanitize=thread`; `-fsanitize=address,undefined`), com
 `-Wall -Wextra -Werror`, e roda cada uma; os builds com sanitizer rodam um décimo das repetições e
 param no primeiro aviso. Sai com código diferente de zero se alguma expectativa não for cumprida ou se
-um sanitizer reclamar. O binário aceita `--random N --forced N --seed S --case NOME -v` (`-v` mostra os
+um sanitizer reclamar. O binário aceita `--random N --forced N --seed S --case NOME --host early|deferred|both -v` (`-v` mostra os
 diagnósticos de suspensão e as escritas perdidas).
 
 ## Arquivos
@@ -31,16 +31,37 @@ diagnósticos de suspensão e as escritas perdidas).
   do ring; a "GPU" executa os comandos gravados com atraso próprio. A CPU do jogo **não** é uma thread: as
   escritas dela acontecem na frente, em pontos fixos do roteiro.
 - **Memórias:** memória do jogo (o que a CPU vê e de onde sai o snapshot) e buffer do host (o que a GPU
-  escreveu). A GPU só escreve no buffer do host; nada é baixado para a memória do jogo.
+  escreveu). A GPU escreve no buffer do host e, nos downloads (abaixo), devolve à memória do jogo só o que a
+  CPU lê.
 - **Snapshot na submissão** (`Submit`), lido pelo mapeamento da hora.
-- **Conclusão antes da hora:** `SyncptIncr` sobe o valor do guest na frente (`IncrementGuest`, como o
-  `SignalFenceCoalesced` em Fast) e o do host só quando a GPU executa (`IncrementHost`).
+- **Três coisas que o syncpoint mistura** (`docs/gpu-produced-data-plan.md`, 4.2): o valor observado
+  (guest e host), o processamento do produtor pela thread de trás e a conclusão real na GPU. O guest sobe na
+  frente, na instrução de incremento (`IncrementGuest`, como `SignalFenceCoalesced` em Fast). O host sobe de
+  um de dois jeitos, e **todos os casos rodam nos dois** (coluna `host` da tabela, `--host early|deferred`):
+  - **`host-early`:** a thread de trás sobe o host quando grava o incremento, antes de a GPU chegar lá. É Fast
+    com fences `Default`: `IncrementHost` é o callback do `SignalFence` e roda na sinalização
+    (`fence_manager.h:128-130`). O acquire satisfeito prova **ordem** (a trás já gravou tudo que veio antes),
+    não conclusão.
+  - **`host-deferred`:** a GPU sobe o host quando executa o incremento. É o nível High ou `GPU Fence Behavior`
+    `Balanced`/`Accurate`: o callback espera a fence. O acquire satisfeito prova ordem **e** conclusão.
+  Nos escalonamentos que atrasam a GPU (`gpu-lags`, `both-lag`) a GPU só é liberada quando algo estacionado
+  depende dela (semáforo, syncpoint em `host-deferred`), então em `host-early` o acquire passa com a GPU
+  parada; o resultado conta isso (`syncpoint ahead of the GPU`, visível com `-v`).
 - **Filtro:** 1 bit por página de 4 KiB, ligado pela thread de trás quando grava um produtor. O dono (thread
   de trás) guarda as faixas exatas escritas pela GPU e decide as faixas da transferência.
 - **Transferência:** a frente passa ao contrato de memória a região inteira da entrada (`covered`, todas as
   palavras físicas no momento da busca); o contrato aplica o filtro e manda copiar só as páginas marcadas
   (`requested`); o pedido entra no ring na posição da entrada; a thread de trás sobe antes as escritas da CPU pendentes nessas faixas (palavra a
   palavra) e grava a cópia; a GPU copia e sinaliza a fence; a frente sobrepõe ao snapshot.
+- **Downloads GPU → memória do jogo.** O jogo lê faixas (`CpuRead`); num `Fence` a thread de trás enfileira
+  um download só das palavras que a GPU escreveu **e** a CPU lê (como nos canais de Switch 2,
+  `buffer_cache_base.h:541-562`): a GPU copia para um staging na posição do fluxo e, depois, a fence conclui
+  e a aplicação grava na memória do jogo. Escrita da CPU sobre uma faixa **cancela** o que está pendente nela
+  (`ClearDownload`, `buffer_cache.h:209-216`) e tira a faixa de `gpu_modified_ranges` (`WriteMemory`,
+  `:132-138`). Cada download tem o seu conjunto de palavras vivas (depois do 15126fb do Lichii). As
+  conferências são `CheckGuest` (memória do jogo) e `CheckHost` (buffer do host, depois de esvaziar trás e GPU).
+  O dono das faixas, o conjunto de downloads e as leituras da CPU ficam sob um mutex (o do buffer cache); a
+  ordem de travas é memória do jogo, depois esse; o buffer do host tem mutex próprio.
 - **Validade:** `valid_until` guarda a época do mapeamento e a soma das épocas de **todas** as páginas de
   `covered`, inclusive as que o filtro descartou (sobem com produtor gravado e escrita da CPU). "A GPU não
   escreveu nada aqui" também é informação e envelhece do mesmo jeito. A validade é lida antes do filtro, e
@@ -105,8 +126,11 @@ Um caso "pass" não pode falhar em nenhum escalonamento. Um negativo declara o *
 | `never_arrives_continue` | igual, com `on_timeout = Continue` | a opção de compatibilidade segue sem a dependência e diz isso |
 | `stale_empty_transfer` | busca sem dados da GPU (transferência vazia em cache), produtor na mesma página, WFI, nova busca | a ausência de dados também perde a validade |
 | `stale_two_pages` | entrada em duas páginas, só uma marcada na primeira busca; produtor na outra, WFI, nova busca | a validade cobre a página que o filtro descartou |
+| `syncpoint_before_gpu` | canal 1 produz e incrementa; canal 0 espera o syncpoint e busca. Em `host-early` guest e host alcançam o valor com a GPU atrasada (o resultado exige que isso tenha acontecido em todas as rodadas `gpu-lags` e `both-lag`) | o syncpoint prova ordem, não conclusão: a entrada vê o produtor porque espera a fence **da própria cópia**, ordenada depois do produtor no fluxo |
+| `other_channel_missing_dependency` | produtor no canal 1, consumidor no canal 0, **nenhuma** dependência entre eles | esperar a cópia não substitui a dependência: a cópia é ordenada na posição do fetch, e o produtor não está antes dela no fluxo. Falha em todo escalonamento, com as duas regras e nos dois modos (`WordMismatch`). É o caso que o protocolo não pode corrigir sozinho: a dependência tem de existir e o protocolo precisa identificar qual trabalho a satisfaz |
+| `pending_download_vs_cpu_write` | P1 escreve 16 palavras que a CPU lê; fence F1 (download D1); a CPU escreve 4 palavras no meio (D1 as perde); P2 escreve as 8 últimas; fence F2 (D2); D1 e D2 concluem; WFI; busca | (Lichii 3165a2b e 15126fb) a escrita nova sobrevive na memória do jogo, o download antigo não a sobrescreve nem consome o novo, e o upload seguinte para o host leva os bytes novos (`CheckGuest`, entrada vista pela busca e `CheckHost`). Ordens adversas: `eager` conclui o download **antes** da escrita; `gpu-lags` e `both-lag` conclui **depois**; o aleatório inclui o meio (entre a cópia para o staging e a aplicação) |
 
-Os dois últimos reproduzem um bug da primeira versão do harness, em que a validade cobria só as faixas
+Os dois `stale_*` reproduzem um bug da primeira versão do harness, em que a validade cobria só as faixas
 copiadas: com `exact-drain` eles falhavam (20/20 no `eager`, 28–37% no aleatório), porque a regra não manda
 esperar quando não há produtor na fila e o consumidor reaproveitava a transferência velha.
 
@@ -118,6 +142,9 @@ Negativos dos mecanismos (cada um desliga uma peça e tem de falhar com as duas 
 | `partial_page_write_page_upload` | upload por palavra (sobe a página inteira) | sempre — `WordMismatch` |
 | `remap_ignore_valid_until` | conferir `valid_until` | sempre — `WordMismatch` |
 | `other_channel_guest_value` | acquire de syncpoint pelo valor do host (usa o do guest) | em todos menos `eager` — `DependencyViolated` |
+| `syncpoint_trusted_as_ready` | esperar a fence da própria cópia (o consumidor lê o buffer do host logo depois do acquire) | **`host-early`:** aleatório, `gpu-lags` e `both-lag` — `WordMismatch`. **`host-deferred`:** passa (o syncpoint também prova conclusão), por isso a expectativa muda com o modo |
+| `pending_download_no_cancel` | cancelar os downloads pendentes antes de a CPU escrever | `gpu-lags`, `both-lag`, aleatório (e parte de `back-lags`) — `WordMismatch`: o download antigo cai por cima da escrita nova. Não em `eager`, onde conclui antes da escrita |
+| `pending_download_single_set` | um conjunto único de faixas pendentes para downloads diferentes da mesma faixa (antes do 15126fb) | `gpu-lags`, `both-lag`, aleatório e parte de `back-lags` — `WordMismatch`: o download antigo consome a entrada do novo, que fica sem aplicar e a memória do jogo termina com os bytes velhos |
 
 `NeverWait` é um controle do harness, não o comportamento atual do emulador: mostra quais casos dependem
 de alguma espera da regra.
@@ -144,6 +171,21 @@ de alguma espera da regra.
 - **Escritas seguradas simplificadas:** segura-se o upload de qualquer escrita da CPU sobre uma entrada
   submetida e não buscada, sem limite de memória nem de tempo, e sem a junção por página do mecanismo real.
 - **Outros clientes do host1x**, incrementos fora de ordem e syncpoints que dão a volta.
+- **Dependência identificada, não só satisfeita.** O modelo exige que o roteiro tenha a dependência entre o
+  produtor e a busca; ele não decide qual trabalho a satisfaz. Esse é o requisito do protocolo
+  (`other_channel_missing_dependency` só mostra o que acontece sem ela). Para produtores de outro canal, o
+  protocolo real precisa associar a dependência ao trabalho que a satisfaz.
+- **Downloads simplificados:** um fence enfileira um download por vez de todas as palavras GPU-escritas e
+  lidas pela CPU, e a aplicação é uma etapa só na thread da "GPU"; não há `async_downloads`, junção de
+  buffers, preflush, `cpu_read_ranges` por página, nem a fila de fences com a thread própria
+  (`fence_manager.h:241-272`). O cancelamento acontece **na hora da escrita da CPU**; no emulador, uma escrita
+  em página com dados da GPU é **segurada** e só avisa os caches quando é aplicada (`OnCPUWrite`,
+  `buffer_cache.h:169-174`; `InlineMemoryImplementation`, `:2107-2108`), então a janela entre a escrita no
+  guest e o cancelamento do download pendente **não** é coberta. Hipótese: um download aplicado nessa janela
+  pode cair sobre os bytes novos (não verificado no emulador).
+- **Os modos de fence são dois, não a política inteira.** `host-early` e `host-deferred` cobrem só quando o
+  valor do host sobe; `Balanced`/`Accurate` também mudam `runtime.Finish()` em DMA e a sincronização em
+  `FindBuffer`, que o modelo não tem.
 - **Falhas da seção 12.2** além do limite de espera: exceções na validação e no efeito, guardas no consumo,
   fuzz de listas e `Abort` não são exercitados. A reavaliação depois de `Suspend` existe no código, mas
   nenhum caso a satisfaz depois.

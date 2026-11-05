@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,16 @@ enum class Schedule {
 };
 const char* ScheduleName(Schedule s);
 
+// When the host value of a syncpoint rises. Fast with the default fence behaviour runs the
+// SignalFence callback (IncrementHost) when the fence is signalled, that is, when the back
+// thread processes the increment (fence_manager.h:123-130). With deferred fences (level High,
+// or GPU Fence Behavior Balanced/Accurate) it runs when the GPU completes the fence.
+enum class HostMode {
+    Early,    // host-early: the back thread raises the host value when it records the increment
+    Deferred, // host-deferred: the GPU raises it when it executes the increment
+};
+const char* HostModeName(HostMode m);
+
 // Mechanisms the model implements correctly by default. Turning one off is how the
 // negative cases prove that the verifier catches that mechanism failing.
 struct ModelKnobs {
@@ -52,6 +63,9 @@ struct ModelKnobs {
     bool page_granular_upload = false;      // upload whole pages instead of the written words
     bool honor_valid_until = true;          // consumer checks Transfer::valid_until
     bool acquire_uses_guest_value = false;  // syncpoint acquire on IncrementGuest, not host
+    bool trust_syncpoint_as_ready = false;  // consumer reads the host buffer after the acquire
+    bool cancel_pending_downloads = true;   // a CPU write cancels pending downloads over it
+    bool single_pending_set = false;        // one pending set for all downloads (pre 15126fb)
 };
 
 enum class OpKind {
@@ -67,6 +81,12 @@ enum class OpKind {
     Remap,         // GPU VA page `page_va` now maps physical page `page_pa`
     Submit,        // entry submitted: snapshot of its words through the current mapping
     Fetch,         // list fetch of entry words [offset, offset + len)
+    CpuRead,       // guest CPU reads physical [pa, pa + len): downloads copy these ranges back
+    Fence,         // fence: queue a GPU -> staging download of the GPU written, CPU read words
+    WaitBack,      // front waits until the back thread has recorded everything pushed so far
+    WaitDownloads, // front waits until every queued download is applied to guest memory
+    CheckGuest,    // guest memory [pa, pa + expected.size()) must equal `expected`
+    CheckHost,     // host buffer [pa, ...) must equal `expected` once everything is drained
 };
 
 struct Op {
@@ -132,6 +152,21 @@ struct Case {
     ModelKnobs knobs{};
     Expect after_satisfied = Expect::MustPass();
     Expect exact_drain = Expect::MustPass();
+    // Overrides for the host-early mode; unset means the same as in host-deferred.
+    std::optional<Expect> early_after_satisfied;
+    std::optional<Expect> early_exact_drain;
+    // host-early only: in the gpu-lags and both-lag schedules the acquire must be satisfied
+    // while the GPU has not executed what was recorded (the case exercises "syncpoint first").
+    bool require_ahead_early = false;
+    Expect ExpectFor(bool after_satisfied_rule, HostMode mode) const {
+        if (mode == HostMode::Early) {
+            const auto& o = after_satisfied_rule ? early_after_satisfied : early_exact_drain;
+            if (o) {
+                return *o;
+            }
+        }
+        return after_satisfied_rule ? after_satisfied : exact_drain;
+    }
     std::vector<std::uint32_t> expect_suspended;   // channels left suspended
     std::vector<std::uint32_t> expect_continued;   // channels that continued after timeout
     std::vector<std::uint32_t> expect_not_fetched; // entries never fetched
@@ -146,9 +181,10 @@ struct RunResult {
     bool suspended = false;
     std::string suspend_diagnostic;
     bool early_completion_observed = false;
+    bool syncpoint_ahead_of_gpu = false; // an acquire passed while the GPU lagged the recording
 };
 
 RunResult RunCase(const Case& c, const contracts::VisibilityRule& rule, Schedule schedule,
-                  std::uint64_t seed);
+                  HostMode host_mode, std::uint64_t seed);
 
 } // namespace harness

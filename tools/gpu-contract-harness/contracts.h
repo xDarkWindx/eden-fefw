@@ -131,6 +131,16 @@ public:
     virtual bool IsValid(const Transfer& transfer) const = 0;
 };
 
+// Harness-only negative control, not part of the contract: a read of the host buffer with no
+// copy and no fence. It models a consumer that takes a satisfied syncpoint as proof that the
+// bytes are ready (see "syncpoint_trusted_as_ready"): a syncpoint proves order, and only a
+// deferred fence also proves completion.
+class DirectHostRead {
+public:
+    virtual ~DirectHostRead() = default;
+    virtual std::vector<Word> ReadHostDirect(const std::vector<std::uint32_t>& phys) = 0;
+};
+
 // Lets the consumer wait for the back thread without knowing how it is scheduled.
 class BackProgress {
 public:
@@ -224,9 +234,12 @@ struct EntryWords {
 
 class ListFetchConsumer {
 public:
+    // `trust_direct`, when set, makes the consumer skip the transfer and its fence and read the
+    // host buffer directly after the visibility rule's wait (negative control only).
     ListFetchConsumer(const VisibilityRule& rule, MemoryContract& memory, BackProgress& back,
-                      bool honor_valid_until = true)
-        : rule_{rule}, memory_{memory}, back_{back}, honor_valid_until_{honor_valid_until} {}
+                      bool honor_valid_until = true, DirectHostRead* trust_direct = nullptr)
+        : rule_{rule}, memory_{memory}, back_{back}, honor_valid_until_{honor_valid_until},
+          trust_direct_{trust_direct} {}
 
     // `snapshot` holds the words captured at submission, `phys` the physical address each
     // of them has now (translated at fetch time).
@@ -236,6 +249,12 @@ public:
         out.plan = rule_.BeforeFetch(ctx);
         if (out.plan.wait_back) {
             back_.WaitBackPassed(out.plan.back_position);
+        }
+
+        if (trust_direct_ != nullptr) {
+            out.words = trust_direct_->ReadHostDirect(phys);
+            out.transfer = std::make_shared<Transfer>();
+            return out;
         }
 
         const Key key{va, static_cast<std::uint32_t>(snapshot.size())};
@@ -285,6 +304,7 @@ private:
     MemoryContract& memory_;
     BackProgress& back_;
     bool honor_valid_until_;
+    DirectHostRead* trust_direct_;
     std::map<Key, std::pair<std::shared_ptr<const Transfer>, std::vector<std::uint32_t>>> cache_;
 };
 

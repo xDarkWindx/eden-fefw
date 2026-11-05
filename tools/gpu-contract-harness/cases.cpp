@@ -120,6 +120,24 @@ Op Fetch(std::uint32_t entry, std::uint32_t offset, const Expected& e) {
     op.expected = e.words;
     return op;
 }
+Op CpuRead(std::uint32_t pa, std::uint32_t len) {
+    Op op{OpKind::CpuRead};
+    op.pa = pa;
+    op.len = len;
+    return op;
+}
+Op CheckGuest(std::uint32_t pa, const Expected& e) {
+    Op op{OpKind::CheckGuest};
+    op.pa = pa;
+    op.expected = e.words;
+    return op;
+}
+Op CheckHost(std::uint32_t pa, std::vector<Word> words) {
+    Op op{OpKind::CheckHost};
+    op.pa = pa;
+    op.expected = std::move(words);
+    return op;
+}
 Op FetchAfterSyncpoint(std::uint32_t entry, const Expected& e, std::uint32_t index,
                        std::uint32_t value) {
     Op op = Fetch(entry, 0, e);
@@ -302,6 +320,74 @@ std::vector<Case> BuildCases() {
                                  .Put(24, ProducerValues(2, 16)))}};
         cases.push_back(c);
     }
+    { // Order, not completion: the syncpoint (guest and host) reaches the value while the GPU
+      // has not executed the producer. Only a consumer that waits for the fence of its own copy
+      // sees the bytes. In host-early the back thread raises the host value when it records the
+      // increment, so the GPU lags it (the gpu-lags and both-lag schedules keep it behind).
+        Case c{"syncpoint_before_gpu", "syncpoint alcancado antes de a GPU executar o produtor"};
+        c.entries[1] = {Page(5), 64};
+        c.channels = {
+            {Submit(1), SyncptAcquire(0, 1, kChannel1),
+             FetchAfterSyncpoint(1, Expected(Page(5), 64).Put(0, ProducerValues(1, 32)), 0, 1)},
+            {Produce(1, Page(5), 32), SyncptIncr(0)}};
+        c.require_ahead_early = true;
+        cases.push_back(c);
+        // A consumer that takes the syncpoint as proof that the bytes are ready and reads the
+        // host buffer with no copy and no fence. In host-deferred the syncpoint also proves the
+        // GPU finished the producer, so it happens to work; in host-early it reads too soon.
+        c.name = "syncpoint_trusted_as_ready";
+        c.title = "consumidor que confia no syncpoint como prova de bytes prontos (negativo)";
+        c.knobs.trust_syncpoint_as_ready = true;
+        c.require_ahead_early = false;
+        c.early_after_satisfied = c.early_exact_drain =
+            Expect::MustFail(FailureKind::WordMismatch);
+        cases.push_back(c);
+    }
+    { // No dependency at all between the producer (channel 1) and the consumer (channel 0): the
+      // copy is ordered at the fetch position, which comes before the producer in the stream.
+      // Waiting for the copy's fence orders the copy, not the producer.
+        Case c{"other_channel_missing_dependency",
+               "produtor de outro canal sem dependencia (esperar a copia nao basta)"};
+        c.entries[1] = {Page(5), 64};
+        c.channels = {{Submit(1), Fetch(1, 0, Expected(Page(5), 64).Put(0, ProducerValues(1, 32)))},
+                      {Produce(1, Page(5), 32)}};
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
+        cases.push_back(c);
+    }
+    { // Lichii 3165a2b and 15126fb: an old download is pending when the CPU writes the same
+      // range; the old download completes afterwards. The new bytes must survive in guest memory
+      // and the next upload to the host must carry them. Words (relative to page 3):
+      // P1 writes 0..15 and the CPU reads them; fence F1 queues download D1 of all 16. The CPU
+      // writes W over 4..7 (D1 loses them). P2 writes 8..15; fence F2 queues D2 of 0..3 and
+      // 8..15. Both complete in the order of the GPU stream: guest 0..3 = P1, 4..7 = W,
+      // 8..15 = P2. The fetch then uploads W to the host buffer.
+        const std::uint32_t b = Page(3);
+        const std::vector<Word> w{0x51, 0x52, 0x53, 0x54};
+        Expected final_words(b, 16);
+        final_words.Put(0, ProducerValues(1, 4)).Put(4, w).Put(8, ProducerValues(2, 8));
+        Case c{"pending_download_vs_cpu_write",
+               "download pendente e escrita nova da CPU na mesma faixa"};
+        c.entries[1] = {b, 16};
+        c.channels = {{Produce(1, b, 16), CpuRead(b, 16), Simple(OpKind::Fence),
+                       Simple(OpKind::WaitBack), CpuWrite(b + 4, w), Produce(2, b + 8, 8),
+                       Simple(OpKind::Fence), Simple(OpKind::WaitDownloads),
+                       CheckGuest(b, final_words), Simple(OpKind::Wfi), Submit(1),
+                       Fetch(1, 0, final_words), CheckHost(b + 4, w)}};
+        cases.push_back(c);
+        // (a) The CPU write does not cancel the pending downloads: the old one lands over it.
+        c.name = "pending_download_no_cancel";
+        c.title = "download pendente sem cancelar antes da escrita da CPU (negativo)";
+        c.knobs.cancel_pending_downloads = false;
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
+        cases.push_back(c);
+        // (b) One pending set for different downloads of the same range (before 15126fb): the
+        // old download completes first and consumes the entry the new one needed.
+        c.name = "pending_download_single_set";
+        c.title = "um conjunto unico de faixas pendentes para downloads da mesma faixa (negativo)";
+        c.knobs.cancel_pending_downloads = true;
+        c.knobs.single_pending_set = true;
+        cases.push_back(c);
+    }
     return cases;
 }
 
@@ -310,6 +396,7 @@ struct Tally {
     std::uint64_t failures = 0;
     std::uint64_t missed = 0;
     std::uint64_t early = 0;
+    std::uint64_t ahead = 0; // runs where an acquire passed while the GPU lagged (host-early)
     std::uint32_t kinds = 0;
     std::string first_failure;
     std::string diagnostic;
@@ -335,6 +422,8 @@ int main(int argc, char** argv) {
     std::uint64_t seed = 1;
     const char* only = nullptr;
     bool verbose = false;
+    bool run_early = true;
+    bool run_deferred = true;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--random") && i + 1 < argc) {
             random_runs = std::strtoull(argv[++i], nullptr, 10);
@@ -344,11 +433,16 @@ int main(int argc, char** argv) {
             seed = std::strtoull(argv[++i], nullptr, 10);
         } else if (!std::strcmp(argv[i], "--case") && i + 1 < argc) {
             only = argv[++i];
+        } else if (!std::strcmp(argv[i], "--host") && i + 1 < argc) {
+            const char* mode = argv[++i];
+            run_early = std::strcmp(mode, "deferred") != 0;
+            run_deferred = std::strcmp(mode, "early") != 0;
         } else if (!std::strcmp(argv[i], "-v")) {
             verbose = true;
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--random N] [--forced N] [--seed S] [--case NAME] [-v]\n",
+                         "usage: %s [--random N] [--forced N] [--seed S] [--case NAME] "
+                         "[--host early|deferred|both] [-v]\n",
                          argv[0]);
             return 2;
         }
@@ -365,8 +459,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(random_runs),
                 static_cast<unsigned long long>(forced_runs),
                 static_cast<unsigned long long>(seed));
-    std::printf("%-30s %-28s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n", "case", "rule",
-                "expect", "random", "back-lags", "gpu-lags", "both-lag", "eager", "verdict");
+    std::printf("%-30s %-28s %-8s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n", "case", "rule",
+                "host", "expect", "random", "back-lags", "gpu-lags", "both-lag", "eager",
+                "verdict");
 
     bool all_ok = true;
     std::uint64_t run_seed = seed * 1000003;
@@ -374,19 +469,25 @@ int main(int argc, char** argv) {
         if (only && c.name != only) {
             continue;
         }
+        for (const HostMode host_mode : {HostMode::Early, HostMode::Deferred}) {
+        if ((host_mode == HostMode::Early && !run_early) ||
+            (host_mode == HostMode::Deferred && !run_deferred)) {
+            continue;
+        }
         for (const contracts::VisibilityRule* rule : rules) {
-            const Expect expect = rule == &after_satisfied ? c.after_satisfied
-                                  : rule == &exact_drain   ? c.exact_drain
+            const Expect expect = rule == &after_satisfied ? c.ExpectFor(true, host_mode)
+                                  : rule == &exact_drain   ? c.ExpectFor(false, host_mode)
                                                            : Expect::Informative();
             Tally tallies[5];
             for (int s = 0; s < 5; ++s) {
                 const std::uint64_t n = s == 0 ? random_runs : forced_runs;
                 for (std::uint64_t i = 0; i < n; ++i) {
-                    const RunResult r = RunCase(c, *rule, schedules[s], ++run_seed);
+                    const RunResult r = RunCase(c, *rule, schedules[s], host_mode, ++run_seed);
                     Tally& t = tallies[s];
                     ++t.runs;
                     t.missed += r.missed_writes;
                     t.early += r.early_completion_observed ? 1 : 0;
+                    t.ahead += r.syncpoint_ahead_of_gpu ? 1 : 0;
                     if (!r.ok) {
                         t.kinds |= r.failure_kinds;
                         if (t.failures++ == 0) {
@@ -428,6 +529,16 @@ int main(int argc, char** argv) {
                     verdict = "OK (" + found + ")";
                 }
             }
+            if (c.require_ahead_early && host_mode == HostMode::Early && ok &&
+                rule != &never_wait) {
+                // The case only means something if the syncpoint really ran ahead of the GPU.
+                for (const int s : {2, 3}) {
+                    if (tallies[s].ahead != tallies[s].runs) {
+                        ok = false;
+                        verdict = "NOT EXERCISED (syncpoint did not run ahead of the GPU)";
+                    }
+                }
+            }
             all_ok = all_ok && ok;
             char cells[5][16];
             for (int s = 0; s < 5; ++s) {
@@ -435,9 +546,10 @@ int main(int argc, char** argv) {
                               static_cast<unsigned long long>(tallies[s].failures),
                               static_cast<unsigned long long>(tallies[s].runs));
             }
-            std::printf("%-30s %-28s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n", c.name.c_str(),
-                        rule->Name(), ExpectName(expect).c_str(), cells[0], cells[1], cells[2],
-                        cells[3], cells[4], verdict.c_str());
+            std::printf("%-30s %-28s %-8s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n",
+                        c.name.c_str(), rule->Name(), HostModeName(host_mode),
+                        ExpectName(expect).c_str(), cells[0], cells[1], cells[2], cells[3],
+                        cells[4], verdict.c_str());
             if (verbose || !ok || (total_failures > 0 && rule != &never_wait)) {
                 for (int s = 0; s < 5; ++s) {
                     if (!tallies[s].first_failure.empty()) {
@@ -453,14 +565,17 @@ int main(int argc, char** argv) {
                         std::printf("    %-9s diagnostic: %s\n", ScheduleName(schedules[s]),
                                     tallies[s].diagnostic.c_str());
                     }
-                    if (tallies[s].missed || tallies[s].early) {
-                        std::printf("    %-9s missed writes: %llu, early completion seen in %llu runs\n",
+                    if (tallies[s].missed || tallies[s].early || tallies[s].ahead) {
+                        std::printf("    %-9s missed writes: %llu, early completion seen in %llu "
+                                    "runs, syncpoint ahead of the GPU in %llu runs\n",
                                     ScheduleName(schedules[s]),
                                     static_cast<unsigned long long>(tallies[s].missed),
-                                    static_cast<unsigned long long>(tallies[s].early));
+                                    static_cast<unsigned long long>(tallies[s].early),
+                                    static_cast<unsigned long long>(tallies[s].ahead));
                     }
                 }
             }
+        }
         }
     }
     std::printf("\n%s\n", all_ok ? "ALL EXPECTATIONS MET" : "EXPECTATIONS NOT MET");

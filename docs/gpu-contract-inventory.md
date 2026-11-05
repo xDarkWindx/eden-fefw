@@ -67,7 +67,7 @@ princípio 6.
 | C8 | Dispatch indireto | `vk_rasterizer.cpp:760-778`; `ObtainBuffer(..., FullSynchronize, DiscardWrite)` (`buffer_cache.h:336-340`) esquece o download desses bytes | Trás | Comando (consumido na GPU) | Memória |
 | C9 | Reset indireto do Bananza feito na CPU | `vk_rasterizer.cpp:260-332`: `ReadBlock` seguro do descritor (`:287`), `FlushRegion` se o buffer está sujo (`:298-300`), `ReadBlockUnsafe` da lista de ponteiros (`:302`) | Trás | Dado que decide um substituto da GPU | Memória |
 | C10 | Acquire de semáforo, canal nativo | `puller.cpp:184-243`. `DrainBack` antes da leitura (`:186`); `ReadNativeSemaphoreWord` baixa o buffer se `MustFlushRegion` (`:34-49`); se não satisfaz, `ReleaseFences(true)` e nova leitura (`:222-227`); persistindo, o canal é suspenso (`:234-243`), retomado em `CanResumeNativeAcquire` com novo `DrainBack` (`:145-154`). Sem limite de tempo | Frente (com a trás esvaziada) | Condição de sincronização | Sincronização, com Memória para o valor |
-| C11 | Acquire de semáforo, canal legado | `puller.cpp:187-270`: dentro de `do { ... } while (false)`, cada `continue` (`:253,260,265`) salta para a condição `false` e **sai sem esperar** (leitura do código, não executado). `ProcessSemaphoreAcquire` (`:284-297`) espera sem limite (`acquire_timeout` é TODO, `:293`) | Frente | Condição de sincronização | Sincronização |
+| C11 | Acquire de semáforo, canal legado | `puller.cpp:187-270`: dentro de `do { ... } while (false)`, cada `continue` (`:253,260,265`) salta para a condição `false` e **sai sem esperar** (leitura do código, não executado). `ProcessSemaphoreAcquire` (`:284-297`) espera sem limite (`acquire_timeout` é TODO, `:293`). **Decisão registrada (usuário):** é um padrão herdado do Eden/yuzu (o arquivo mantém o cabeçalho yuzu 2022, `puller.cpp:4-5`; a história git daqui não permite confirmar a origem do laço), **fora do escopo** porque mudá-lo afeta os jogos de Switch 1. Candidato a **contador no relatório de saúde** (`docs/architecture-plan.md`, 12.2 e), sem mudar o comportamento | Frente | Condição de sincronização | Sincronização |
 | C12 | Acquire de syncpoint | `puller.cpp:126-132`: só agenda `ReleaseFences`; a espera está comentada. Não satisfaz nada | Trás (`OnBack`) | Condição de sincronização | Sincronização |
 | C13 | Descritor de QMD nativo | `kepler_compute.cpp:153-181`: `ReadBlock` seguro "por causa de patches da GPU" (`:162-164`) | Trás | Comando | Memória |
 | C14 | Condição de renderização condicional | `maxwell_3d.cpp:626-645`, `ReadBlock` seguro; no host, `vk_query_cache.cpp:1407-1448` compara no buffer | Trás | Dado que decide draws | Memória |
@@ -326,8 +326,8 @@ arquitetura (item 6 do pedido).
 
 | # | Achado | Onde afeta |
 | --- | --- | --- |
-| F1 | O valor host do syncpoint, em Fast com fence `Default`, sobe na sinalização, não na conclusão da GPU (`fence_manager.h:123-130`); a frase "o valor que sobe na conclusão na GPU (`IncrementHost` na fence)" do plano de listas (4.2, item 2) só vale para fences adiadas. O harness do T1 modela o caso adiado. A espera real do acquire precisa dizer que garantia dá em cada modo: ordem do fluxo em Fast, conclusão no adiado | `docs/gpu-produced-data-plan.md` 4.2 item 2; `docs/architecture-plan.md` 2.2; harness (um modo "host cedo" é um caso a acrescentar) |
-| F2 | O acquire de semáforo legado nunca espera (`continue` dentro de `do/while(false)`, `puller.cpp:187-270`); o nativo suspende sem limite (`:234-243`); o `acquire_timeout` é TODO (`:293`) | Seção 12.2 c do plano de arquitetura: o ponto de partida da espera com limite é mais fraco do que o texto sugere |
+| F1 | O valor host do syncpoint, em Fast com fence `Default`, sobe na sinalização, não na conclusão da GPU (`fence_manager.h:123-130`); a frase "o valor que sobe na conclusão na GPU (`IncrementHost` na fence)" do plano de listas (4.2, item 2) só vale para fences adiadas. **Corrigido** em `docs/gpu-produced-data-plan.md` 4.2 (itens 2 e 3) e na linha 9 da seção 11 dele; o harness do T1 passou a ter os dois modos (`host-early`, `host-deferred`) e os casos `syncpoint_before_gpu`, `syncpoint_trusted_as_ready` e `other_channel_missing_dependency` | Feito; a espera real do acquire (T4) precisa dizer que garantia dá em cada modo: ordem do fluxo em Fast, conclusão no adiado |
+| F2 | O acquire de semáforo legado nunca espera (`continue` dentro de `do/while(false)`, `puller.cpp:187-270`); o nativo suspende sem limite (`:234-243`); o `acquire_timeout` é TODO (`:293`). **Decisão (usuário):** padrão herdado do Eden/yuzu; **fora do escopo** (mudar afeta os jogos de Switch 1); candidato a contador no relatório de saúde, sem mudar o comportamento | Seção 12.2 c do plano de arquitetura: o ponto de partida da espera com limite é mais fraco do que o texto sugere; a espera com limite vale para o caminho nativo e para o syncpoint, não para o legado |
 | F3 | Segurar escritas da CPU existe, mas condicionado a páginas com dados da GPU e liberado por lista/fence, não por entrada | 4.2; caso `cpu_reuse` do harness |
 | F4 | O upload por palavra já está no caminho principal, com ressalva Android | 4.3; pendência da seção 11 respondida |
 | F5 | Há dois rastreios que precisam concordar: bit de página (com máscara "untracked") e faixas exatas | 4.3 |
@@ -339,6 +339,21 @@ Perguntas abertas:
    Se sim, `Query` precisa marcar o filtro e escrever na ordem do fluxo.
 2. Imagens com alias de buffer (P6) produzem comandos em algum jogo? O Bananza usa buffers (hipótese).
 3. A espera real do acquire de syncpoint (T4) deve usar o valor host ou o guest em Fast? (F1)
+
+### Pendências de localização
+
+**P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com
+`arquivo:linha`; não analisei qual deles o Ocarina usa nem como o controle de resolução dinâmica os consome
+(pergunta 6 da seção 9 do plano de arquitetura).
+
+| Tempo | Onde é produzido |
+| --- | --- |
+| Tick da GPU | `GPU::GetTicks` (`video_core/gpu.cpp:210-213`): `CoreTiming::GetGPUTicks` (`core/core_timing.cpp:240-244`, relógio de parede no multi-core, ticks da CPU convertidos no single-core) dividido pelo multiplicador do clock da GPU (`gpu.cpp:48`, configuração `gpu_clock`) |
+| Timestamp escrito nos relatórios de semáforo e de query | `Maxwell3D::StampQueryResult` (`video_core/engines/maxwell_3d.cpp:557-561`); no cache de queries, na fence ou na hora (`video_core/query_cache/query_cache.h:283-286,300-304`); OpenGL `gl_rasterizer.cpp:441,453`; backend nulo `renderer_null/null_rasterizer.cpp:35` |
+| Tempo de GPU lido por ioctl | `nvhost_ctrl_gpu::GetGpuTime` (`core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.cpp:421-424`): devolve o tempo global do `CoreTiming` em nanossegundos, não os ticks da GPU |
+| Vsync (evento que o jogo espera) | `Conductor::ProcessVsync` e `VsyncThread` (`core/hle/service/vi/conductor.cpp:76,86`), `VsyncManager::SignalVsync` (`vi/vsync_manager.cpp:15`), `GetDisplayVsyncEvent` (`vi/application_display_service.h:64`) |
+| Ritmo e duração do frame na apresentação | `nvdisp_disp0::Composite` (`nvdrv/devices/nvdisp_disp0.cpp:101-105`): `ReportFrameInterval`, `SpeedLimiter::DoSpeedLimiting`, `PerfStats::EndSystemFrame`/`BeginSystemFrame`; `core/perf_stats.cpp:131-138` |
+| Fatias de tempo de GPU do applet | `IWindowController::SetAppletGpuTimeSlice` é um stub (`am/service/window_controller.cpp:79-82`); `SetGpuTimeSliceBoost` em `am/service/applet_common_functions.cpp:87` (corpo não aberto) |
 
 ## 8. O que não foi aberto
 
