@@ -2515,10 +2515,22 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    std::array<uint64_t, 8> inputs = args;
     if (process.Is64Bit()) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
+    }
+    // Every SVC returns its result in w0. Games abort on an unexpected 2001-0033
+    // (ResultNotImplemented) without naming the call, so name it, once per SVC.
+    if (static_cast<u32>(args[0]) == ResultNotImplemented.raw) {
+        static std::array<std::atomic<bool>, 256> reported{};
+        if (!reported[imm & 0xff].exchange(true)) {
+            LOG_WARNING(Kernel_SVC,
+                        "SVC {:#x} returned 2001-0033 (not implemented): [0]={:#x} [1]={:#x} "
+                        "[2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
+                        imm, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5]);
+        }
     }
     //kernel.ExitSVCProfile();
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
