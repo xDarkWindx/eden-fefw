@@ -124,6 +124,17 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   | sort | uniq -c | sort -rn | head -25
 ```
 
+## 7.1 Andamento (2026-11-05)
+
+- Item 1 da seção 7 feito: as medições estão em `docs/list-diag-design.md` 8.4. O FE foi medido no mesmo lugar,
+  com a mesma configuração: −20,0% de draws/s com `pop,blk`; 70% dos trechos do B ficam ambíguos por falta de
+  registro.
+- Item 2: o plano passa a ser **T3a.1** (amostragem por página com cobertura completa nas páginas amostradas, mais
+  o caminho quente: contadores por núcleo e uma leitura de relógio por `Register`), e depois o desenho do
+  **T3a.2** (`blkcmp`, confirmação do B). O T3b continua esperando.
+- Item 3: o prompt do T3a.1 foi para o revisor. O codador ainda não recebeu nada.
+- Próximo Bananza: depois do T3a.1, no mesmo lugar, com e sem `EDEN_NX2_MACRO_REFRESH=1`.
+
 ## 8. Armadilhas
 
 - Arquivos com CRLF (por exemplo `texture_cache/texture_cache.h`): preserve as quebras de linha.

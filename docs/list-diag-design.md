@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, aguardando as medições do usuário; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página e caminho quente) em desenho; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -619,6 +619,73 @@ Anotar também os degraus de FPS. Fechar o jogo pelo menu (para o resumo sair no
 O que cada contador diz e **não** diz está em 4 e 5 e em 9: `pop_over_notice` e `blk_gpu_bytes_at_risk` são **limites
 superiores** (aviso registrado, não escrita concluída; bytes em risco, não perdidos), e uma rodada com zero ocorrências
 **não** invalida a janela nem os blocos (seção 0).
+
+### 8.4 Medições do T3a (rodada 2, 2026-11-05)
+
+**Rodadas (medido pelo usuário).** Build de `fc22def`. A string de versão do log diz `bold-dirac-tppzm7-32e6e17`, mas
+a linha `[ListDiag] ligado ... totais a cada 30 s` só existe a partir de `fc22def` (`list_diag.h:150`; ausente em
+`32e6e17`, conferido com `git grep`), e as macros estão na frente nos dois jogos, o que só acontece com `8ee3728`:
+a string está velha (cache do CMake). FE: quatro rodadas no **mesmo lugar** (25 s depois de carregar o save,
+parado), sem VSync, só `EDEN_BACK_THREAD_STATS=1` nas quatro (diferente do 8.3, mas igual entre elas), mais
+`EDEN_LIST_DIAG=pop,blk` em b e d (conferido pela linha `ligado`). Split padrão (`2`), macros na frente em todas.
+Nenhuma violação de P0 nas três rodadas com diagnóstico.
+
+**Custo no FE (medido, `Back thread:` dos logs, amostras de 4 s depois da subida):**
+
+| Rodada | Diag | draws/s (média) | Trás ocupada |
+| --- | --- | --- | --- |
+| a | desligado | 81 577 (5 amostras, 40-56 s) | 86,7% |
+| c | desligado | 80 602 (5 amostras, 40-56 s) | 87,2% |
+| b | `pop,blk` | 65 137 (5 amostras, 42-58 s) | 78,2% |
+| d | `pop,blk` | 64 641 (5 amostras, 44-60 s) | 78,2% |
+
+Desligado 81 090, ligado 64 889: **−20,0%** de draws/s, com ruído de ~1% entre as rodadas iguais. A linha de
+base (seção 6 do `handoff-planner.md`, −18%) se confirma no mesmo lugar. A thread de trás fica **mais ociosa**
+com o diagnóstico, então o custo está antes dela, nas threads da CPU do jogo que registram os avisos (hipótese
+compatível com o código abaixo; não medido por thread).
+
+**Onde o custo provavelmente está (verificado no código; a parte de cada item é hipótese).** São ~555 mil avisos/s
+(b: 24,4 mi em 44 s; d: 25,0 mi em 44,7 s), e **80% vão para overflow**:
+- `Ledger::Register` (`list_diag/ledger.h:160-210`) examina até `kScan = 8` slots (`:25`) e chama `Expired` em
+  cada slot publicado. `Expired` lê o relógio a cada chamada (`:354-358`; `steady_clock::now`, `hooks.h:17-21`).
+  Um aviso que vai para overflow pode custar até 8 leituras de relógio, mais 8 cargas `seq_cst`.
+- Os contadores são `std::atomic<u64>` adjacentes numa `struct` só (`counters.h:20`, `:36-43`). `notice_registered`,
+  `notice_overflow` e `notice_applied` estão na mesma linha de cache e são incrementados pelos seis núcleos do
+  jogo e pela thread que aplica: compartilhamento falso a centenas de milhares por segundo.
+- Todo aviso faz 3 cargas `seq_cst` do lote (`protocol.h:101-106`) e, se registrado, CAS, `exchange`, `store`
+  `seq_cst`, `fetch_or` `seq_cst` no índice de vivos (`ledger.h:341-343`) e mais leituras de relógio.
+
+**Cobertura e magnitude (medido):**
+
+| Medida | b (FE) | d (FE) | Bananza |
+| --- | --- | --- | --- |
+| Registrados ÷ (registrados + overflow) | 19,7% | 19,5% | 16,6% |
+| A: pops sobre aviso / registros / bytes | 32 / 582 / 2 588, todos `sample_equal` | 12 / 533 / 2 300, todos `sample_equal` | 10 / 361 / 2 144, 1 `sample_different` |
+| B: aplicações sobre bytes da GPU | 201 272 de 347 917 (58%) | 205 370 de 355 514 (58%) | 67 277 de 74 497 (90%) |
+| B: **ambíguas** entre as que cobrem bytes da GPU | 139 975 (70%) | 144 768 (70%) | 49 847 (74%) |
+| B: `at_risk` (só não ambíguas) / `not_seen_cpu_read` | 6,70 MB / 96% | 5,97 MB / 96% | 1,38 MB / 99% |
+| Aviso → aplicação, média / máximo | 6,0 ms / 630 ms | 6,0 ms / 616 ms | 2,2 ms / 77 ms |
+| `InvalidateGPUCache`: chamadas / vazias / trocas de thread | 54 509 / 48% / 1 | 55 655 / 48% / 2 | 146 754 / 90% / 24 299 |
+
+Leitura:
+- **O `at_risk` não é limite superior da exposição total.** Ele só soma os 30% de trechos não ambíguos (seção 5).
+  Os outros 70% são ambíguos, na maior parte porque o aviso do trecho caiu em overflow (sem registro, `blk` não
+  desconta nada). O limite superior de verdade é `blk_gpu_bytes_covered` (110 MB no b). Mais cobertura resolve
+  as duas coisas.
+- **A** continua raro e, no FE, consistente com sobrescrita. O `sample_different` do Bananza (4 B em
+  `0x86154b8c`, núcleo 4, pop +260 µs, aplicação +738 µs) só diz que a amostra mudou entre o pop e a aplicação
+  (seção 4). Não prova nem descarta o A.
+- **Bananza:** a rodada não tem par sem diagnóstico, nem lugar estável. Foi só a carga do save e uns 5 s de chão
+  preto, com a releitura de macro desligada (padrão desde `8ee3728`). Serve para cobertura e trocas de thread,
+  não para custo. As 24 299 trocas de thread no `InvalidateGPUCache` (contra 1 ou 2 no FE) mostram que a
+  convenção da P0 é exercitada de verdade nesse jogo; ela não foi violada.
+- O ledger tem 1 024 slots por núcleo (`protocol.h:83`). Com ~555 mil avisos/s e 6 ms de vida média, um núcleo
+  que concentre os avisos precisa de ~3 300 slots vivos, e `Register` só examina 8 a partir do cursor: o overflow
+  é estrutural, não acaso (hipótese: a distribuição por núcleo não é medida).
+
+**Consequência para o plano:** a próxima mudança do diagnóstico precisa **baixar o custo e subir a cobertura juntos**.
+Aumentar o ledger sem mexer no caminho quente aumentaria os dois. O desenho está no prompt T3a.1 (seção 11,
+revisão 4, quando aprovado).
 
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 
