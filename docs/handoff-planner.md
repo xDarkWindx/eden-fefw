@@ -152,6 +152,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão do desenho do T3a.1 (sobre `b34a2e4`): aceita a direção. Pede ajustes na prova da 3.7.3 (CAS repetido,
   aviso recortado pelo D1, exclusão do `ClearLive`, rejeição por geração em `marks`), testes novos e a correção
   de `sampled/seen` (fração de avisos, não de páginas). Tudo foi para o codador junto com o desenho do D1.
+- `d16866d` (desenho do D1, `docs/gpu-contract-inventory.md` 7.4.1) e `a296323` (prova da 3.7.3 refeita, testes 16
+  a 18) foram conferidos pelo planejador. O D1 foi liberado para implementação, e o diff passa pelo revisor antes
+  de o usuário compilar. O fechamento da prova do T3a.1 está com o revisor. O código do T3a.1 espera o D1
+  medido.
 
 ## 8. Armadilhas
 
