@@ -148,6 +148,8 @@ private:
         h264_context.reset();
         h264_decoder.reset();
         h264_timestamps.clear();
+        ffmpeg_vp9 = false;
+        deferred_initialization.reset();
         if (transfer_memory) transfer_memory->Close(kernel);
         transfer_memory = nullptr;
         configuration.reset();
@@ -223,7 +225,7 @@ private:
     }
 
     bool Initialized() const {
-        return decoder || h264_context;
+        return decoder || h264_context || deferred_initialization;
     }
 
     // H.264 input is accepted as Annex B, or as 4-byte length-prefixed units which are
@@ -295,7 +297,7 @@ private:
             pending_inputs.pop_front();
             R_SUCCEED();
         }
-        auto bytes = ToAnnexB(input.bytes);
+        auto bytes = ffmpeg_vp9 ? input.bytes : ToAnnexB(input.bytes);
         const size_t size = bytes.size();
         bytes.resize(size + AV_INPUT_BUFFER_PADDING_SIZE);
         FFmpeg::Packet packet(std::span<const u8>{bytes.data(), size});
@@ -900,10 +902,41 @@ private:
                 // (pointer, size) pair is codec-specific data (parameter sets) instead; when present
                 // it is given to FFmpeg as extradata by reopening the decoder.
                 result = Kernel::ResultNotImplemented;
-                if (h264_context || mime_is("video/av1")) {
+                if (deferred_initialization) {
+                    if (mime_is("video/vp9")) {
+                        auto ffmpeg_decoder = std::make_unique<FFmpeg::Decoder>(
+                            Tegra::Host1x::NvdecCommon::VideoCodec::VP9);
+                        if (ffmpeg_decoder->GetCodec()) {
+                            auto ffmpeg_context = std::make_unique<FFmpeg::DecoderContext>(*ffmpeg_decoder);
+                            if (ffmpeg_context->OpenContext(*ffmpeg_decoder)) {
+                                h264_decoder = std::move(ffmpeg_decoder);
+                                h264_context = std::move(ffmpeg_context);
+                                ffmpeg_vp9 = true;
+                                deferred_initialization.reset();
+                            }
+                        }
+                    } else if (mime_is("video/av1")) {
+                        auto backend = std::make_unique<libgav1::Decoder>();
+                        libgav1::DecoderSettings settings;
+                        settings.threads = 4;
+                        if (backend->Init(&settings) == libgav1::kStatusOk) {
+                            decoder = std::move(backend);
+                            decode_worker = std::jthread{[this](std::stop_token stop) { DecodeWorker(stop); }};
+                            deferred_initialization.reset();
+                        }
+                    }
+                    if (deferred_initialization) {
+                        const auto name_end = std::find(mime.begin(), mime.end(), u8{0});
+                        LOG_WARNING(Service_AM, "native video codec not supported: name \"{}\" ({} bytes), "
+                                                "initialized with codec={}, input_format={}, output_format={}",
+                                    std::string(mime.begin(), name_end), mime.size(), deferred_initialization->codec,
+                                    deferred_initialization->input_format, deferred_initialization->output_format);
+                    }
+                }
+                if (h264_context || (decoder && mime_is("video/av1"))) {
                     result = Kernel::ResultInvalidSize;
                     if (request->input_capacity <= transfer_memory->GetSize()) {
-                        if (h264_context && !mime.empty()) {
+                        if (h264_context && !ffmpeg_vp9 && !mime.empty()) {
                             auto reopened = std::make_unique<FFmpeg::DecoderContext>(*h264_decoder);
                             if (reopened->OpenContext(*h264_decoder, mime)) {
                                 h264_context = std::move(reopened);
@@ -975,7 +1008,30 @@ private:
             const bool is_h264 = kind == NativeVideoKind::Decoder && request->codec == 0 &&
                                  request->input_format == 1 && (request->output_format == 2 || request->output_format == 3) &&
                                  request->output_mode == 1;
-            if (is_av1 || is_h264) {
+            // Donkey Kong Bananza's command 200 movie decoder matches neither pairing (2001-0033
+            // made it abort when the movie started). Accept such an initialization with its work
+            // memory and let Configure pick the codec by name ("video/vp9" or "video/av1").
+            const bool deferred = !is_av1 && !is_h264 && kind == NativeVideoKind::Decoder &&
+                                  ctx.GetCommand() >= 200 && ctx.GetCommand() <= 201;
+            if (deferred) {
+                result = Kernel::ResultInvalidState;
+                if (!Initialized()) {
+                    auto memory = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
+                    result = Kernel::ResultInvalidHandle;
+                    if (!memory.IsNull() && memory->GetOwner() == process) {
+                        result = Kernel::ResultInvalidSize;
+                        if (request->memory_size != 0 && request->memory_size == memory->GetSize()) {
+                            transfer_memory = memory.GetPointerUnsafe();
+                            transfer_memory->Open(kernel);
+                            deferred_initialization = *request;
+                            result = ResultSuccess;
+                            LOG_INFO(Service_AM, "native video decoder initialized without a known codec (command {}: "
+                                                 "codec={}, input_format={}, output_format={}); Configure picks it by name",
+                                     ctx.GetCommand(), request->codec, request->input_format, request->output_format);
+                        }
+                    }
+                }
+            } else if (is_av1 || is_h264) {
                 result = Kernel::ResultInvalidState;
                 if (!Initialized()) {
                     auto memory = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
@@ -1051,8 +1107,14 @@ private:
     NativeVideoKind kind;
     Kernel::KTransferMemory* transfer_memory{};
     std::unique_ptr<libgav1::Decoder> decoder;
+    // The FFmpeg decoder serves H.264 and VP9; ffmpeg_vp9 tells them apart (Annex B input and
+    // extradata are H.264's).
     std::unique_ptr<FFmpeg::Decoder> h264_decoder;
     std::unique_ptr<FFmpeg::DecoderContext> h264_context;
+    bool ffmpeg_vp9{};
+    // Command 200/201 initializations this decoder does not recognize by their numbers: the work
+    // memory is kept and Configure picks the codec by its name, as Eglantine's decoder does.
+    std::optional<GraphicsSupervisorProtocol::VideoDecoderInitialization> deferred_initialization;
     std::map<u64, u64> h264_timestamps;
     std::optional<GraphicsSupervisorProtocol::VideoDecoderConfiguration> configuration;
     KernelHelpers::ServiceContext context;
