@@ -565,6 +565,27 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true);
     if (!lowered) {
+        // A rejected program never reaches the Maxwell dump, so keep its native code: the
+        // rejected instruction alone rarely shows which pattern the lowering needs to accept.
+        // Raw 16-byte instructions from the first one, readable with nvdisasm -b SM86 -raw.
+        static std::mutex dumped_mutex;
+        static std::set<std::pair<GPUVAddr, u64>> dumped;
+        const bool first_rejection = [&] {
+            std::scoped_lock lock{dumped_mutex};
+            return dumped.emplace(program_base, lowered.error_offset).second;
+        }();
+        if (Settings::values.dump_guest_shaders && first_rejection) {
+            const auto dump_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)};
+            if (Common::FS::CreateDir(dump_dir)) {
+                const auto name{dump_dir / fmt::format("{:016x}_native_{:x}_rejected_at_{:x}.bin",
+                                                        Settings::GetCurrentProgramID(), program_base,
+                                                        lowered.error_offset)};
+                std::ofstream file(name, std::ios::binary | std::ios::trunc);
+                file.write(reinterpret_cast<const char*>(native.data()),
+                           static_cast<std::streamsize>(native.size() * sizeof(Instruction)));
+                LOG_INFO(Shader, "Dumped rejected native shader to {}", name.string());
+            }
+        }
         if (lowered.error_offset / sizeof(Instruction) < native.size()) {
             const auto& words = native[lowered.error_offset / sizeof(Instruction)].words;
             throw Shader::RuntimeError("Native shader at {:#x}, instruction {:#x}: {} [{:08x} {:08x} {:08x} {:08x}]",
