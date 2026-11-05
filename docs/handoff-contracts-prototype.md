@@ -89,6 +89,13 @@ falhar). Um caso "pass" não pode falhar em nenhum.
 
 ## 4. Decisões tomadas desde a primeira versão
 
+0. **(Sessão do T3a, a pedido do usuário) A releitura de macro do 6d3dd9a voltou a ser opt-in.** O commit a ligava em todo
+   jogo de Switch 2 e, por isso, tirava as macros da thread da frente (`gpu_split.cpp:100-103`): `EDEN_GPU_SPLIT=2` deixava de
+   valer para esses jogos. Agora `EDEN_NX2_MACRO_REFRESH` só liga com `1` (ausente = desligado = o antigo `=0`); o código e o
+   interruptor continuam, para a matriz do Bananza (`docs/gpu-produced-data-plan.md`, 4.1.1) e para o A/B no FE. Efeito
+   esperado no Bananza: o chão volta a ficar invisível por padrão, até o consumidor novo (T4) ou `EDEN_NX2_MACRO_REFRESH=1`.
+   **Não medido** no FE: é a hipótese do usuário de uma regressão.
+
 1. **`exact-drain` é a regra de visibilidade de referência e o candidato a padrão**, depois de corrigida a
    validade das transferências e validado o protocolo completo (produtores cobertos, cópia ordenada na posição
    da entrada, conclusão na GPU, publicação). O drain sozinho não garante coerência. O custo acima do

@@ -35,11 +35,13 @@ enum class HighAccuracyPart : u32 {
 
 /// Switch 2 (native) channels re-read macro parameters that the GPU may have written, at any
 /// accuracy level: Donkey Kong Bananza's terrain draws take counts written by compute programs and
-/// were not drawn at Fast without it. EDEN_NX2_MACRO_REFRESH=0 turns this off.
+/// were not drawn at Fast without it. OFF by default (commit 6d3dd9a had it on): the refresh flushes
+/// the split back's caches, which keeps macros off the front thread (split mode 2) in every Switch 2
+/// game, and its cost in Fortune's Weave was never measured. EDEN_NX2_MACRO_REFRESH=1 turns it on.
 [[nodiscard]] inline bool NativeMacroRefresh() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_MACRO_REFRESH");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     return enabled;
 }
