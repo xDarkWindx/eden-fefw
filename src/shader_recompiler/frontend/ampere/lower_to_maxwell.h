@@ -112,7 +112,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x88c: case 0x887: case 0x958: case 0xabb:
             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(24, 8));
             break;
-        case 0xc09: case 0xd05: case 0xc0a: case 0xc0b: case 0xc0c: case 0xc10: case 0xc11: case 0xc12: case 0xc17: case 0xc20: case 0xc24:
+        case 0xc09: case 0xd05: case 0xc0a: case 0xc0b: case 0xc0c: case 0xc10: case 0xc11: case 0xc12: case 0xc13: case 0xc17: case 0xc20: case 0xc24:
         case 0xc45: case 0xd08: case 0xc82: case 0xc02: case 0xd00: case 0xd09: case 0xe21: case 0xe23:
         case 0xe24: case 0xc23: case 0x2bd:
             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(32, 8));
@@ -131,7 +131,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         default: break;
         }
-        uses_uniform_bank |= op == 0xf60 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0a || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
+        uses_uniform_bank |= op == 0xf60 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0a || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc13 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
                              op == 0xc09 || op == 0xd05 || op == 0x2a5 || op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || (op == 0x81c && instruction.Bits(67, 1));
     }
     const bool uses_async_copy = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
@@ -1521,9 +1521,11 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
-        case 0x213: case 0xa13: { // IABS.S32 preserves the two's-complement minimum value.
-            if (insn.Bits(24, 8) || insn.words[2] ||
+        case 0x213: case 0xa13: case 0xc13: { // IABS.S32 preserves the two's-complement minimum value.
+            // 0xc13 reads a uniform register (bit 91 marks the uniform source).
+            if (insn.Bits(24, 8) || insn.words[2] != (opcode == 0xc13 ? 0x08000000U : 0U) ||
                 (opcode == 0x213 ? insn.words[1] > 255 :
+                 opcode == 0xc13 ? (insn.words[1] & ~0xffU) != 0 :
                  (!valid_cbuf() || insn.Bits(62, 2))))
                 return fail(index, "native integer absolute mode");
             const u32 source = operand(1, false);

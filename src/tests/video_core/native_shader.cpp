@@ -3763,6 +3763,34 @@ TEST_CASE("Native constant integer absolute values preserve signed boundaries", 
 }
 
 
+TEST_CASE("Native uniform integer absolute values preserve signed boundaries", "[native-shader]") {
+    // IABS R79, UR4, from a Donkey Kong Bananza draw shader. UR4 lives in R220.
+    const u32 destination = GENERATE(5U, 79U);
+    const std::array<Native, 2> input{{
+        {{0x7c13U | (destination << 16), 4, 0x08000000, 0x000fe200}}, VertexTransform.back(),
+    }};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (u32 bits : {0U, 1U, 0xffffffffU, 0x80000000U, 0x7fffffffU, 0xfedcba98U}) {
+        ScalarNativeMachine machine;
+        machine.regs[220] = bits;
+        machine.regs[18] = 0x12345678;
+        machine.Execute(block);
+        REQUIRE(machine.regs[destination] == ((bits & 0x80000000U) ? 0U - bits : bits));
+        REQUIRE(machine.regs[220] == bits);
+        REQUIRE(machine.regs[18] == 0x12345678);
+    }
+    for (const Native invalid : {
+             Native{{0x00057c13, 0x00000004, 0, 0}},          // Uniform form without its marker.
+             Native{{0x00057c13, 0x40000004, 0x08000000, 0}}, // Unsupported source modifier.
+             Native{{0x01057c13, 0x00000004, 0x08000000, 0}}}) { // Reserved source register.
+        const std::array<Native, 2> rejected{{invalid, VertexTransform.back()}};
+        REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(rejected));
+    }
+}
+
+
 TEST_CASE("Native predicate AND with an inverted aliased input preserves other predicates", "[native-shader]") {
     const std::array<Native, 2> input{{
         {{0x781c, 0, 0x00f20170, 0}}, VertexTransform.back(),
