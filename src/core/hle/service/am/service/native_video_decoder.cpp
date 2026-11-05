@@ -12,6 +12,7 @@
 #include "common/thread.h"
 #include <vector>
 #include <deque>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include "core/memory.h"
@@ -204,6 +205,7 @@ private:
                     if (pending_inputs.size() < MaximumPendingInputs &&
                         pending_input_bytes + input.size() <= transfer_memory->GetSize()) {
                         submission_id = next_submission_id++;
+                        stream_ended = false;
                         const u64 timestamp = u64{packet[5]} | (u64{packet[6]} << 32);
                         consumed_size = input.size();
                         pending_input_bytes += input.size();
@@ -588,6 +590,7 @@ private:
             properties[6] = static_cast<u32>(timestamp_ns);
             properties[7] = static_cast<u32>(timestamp_ns >> 32);
             properties[8] = frame.eos ? 1 : 0;
+            if (frame.eos) stream_ended = true;
             output_properties.push_back(properties);
             image->available = false;
             system.Host1x().GetSyncpointManager().IncrementGuest(*operation_syncpoint);
@@ -674,7 +677,32 @@ private:
                         }
                         WaitForReleaseFence(~packet[4], packet[6]);
                     }
-                    { // Hand the image back to the decoder.
+                    // EDEN_NX2_VDEC_EOS_RELEASE_NOW=1, as in Eglantine: after the end of a stream
+                    // nothing fills an image again, so a release completes at once and its fence is
+                    // the syncpoint's current value. Games that release their images after a movie
+                    // ends and wait for those fences (Mario Kart World's title movie in Eglantine)
+                    // otherwise wait for frames that never come; Donkey Kong Bananza's looping panel
+                    // movie spins releasing images after its end. The sequence restarts there.
+                    static const bool release_now = [] {
+                        const char* value = std::getenv("EDEN_NX2_VDEC_EOS_RELEASE_NOW");
+                        return value != nullptr && value[0] != '0';
+                    }();
+                    std::unique_lock queue_lock{decode_mutex};
+                    const bool idle_stream = pending_inputs.empty() && decoded_frames.empty();
+                    queue_lock.unlock();
+                    if (release_now && stream_ended && idle_stream) {
+                        const u32 reached = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(*operation_syncpoint);
+                        next_completion_value = reached;
+                        for (auto& other : registered_images) {
+                            if (other.available) other.completion_value = reached;
+                        }
+                        image->available = true;
+                        image->completion_value = reached;
+                        completion_value = reached;
+                        result = ResultSuccess;
+                        LOG_DEBUG(Service_AM, "native video release after end of stream image={}, fence={} (reached)",
+                                  packet[2], reached);
+                    } else { // Hand the image back to the decoder.
                         result = Kernel::ResultInvalidState;
                         if (!image->available) {
                             completion_value = ++next_completion_value;
@@ -781,6 +809,7 @@ private:
                     CompleteHandedOutFences();
                     started = false;
                     flushed = false;
+                    stream_ended = false;
                     pending_inputs.clear();
                     pending_input_bytes = 0;
                     decoded_frames.clear();
@@ -1136,6 +1165,7 @@ private:
     u64 next_submission_id{1};
     bool started{};
     bool flushed{}; // Flushed since the last Start: Start may resume decoding.
+    bool stream_ended{}; // An end-of-stream frame was written and nothing was submitted since.
     u64 idle_releases{}; // Releases of images the decoder already held (diagnostics).
     Kernel::KProcess* process;
     NativeVideoKind kind;
