@@ -7077,6 +7077,29 @@ TEST_CASE("Native Donkey Kong Bananza instructions lower to the matching Maxwell
     if (size_shift != 0) REQUIRE(((*found >> size_shift) & 7) == size);
 }
 
+TEST_CASE("Native float set combines the comparison with an input predicate", "[native-shader]") {
+    // FSET.BF.LT.<op> R5 = (R1 < R2) <op> P0, the form Donkey Kong Bananza uses with AND.
+    const u32 operation = GENERATE(0U, 1U, 2U); // AND, OR, XOR
+    const bool p0 = GENERATE(false, true);
+    const std::array<Native, 2> input{{{{0x0105720aU, 0x00000002U,
+                                         0x00011200U | (operation << 10), 0}},
+                                       VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (const auto [a, b] : {std::pair{1.0f, 2.0f}, std::pair{2.0f, 1.0f}}) {
+        ScalarNativeMachine machine;
+        machine.regs[1] = std::bit_cast<u32>(a);
+        machine.regs[2] = std::bit_cast<u32>(b);
+        machine.predicates.fill(true);
+        machine.predicates[0] = p0;
+        machine.Execute(block);
+        const bool less = a < b;
+        const bool expected = operation == 0 ? (less && p0) : operation == 1 ? (less || p0) : (less != p0);
+        REQUIRE(std::bit_cast<float>(machine.regs[5]) == (expected ? 1.0f : 0.0f));
+    }
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);

@@ -2771,18 +2771,16 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
             break;
         }
-        case 0x20a: case 0x80a: case 0xa0a: case 0xc0a: { // FSET.BF with PT/AND
-            // [merge-fset-or] One observed FSET.BF form combines with a PT-OR instead of the AND.
-            const bool fast_fusion_or = insn.words[0] == 0x131e720a &&
-                insn.words[1] == 0x000000ff && insn.words[2] == 0x0081d400;
-            if (!fast_fusion_or &&
-                (insn.Bits(64, 8) || insn.Bits(74, 2) || insn.Bits(81, 6) ||
-                insn.Bits(87, 4) != 7 || insn.Bits(91, 1) != (opcode == 0xc0a ? 1U : 0U)))
+        case 0x20a: case 0x80a: case 0xa0a: case 0xc0a: { // FSET.BF combined with Pc (87-90) by 74-75
+            // The combining predicate and operation map onto Maxwell FSET's (39-42 and 45-46), as
+            // Eglantine does. This also covers the PT-OR form [merge-fset-or] once special-cased
+            // here (P1, OR), and the P0-AND form in Donkey Kong Bananza's graphics.
+            if (insn.Bits(64, 8) || insn.Bits(74, 2) == 3 || insn.Bits(81, 6) ||
+                insn.Bits(91, 1) != (opcode == 0xc0a ? 1U : 0U))
                 return fail(index, "native floating comparison output mode");
             const u32 a = operand(0), b = operand(1);
             emit(base(0x5800000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
-                 (u64{fast_fusion_or ? 1U : 7U} << 39) |
-                 (u64{fast_fusion_or ? 1U : 0U} << 45) |
+                 (u64{insn.Bits(87, 4)} << 39) | (u64{insn.Bits(74, 2)} << 45) |
                  (u64{insn.Bits(76, 4)} << 48) | (u64{1} << 52) |
                  (u64{insn.Bits(80, 1)} << 55));
             break;
