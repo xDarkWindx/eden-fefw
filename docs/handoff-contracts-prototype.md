@@ -171,7 +171,7 @@ Valem para tudo o que o T3 escrever. O desenho está em `docs/list-diag-design.m
 2. **Observar sem corrigir.** Nada de travas novas que ordenem o pop em relação à aplicação dos avisos, nem
    aplicação antecipada. A leitura do estado dos avisos pela thread de fences não pode ser um `Gather` nem um
    peek no `GPUDirtyMemoryManager` (o `Gather` consome, e o peek não vê o aviso entre o `Gather` e a aplicação):
-   livro-razão próprio, sem trava no escritor (`docs/list-diag-design.md`, 3.2, com o que ele deixa de ver).
+   livro-razão próprio, sem trava no escritor, com o aviso ligado ao **lote** que o `Gather` retira (`lot_started`/`lot_done`, só do diagnóstico) e o aviso tratado como **registrado, nunca como escrita concluída** (`docs/list-diag-design.md`, 3.2 a 3.6, com o que ele deixa de ver).
 3. **Custo:** contadores agregados (no `EDEN_BACK_THREAD_STATS`) e logs limitados (primeiras N, depois
    amostragem). Plano de teste no FE: diagnóstico desligado contra ligado na praça e no palácio (draws/s, com
    as estatísticas de tempo desligadas), além do Bananza (`docs/list-diag-design.md`, 8.3).
@@ -191,8 +191,8 @@ integrar.
 
 ### T3 — Build de diagnóstico de listas (código real, **desligado por padrão**)
 
-**Estado:** harness feito; **desenho proposto e aguardando aprovação** (`docs/list-diag-design.md`, decisões na
-seção 10). Não escreva código do emulador antes dela. Fases propostas: T3a (`pop` e `blk`) e T3b (`list`).
+**Estado:** harness feito; **desenho proposto (revisão 1, seção 11 do doc) e aguardando aprovação** (`docs/list-diag-design.md`,
+decisões na seção 10). Não escreva código do emulador antes dela. Fases propostas: T3a (`pop` e `blk`) e T3b (`list`).
 
 Escopo que o revisor pediu: **pequeno, opt-in, com testes de integração, sem habilitar nada por padrão.**
 Não comece sem ler a seção 5 acima e `docs/gpu-produced-data-plan.md`, 4.1.2.
