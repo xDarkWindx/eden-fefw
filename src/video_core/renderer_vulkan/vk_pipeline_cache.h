@@ -128,6 +128,10 @@ public:
                            const VideoCore::DiskResourceLoadCallback& callback);
 
     /// True (once) when the last null pipeline was withheld because it is still being built asynchronously.
+    /// Whether the bound vertex program is Donkey Kong Bananza's indirect record reset (11
+    /// instructions, recognised by its native program key), from Eglantine.
+    [[nodiscard]] bool IsIndirectResetShader() const;
+
     [[nodiscard]] bool TakeDeferredDraw() noexcept {
         return std::exchange(draw_deferred, false);
     }

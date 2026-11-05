@@ -629,6 +629,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
                                    program_base, lowered.error_offset, lowered.error);
     }
     auto result = std::make_shared<LoweredNativeCode>();
+    result->diagnostic_key = native_program_key;
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;
     result->source_header_size = native_header_size;

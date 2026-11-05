@@ -50,6 +50,8 @@ struct LoweredNativeCode {
     std::vector<std::pair<u32, std::vector<u32>>> native_indirect_tables;
     std::vector<Shader::Ampere::Instruction> native_trap_prefix;
     u32 source_header_size{};
+    /// NativeProgramKey of the native program, to recognise specific programs (indirect reset).
+    u64 diagnostic_key{};
 };
 
 class GenericEnvironment : public Shader::Environment {

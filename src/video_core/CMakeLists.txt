@@ -95,6 +95,7 @@ add_library(video_core STATIC
     fence_manager.h
     gpu.cpp
     gpu.h
+    indirect_reset.h
     native_root_table.h
     native_semaphore.h
     back_thread_stats.cpp

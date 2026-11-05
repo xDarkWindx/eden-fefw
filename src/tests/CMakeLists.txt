@@ -31,6 +31,7 @@ add_executable(tests
     video_core/native_shader.cpp
     video_core/native_swizzle.cpp
     video_core/image_overlap.cpp
+    video_core/indirect_reset.cpp
     video_core/pending_download.cpp
     video_core/memory_tracker.cpp
     input_common/calibration_configuration_job.cpp

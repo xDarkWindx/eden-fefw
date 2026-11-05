@@ -48,6 +48,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/back_thread_stats.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/indirect_reset.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -249,6 +250,86 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+// Donkey Kong Bananza draws its destructible terrain indirectly, and before that a vertex
+// program resets the indirect records ({count 0, instances 1, ...}) through a list of pointers
+// in its constant buffer. Its stores do not run as such here, so the records kept stale counts
+// and the terrain stayed invisible. Recognised by its native program key, the reset is done on
+// the CPU in place of the draw (from Eglantine 7abf1f9546, adapted there from PokeDinner).
+// EDEN_NX2_RESETFIX=0 turns it off.
+bool RasterizerVulkan::TryNx2IndirectReset() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RESETFIX");
+        return !value || std::string_view{value} != "0";
+    }();
+    if (!enabled || !maxwell3d->GetNativeMacroEngine().native_turing ||
+        !pipeline_cache.IsIndirectResetShader()) {
+        return false;
+    }
+    const auto reject = [](std::string_view reason) {
+        static std::atomic<u32> reported_rejections{};
+        if (reported_rejections++ < 8) {
+            LOG_WARNING(HW_GPU, "Indirect reset skipped: {}", reason);
+        }
+        return false;
+    };
+    const auto in_gpu_range = [this](u64 address, size_t size) {
+        return size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+               gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsWithinGPUAddressRange(address + size - 1);
+    };
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled || cbuf.size < 0x120 || !in_gpu_range(cbuf.address, 0x120) ||
+        !gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, 16)) {
+        return reject("descriptor unavailable");
+    }
+    std::array<u64, 2> descriptor{};
+    gpu_memory->ReadBlock(cbuf.address + 0x110, descriptor.data(), sizeof(descriptor));
+    const u64 list = descriptor[0];
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const u64 first = draw.vertex_buffer.first;
+    const u64 count = draw.vertex_buffer.count;
+    const auto range = VideoCommon::IndirectResetRange(list, static_cast<u32>(descriptor[1]),
+                                                        first, count);
+    if (!range || !in_gpu_range(range->begin, range->size) ||
+        !gpu_memory->IsFullyMappedRange(range->begin, range->size)) {
+        return reject("list outside mapped descriptor");
+    }
+    if (gpu_memory->IsMemoryDirty(range->begin, range->size, VideoCommon::CacheType::BufferCache)) {
+        gpu_memory->FlushRegion(range->begin, range->size, VideoCommon::CacheType::BufferCache);
+    }
+    std::vector<u64> pointers(count);
+    gpu_memory->ReadBlockUnsafe(range->begin, pointers.data(), range->size);
+    static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+    for (const u64 pointer : pointers) {
+        if (!pointer) {
+            continue;
+        }
+        if (!in_gpu_range(pointer, sizeof(record)) ||
+            !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+            return reject("record not mapped");
+        }
+        if (pointer < range->begin + range->size && range->begin < pointer + sizeof(record)) {
+            return reject("record overlaps pointer list");
+        }
+        const auto segments = gpu_memory->GetSubmappedRange(pointer, sizeof(record));
+        if (segments.size() != 1 || segments[0].first != pointer ||
+            segments[0].second != sizeof(record)) {
+            return reject("record crosses a mapping boundary");
+        }
+    }
+    const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
+    for (const u64 pointer : pointers) {
+        if (pointer) {
+            AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+        }
+    }
+    static std::atomic<u32> reported{};
+    if (reported++ < 5) {
+        LOG_INFO(HW_GPU, "Indirect reset: {} records", count);
+    }
+    return true;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     namespace BackStats = VideoCommon::BackStats;
@@ -292,6 +373,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (!pipeline) {
         // A draw withheld for an asynchronous pipeline build is not a failure of the native work.
         submitted = pipeline_cache.TakeDeferredDraw();
+        return;
+    }
+    if (!is_indexed && TryNx2IndirectReset()) {
+        submitted = true;
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

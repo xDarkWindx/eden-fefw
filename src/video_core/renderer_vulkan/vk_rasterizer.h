@@ -135,6 +135,9 @@ public:
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
+    /// Donkey Kong Bananza's indirect record reset, done on the CPU in place of its draw.
+    bool TryNx2IndirectReset();
+
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,

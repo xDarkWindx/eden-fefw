@@ -881,6 +881,15 @@ bool PipelineCache::BuildNewGraphicsPipeline() {
     return true;
 }
 
+bool PipelineCache::IsIndirectResetShader() const {
+    constexpr size_t vertex_b = static_cast<size_t>(Maxwell::ShaderType::VertexB);
+    constexpr u64 reset_key = 0x72fd62555e7196cdULL;
+    const auto* info = shader_infos[vertex_b];
+    return maxwell3d->regs.IsShaderConfigEnabled(vertex_b) && info && info->lowered_native &&
+           info->lowered_native->source_size == 128 + 11 * 16 &&
+           info->lowered_native->diagnostic_key == reset_key;
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
