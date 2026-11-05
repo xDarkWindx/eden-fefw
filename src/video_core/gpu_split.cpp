@@ -14,6 +14,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "video_core/back_thread_stats.h"
+#include "video_core/accuracy_parts.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 
@@ -96,7 +97,10 @@ void GpuSplit::MaybeStart(Core::System& system_) {
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
     const char* jit = std::getenv("EDEN_MME_JIT");
-    front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
+    // Macro parameters the GPU wrote are re-read before a macro runs (VideoCommon::NativeMacroRefresh),
+    // which flushes the back's caches: macros then stay on the back, as in mode 1.
+    front_macros = mode == '2' && (jit == nullptr || jit[0] != '0') && !VideoCommon::NativeMacroRefresh() &&
+                   !VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::MacroParameters);
 #endif
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");

@@ -33,4 +33,15 @@ enum class HighAccuracyPart : u32 {
     return Settings::IsGPULevelHigh() || (HighAccuracyPartsMask() & static_cast<u32>(part)) != 0;
 }
 
+/// Switch 2 (native) channels re-read macro parameters that the GPU may have written, at any
+/// accuracy level: Donkey Kong Bananza's terrain draws take counts written by compute programs and
+/// were not drawn at Fast without it. EDEN_NX2_MACRO_REFRESH=0 turns this off.
+[[nodiscard]] inline bool NativeMacroRefresh() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MACRO_REFRESH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 } // namespace VideoCommon

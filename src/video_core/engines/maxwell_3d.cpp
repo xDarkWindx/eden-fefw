@@ -264,7 +264,8 @@ bool Maxwell3D::ReadMacroMemory(GPUVAddr address, std::span<u32> words) {
 }
 
 void Maxwell3D::RefreshParametersImpl() {
-    if (!VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::MacroParameters)) {
+    if (!VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::MacroParameters) &&
+        !(GetNativeMacroEngine().native_turing && VideoCommon::NativeMacroRefresh())) {
         return;
     }
     size_t current_index = 0;
