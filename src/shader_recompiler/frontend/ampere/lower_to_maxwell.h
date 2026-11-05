@@ -175,6 +175,45 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         return branch.words[0] == ((pred << 12) | 0x947) && branch.words[2] == 0x03800000 &&
                s64{at + 1} * 16 + static_cast<s32>(branch.words[1]) == destination;
     };
+    // A branch at `at` (guard `pred`, no second condition) to straight-line code that reaches
+    // `join` by falling into it or through one unconditional branch to it, and that nothing else
+    // enters: the instruction before the code is an unconditional branch, and no other branch
+    // lands in it. For a cancellation, the canceled tokens then meet the join's SYNC exactly as
+    // when the branch goes to the join itself (a loop break in Donkey Kong Bananza's compute,
+    // @P0 BREAK B3; @P0 BRA to moves and a BRA to BSYNC B2).
+    const auto branches_through_exclusive_path_to = [&](u32 at, u32 pred, s64 join) {
+        if (at >= code.size() || join < 0 || join % 16 || static_cast<u64>(join / 16) >= code.size()) return false;
+        const auto& branch = code[at];
+        if (branch.words[0] != ((pred << 12) | 0x947) || branch.words[2] != 0x03800000) return false;
+        const s64 target = s64{at + 1} * 16 + static_cast<s32>(branch.words[1]);
+        if (target == join) return true;
+        if (target <= 0 || target % 16 || target > join) return false;
+        const auto unconditional = [](const Instruction& op) {
+            return op.Bits(0, 12) == 0x947 && op.Bits(12, 4) == 7 && op.words[2] == 0x03800000;
+        };
+        const auto destination = [&](u32 where) {
+            return s64{where + 1} * 16 + static_cast<s32>(code[where].words[1]);
+        };
+        if (!unconditional(code[target / 16 - 1])) return false;
+        s64 end = join / 16; // the last instruction of the path (exclusive of the join itself)
+        for (s64 k = target / 16; k < join / 16; ++k) {
+            const u32 op = code[k].Bits(0, 12);
+            const bool control = op == 0x947 || op == 0x945 || op == 0x941 || op == 0x942 || op == 0x944 ||
+                                 op == 0x948 || op == 0x949 || op == 0x94d || op == 0x950 || op == 0x958 ||
+                                 op == 0x95b;
+            if (!control) continue;
+            if (!unconditional(code[k]) || destination(static_cast<u32>(k)) != join) return false;
+            end = k;
+            break;
+        }
+        for (u32 other = 0; other < code.size(); ++other) {
+            if (other == at || code[other].Bits(0, 12) != 0x947) continue;
+            const u64 raw = code[other].words[1] | (u64{code[other].words[2] & 0x3ffff} << 32);
+            const s64 landing = s64{other + 1} * 16 + (static_cast<s64>(raw << 14) >> 14);
+            if (landing >= target && landing <= end * 16) return false;
+        }
+        return true;
+    };
     if (has_barrier_break) {
         std::vector<u32> scopes;
         for (u32 at = 0; at < code.size(); ++at) {
@@ -191,7 +230,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 const bool split_exit = (pred & 7) != 7 &&
                     branches_to(at + 1, pred ^ 8U, inner_join) && branches_to(at + 2, 7, join);
                 if (op.Bits(16, 4) == inner.Bits(16, 4) &&
-                    (branches_to(at + 1, pred, join) || split_exit))
+                    (branches_through_exclusive_path_to(at + 1, pred, join) || split_exit))
                     cancellation_parent_scopes.push_back(parent_index);
             }
         }
@@ -3570,7 +3609,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 const bool split_exit = (native_predicate & 7) != 7 &&
                     branches_to(index + 1, native_predicate ^ 8U, inner_join) &&
                     branches_to(index + 2, 7, join);
-                if ((branches_to(index + 1, native_predicate, join) || split_exit) &&
+                if ((branches_through_exclusive_path_to(index + 1, native_predicate, join) || split_exit) &&
                     join >= barrier_targets.back() && join % 16 == 0 &&
                     static_cast<u64>(join / 16) < code.size() &&
                     code[join / 16].words[0] == ((barrier_tokens[barrier_tokens.size() - 2] << 16) | 0x7941) &&

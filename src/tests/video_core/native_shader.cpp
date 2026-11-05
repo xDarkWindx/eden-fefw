@@ -1940,6 +1940,71 @@ TEST_CASE("Native conditional cancellation leaves the inner scope through exclus
 }
 
 
+TEST_CASE("Native inner cancellation reaches the parent join through exclusive code", "[native-shader]") {
+    // Donkey Kong Bananza's loop break, with scopes left open around the parent: @P0 BREAK B2 and
+    // @P0 BRA to moves that branch to the parent's BSYNC B1; the normal path branches over them.
+    const std::array<Native, 13> input{{
+        {{0x7945, 176, 0x03800000, 0}},  // 0x00 BSSY B0, join after 0xb0
+        {{0x17945, 144, 0x03800000, 0}}, // 0x10 BSSY B1, join after 0xa0
+        {{0x27945, 48, 0x03800000, 0}},  // 0x20 BSSY B2, join after 0x50
+        {{0x20942, 0, 0x03800000, 0}},   // 0x30 @P0 BREAK B2
+        {{0x0947, 48, 0x03800000, 0}},   // 0x40 @P0 BRA 0x80
+        {{0x27941, 0, 0x03800000, 0}},   // 0x50 BSYNC B2
+        {{0x27802, 3, 0xf00, 0}},        // 0x60 MOV R2, 3
+        {{0x7947, 32, 0x03800000, 0}},   // 0x70 BRA 0xa0
+        {{0x37802, 4, 0xf00, 0}},        // 0x80 MOV R3, 4 (cleanup)
+        {{0x7947, 0, 0x03800000, 0}},    // 0x90 BRA 0xa0
+        {{0x17941, 0, 0x03800000, 0}},   // 0xa0 BSYNC B1
+        {{0x7941, 0, 0x03800000, 0}},    // 0xb0 BSYNC B0
+        VertexTransform.back(),
+    }};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    auto invalid = input;
+    invalid[9] = {{0x7947, 0xffffffc0U, 0x0383ffff, 0}}; // the cleanup branches back into B2
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[7].words[0] = 0x7918; // the normal path falls into the cleanup (NOP)
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    std::vector<u64> code(0x50 / 8);
+    for (const auto word : lowered.instructions) {
+        if ((code.size() * 8) % 32 == 0) code.push_back(0);
+        code.push_back(word);
+    }
+    class ParentEnvironment final : public EmptyEnvironment {
+    public:
+        explicit ParentEnvironment(const std::vector<u64>& code_) : code{code_} { stage = Shader::Stage::VertexB; }
+        u64 ReadInstruction(u32 address) override { return code.at(address / 8); }
+        const std::vector<u64>& code;
+    } env{code};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, 0x50};
+    INFO(cfg.Dot());
+    const auto location = [&](u32 index) {
+        const u32 offset = lowered.source_instruction_offsets[index];
+        return Shader::Maxwell::Location{0x50 + offset * 8 + ((offset + 1) / 3) * 8};
+    };
+    for (const bool p0 : {false, true}) {
+        const auto* block = &*cfg.Functions().front().blocks.begin();
+        bool cleaned{}, continued{}, exited{};
+        for (u32 step = 0; step < 64 && block; ++step) {
+            cleaned |= !block->begin.IsVirtual() && block->Contains(location(8));
+            continued |= !block->begin.IsVirtual() && block->Contains(location(6));
+            if (block->end_class == Shader::Maxwell::Flow::EndClass::Exit) { exited = true; break; }
+            const auto [pred, inverted] = block->cond.GetPred();
+            REQUIRE(block->cond.GetFlowTest() == IR::FlowTest::T);
+            REQUIRE((pred == IR::Pred::P0 || pred == IR::Pred::PT));
+            block = ((pred == IR::Pred::PT || p0) != inverted) ? block->branch_true : block->branch_false;
+        }
+        INFO("P0=" << p0);
+        REQUIRE(exited);
+        REQUIRE(cleaned == p0);
+        REQUIRE(continued == !p0);
+    }
+}
+
+
 TEST_CASE("Native full warp synchronization retains ordering after reconvergence", "[native-shader]") {
     std::array<Native, 4> input{{
         {{0x7945, 16, 0x03800000, 0}},
