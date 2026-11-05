@@ -803,6 +803,19 @@ private:
         rb.Push(result.raw);
     }
 
+    // Outputs written but not fetched by the game: their images go back to the decoder, at the
+    // end of the fence sequence (their old fence was already reached).
+    void ReclaimUnfetchedOutputs() {
+        for (const auto& properties : output_properties) {
+            const auto image = std::ranges::find(registered_images, properties[0], &RegisteredImage::id);
+            if (image != registered_images.end() && !image->available) {
+                image->completion_value = ++next_completion_value;
+                image->available = true;
+            }
+        }
+        output_properties.clear();
+    }
+
     void Flush(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
         Result result = Kernel::ResultInvalidCombination;
@@ -810,11 +823,25 @@ private:
             result = Kernel::ResultInvalidState;
             if (started && configuration) {
                 if (h264_context) {
-                    // Decode everything submitted, then drain the decoder so no frame stays queued.
-                    result = PumpOutput();
-                    if (result.IsSuccess()) {
-                        DrainH264();
-                        result = PumpOutput();
+                    // Like the AV1 path below (and Eglantine's decoder), drop everything in flight
+                    // rather than decode it: Donkey Kong Bananza flushes when a movie ends and then
+                    // submits it again from the start to loop it. Frames of the old pass handed out
+                    // after the flush (an end-of-stream frame above all) ended the new pass, so the
+                    // panel video played once. Outputs written but not fetched give their image
+                    // back to the decoder at the end of the fence sequence.
+                    std::unique_lock lock{decode_mutex};
+                    ReclaimUnfetchedOutputs();
+                    LOG_DEBUG(Service_AM, "native H.264 flush drops inputs={}, frames={}",
+                              pending_inputs.size(), decoded_frames.size());
+                    decoded_frames.clear();
+                    pending_inputs.clear();
+                    pending_input_bytes = 0;
+                    lock.unlock();
+                    avcodec_flush_buffers(h264_context->GetCodecContext());
+                    h264_timestamps.clear();
+                    result = ResultSuccess;
+                    if (submission_event && transfer_memory) {
+                        submission_event->Signal(kernel);
                     }
                 } else {
                     // AV1 (Fortune's Weave flushes its character-select clips when one ends or the
@@ -825,16 +852,9 @@ private:
                     // image back to the decoder, at the end of the fence sequence (their old fence was
                     // already reached). libgav1 is reset so the next input may start a new sequence.
                     const auto lock = QuiesceAv1Decoding();
-                    for (const auto& properties : output_properties) {
-                        const auto image = std::ranges::find(registered_images, properties[0], &RegisteredImage::id);
-                        if (image != registered_images.end() && !image->available) {
-                            image->completion_value = ++next_completion_value;
-                            image->available = true;
-                        }
-                    }
                     LOG_DEBUG(Service_AM, "native AV1 flush drops inputs={}, frames={}, outputs={}",
                               pending_inputs.size(), decoded_frames.size(), output_properties.size());
-                    output_properties.clear();
+                    ReclaimUnfetchedOutputs();
                     decoded_frames.clear();
                     pending_inputs.clear();
                     pending_input_bytes = 0;
@@ -866,7 +886,10 @@ private:
             // Like a MediaCodec flush, a flushed decoder is resumed with Start (Fortune's Weave
             // calls Flush then Start when its character-select clip loops or changes, and aborts
             // on InvalidState). Games that keep submitting after Flush need no Start.
-            if (Initialized() && configuration && !registered_images.empty() && (!started || flushed)) {
+            // Starting a decoder that already runs changes nothing and succeeds, as in Eglantine,
+            // whose Start always succeeds: a game that starts its looping movie again must not
+            // get an error that stops it.
+            if (Initialized() && configuration && !registered_images.empty()) {
                 started = true;
                 flushed = false;
                 submission_event->Signal(kernel);
