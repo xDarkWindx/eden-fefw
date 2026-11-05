@@ -59,8 +59,9 @@ leitores (seção 3.14 e 9 daquele plano).
   de memória por macros, `AccelerateDMA` com retorno).
 
 **Primeiro passo possível, na mesma thread:** a engine produz um pacote de draw e o rasterizador o consome
-logo depois, sem thread nova. Isso testa a captura (registradores e versões de memória) sem mudar o tempo, e
-um modo de verificação compara o resultado com o caminho direto.
+logo depois, sem thread nova. Isso testa a captura (registradores e versões de memória) sem introduzir
+concorrência nova; o custo e a temporização ainda podem mudar (montar e ler o pacote custa) e são medidos. Um
+modo de verificação compara o resultado com o caminho direto.
 
 **Teste de aceitação:** enfileirar o draw A; modificar registradores e memória (constant buffer, argumento
 indireto) para o draw B; atrasar o rasterizador; verificar que A usa os dados da sua posição e B os seus.
