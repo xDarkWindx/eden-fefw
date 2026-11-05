@@ -289,11 +289,19 @@ private:
         const auto& input = pending_inputs.front();
         if (input.eos) {
             DrainH264();
-            DecodedFrame frame{};
-            frame.eos = true;
-            frame.submission_id = input.submission_id;
-            frame.timestamp = input.timestamp;
-            decoded_frames.push_back(std::move(frame));
+            // As Eglantine does, the last picture carries the end of stream; an empty frame only
+            // when none is left to carry it. Donkey Kong Bananza's looping panel movie got an
+            // extra empty 0x0 frame here, then spun releasing images after its Flush instead of
+            // submitting the movie again.
+            if (!decoded_frames.empty()) {
+                decoded_frames.back().eos = true;
+            } else {
+                DecodedFrame frame{};
+                frame.eos = true;
+                frame.submission_id = input.submission_id;
+                frame.timestamp = input.timestamp;
+                decoded_frames.push_back(std::move(frame));
+            }
             pending_inputs.pop_front();
             R_SUCCEED();
         }
@@ -444,17 +452,19 @@ private:
                 decode_cv.notify_all(); // Room to decode ahead again.
             }
             timing.decode += frame.decode_time;
+            // An end-of-stream frame may carry the last picture (H.264) or none.
+            const bool has_picture = frame.widths[0] != 0 && frame.heights[0] != 0;
             const auto& pool = *image->pool;
             const u32 pool_width = (pool.packed_dimensions & 0xffffU) + 1;
             const u32 pool_height = (pool.packed_dimensions >> 16) + 1;
-            if (!frame.eos && (frame.bitdepth != 8 || frame.format != 0 ||
+            if (has_picture && (frame.bitdepth != 8 || frame.format != 0 ||
                 (!pool.layout.nv12 && frame.matrix != 1) ||
                 frame.widths[0] > pool_width || frame.heights[0] > pool_height)) {
                 LOG_ERROR(Service_AM, "Unsupported native AV1 output: depth={}, format={}, matrix={}, dimensions={}x{}",
                           frame.bitdepth, frame.format, frame.matrix, frame.widths[0], frame.heights[0]);
                 R_THROW(Kernel::ResultNotImplemented);
             }
-            if (!frame.eos && pool.layout.nv12) {
+            if (has_picture && pool.layout.nv12) {
                 // NV12 pool: copy the planes as decoded, with the interleaved chroma plane after
                 // the luma plane; colour conversion is left to the game.
                 std::vector<u8> nv12(pool.layout.image_bytes);
@@ -472,7 +482,7 @@ private:
                 const u64 offset = u64{image->index} * pool.layout.image_stride;
                 system.GPU().InvalidateRegion(pool.device_address + offset, nv12.size());
                 R_UNLESS(process->GetMemory().WriteBlock(pool.address + offset, nv12.data(), nv12.size()), Kernel::ResultInvalidAddress);
-            } else if (!frame.eos) {
+            } else if (has_picture) {
                 auto stage_start = std::chrono::steady_clock::now();
                 const auto lap = [&](std::chrono::steady_clock::duration& total) {
                     const auto now = std::chrono::steady_clock::now();
@@ -555,7 +565,7 @@ private:
                 R_UNLESS(process->GetMemory().WriteBlock(pool.address + offset, tiled.data(), tiled.size()), Kernel::ResultInvalidAddress);
                 lap(timing.write);
             }
-            if (!frame.eos && ++timing.frames == 60) {
+            if (has_picture && ++timing.frames == 60) {
                 using ms = std::chrono::duration<double, std::milli>;
                 const auto now = std::chrono::steady_clock::now();
                 LOG_INFO(Service_AM,
@@ -571,8 +581,9 @@ private:
             properties[0] = image->id;
             properties[1] = configuration->width;
             properties[2] = configuration->height;
-            properties[3] = frame.widths[0];
-            properties[4] = frame.heights[0];
+            // An empty end-of-stream frame reports the configured size, as Eglantine does, not 0x0.
+            properties[3] = has_picture ? frame.widths[0] : configuration->width;
+            properties[4] = has_picture ? frame.heights[0] : configuration->height;
             const u64 timestamp_ns = frame.timestamp * 1000;
             properties[6] = static_cast<u32>(timestamp_ns);
             properties[7] = static_cast<u32>(timestamp_ns >> 32);
