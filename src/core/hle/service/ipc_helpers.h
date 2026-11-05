@@ -25,6 +25,9 @@ namespace IPC {
 constexpr Result ResultNotSupported{ErrorModule::HIPC, 1};
 constexpr Result ResultSessionClosed{ErrorModule::HIPC, 301};
 
+/// Logs, once per service and command, a reply carrying kernel ResultNotImplemented (2001-0033).
+void ReportNotImplementedReply(Service::HLERequestContext& ctx);
+
 struct ResponseBuilder {
     /// Flags used for customizing the behavior of ResponseBuilder
     enum class Flags : u32 {
@@ -36,6 +39,7 @@ struct ResponseBuilder {
 
     inline explicit ResponseBuilder(Service::HLERequestContext& ctx, u32 normal_params_size_, u32 num_handles_to_copy_ = 0, u32 num_objects_to_move_ = 0, Flags flags = Flags::None)
         : cmdbuf(ctx.CommandBuffer())
+        , context(&ctx)
         , normal_params_size(normal_params_size_)
         , num_handles_to_copy(num_handles_to_copy_)
         , num_objects_to_move(num_objects_to_move_)
@@ -175,6 +179,7 @@ struct ResponseBuilder {
     template <typename... O> void PushCopyObjects(Service::HLERequestContext& ctx, O&... pointers);
 
     u32* cmdbuf;
+    Service::HLERequestContext* context{};
     u32 index = 0;
     u32 normal_params_size{};
     u32 num_handles_to_copy{};
@@ -189,6 +194,11 @@ inline void ResponseBuilder::PushImpl(s32 value) {
 }
 
 inline void ResponseBuilder::PushImpl(u32 value) {
+    // The first word of the data payload is the reply's result. Games abort on an unexpected
+    // 2001-0033 without naming the call, and several native services return it silently.
+    if (index == data_payload_index && value == 0x4201 && context) {
+        ReportNotImplementedReply(*context);
+    }
     cmdbuf[index++] = value;
 }
 

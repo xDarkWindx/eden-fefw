@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
+#include <set>
 #include <sstream>
+#include <string>
+#include <utility>
 
 #include <boost/range/algorithm_ext/erase.hpp>
 
@@ -25,6 +29,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/service.h"
 #include "core/memory.h"
 
 namespace Service {
@@ -569,3 +574,28 @@ std::string HLERequestContext::Description() const {
 }
 
 } // namespace Service
+
+namespace IPC {
+
+void ReportNotImplementedReply(Service::HLERequestContext& ctx) {
+    std::string service{"unknown service"};
+    if (const auto manager = ctx.GetManager(); manager && manager->HasSessionHandler()) {
+        if (const auto* framework =
+                dynamic_cast<const Service::ServiceFrameworkBase*>(&manager->SessionHandler())) {
+            service = std::string{framework->GetServiceName()};
+        }
+    }
+    const u32 command = ctx.GetCommand();
+    static std::mutex mutex;
+    static std::set<std::pair<std::string, u32>> reported;
+    {
+        std::scoped_lock lock{mutex};
+        if (!reported.emplace(service, command).second) {
+            return;
+        }
+    }
+    LOG_WARNING(Service, "{} command {} ({}) replied 2001-0033 (not implemented)", service, command,
+                ctx.IsTipc() ? "TIPC" : "CMIF");
+}
+
+} // namespace IPC
