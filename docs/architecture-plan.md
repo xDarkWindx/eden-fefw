@@ -99,6 +99,11 @@ Três requisitos, nas palavras do usuário:
   Cada local que precisa de algo da de trás chama `Drain` e espera a fila inteira.
 - **Proposta:** marcos anotados na frente ao enviar (último produtor de compute ou cópia, última espera de
   host) e um primitivo `WaitFor(posição)` que espera a de trás passar de um marco.
+- **Posição não é dependência (revisão 2):** a thread de trás ter processado um método de espera não quer
+  dizer que a condição dele foi satisfeita. Hoje o acquire de syncpoint nem espera (`puller.cpp:126-132`), e
+  um produtor de outro canal pode nem estar no ring ainda. Um marco de espera de host carrega a condição
+  (semáforo e valor, syncpoint e valor) e só vale quando ela é satisfeita; passar da posição serve para
+  ordem, não para conclusão. Conclusão na GPU é outra coisa ainda (fence).
 - **Regra de dono (revisão):** depois de um `WaitFor`, a thread de trás **continua** executando. Por isso a
   frente não pode consultar `IsMemoryDirty`, fazer `FlushRegion` nem tocar no scheduler. Hoje essas consultas
   passam pelo rasterizador e pelos locks dos caches (`memory_manager.cpp:518`, `vk_rasterizer.cpp:862-878`).
@@ -188,7 +193,8 @@ o padrão antes de medir.
 | 1 | Corpus de shaders + sweep; inventário de configurações e de todos os efeitos do nível High | nenhum |
 | 2 | Diagnóstico de command lists e matriz de testes (gpu-produced-data-plan 4.1), sem trocar a fonte | nenhum com o diagnóstico desligado |
 | 3 | Teste das faixas de downloads pendentes (15126fb), independente do Bananza | baixo |
-| 4 | Protocolo mínimo exato: filtro, marcos de espera de host, transferências feitas e publicadas pela thread de trás, conclusão na GPU | médio; medir o custo do filtro e das esperas |
+| 4 | Casos dirigidos num harness (primeira escrita, outro canal, retomada, reuso pela CPU, dois produtores); espera real do acquire de syncpoint, atrás de chave | médio na espera de syncpoint; A/B |
+| 4b | Protocolo mínimo: filtro, dependências satisfeitas (não só posições), cópias ordenadas na posição do consumidor e publicadas pela thread de trás, conclusão na GPU | médio; medir o custo fixo e das esperas |
 | 5 | Consumidor de command lists, opt-in; validar reutilização pela CPU, primeira escrita e retomada depois de acquire | baixo enquanto opt-in |
 | 6 | Decidir: reverter o 6d3dd9a no split, padrão do consumidor | o objetivo é ganhar de volta as macros na frente |
 | 7 | Registro de políticas (sem mudar padrões) | nenhum |
@@ -241,3 +247,4 @@ o padrão antes de medir.
 | Memória global também pode ir ao buffer errado | Seção 1 corrigida |
 | Contagem de 19 variáveis sem critério | Critério e lista na seção 1 |
 | Ordem: diagnóstico e protocolo antes da arquitetura global | Seção 5 reescrita conforme a revisão |
+| (revisão 2) Posição no ring não é dependência satisfeita | 3.3 e passo 4 da seção 5 |

@@ -10,6 +10,11 @@ aqui) e **hipótese**.
 conferidas no código; o que mudou está na seção 9, e as seções 0, 2, 3.1, 4.1, 5 e 7 foram corrigidas no
 lugar. A principal mudança: a opção "aprendida" para command lists saiu, e o teste virou diagnóstico.
 
+**Revisão 2 (2026-11-05):** incorpora a segunda revisão, sobre `ba797e4`, conferida no código. O que mudou
+está na seção 10; as seções 0, 4.1, 4.2, 5, 6 e 7 foram corrigidas no lugar. A principal mudança: as
+dependências de host precisam ser satisfeitas, não só processadas, e o consumidor só vem depois de casos
+dirigidos.
+
 Este plano é o primeiro caso concreto de `docs/architecture-plan.md`. O desenho daqui segue aquele.
 
 ## 0. Resumo
@@ -31,9 +36,10 @@ Este plano é o primeiro caso concreto de `docs/architecture-plan.md`. O desenho
    que é o motivo do snapshot, `nvhost_gpu.cpp:392-397`).
    A hipótese **não está demonstrada**: falta saber quais palavras o Bananza produz, quem as escreve e que
    versão chega ao parser.
-4. **Proposta:** primeiro um build de diagnóstico que compara, por entrada, o snapshot com a versão coerente
-   e diz o que difere (seção 4.1). Só com esse resultado se decide o consumidor, e o desenho dele segue um
-   protocolo exato (seção 4.2), sem execução especulativa de comandos.
+4. **Proposta:** primeiro um build de diagnóstico que compara, por entrada, as palavras usadas com a versão
+   coerente e diz o que difere (seção 4.1), e casos dirigidos num harness (4.1.4). Só depois vem o consumidor
+   (seção 4.2), sem execução especulativa de comandos; ele só pode ser chamado de exato quando os casos
+   dirigidos passarem.
 
 ## 1. Restrições
 
@@ -135,72 +141,113 @@ Contadores por caminho de leitura (`EDEN_NX2_CMDPAGE_DIAG` do Lichii) e servidor
 Isso diz se o modo Safe conserta a cor, mas **não confirma a causa**: o Safe passa por `FlushRegion`, que
 baixa também texturas e muda o tempo (seção 2). Uma melhora pode vir disso.
 
-**4.1.2 Build de diagnóstico (desligado por padrão, `EDEN_LIST_DIAG=1`).** Para cada entrada executada
-pelo snapshot cujas páginas tenham faixas modificadas pela GPU:
+**4.1.2 Build de diagnóstico (desligado por padrão, `EDEN_LIST_DIAG=1`).** Observa sem mudar o que é
+executado. Para cada entrada em página com faixas modificadas pela GPU, executada pelo snapshot **ou** pela
+memória atual (entradas retomadas, `UnsafeRead`):
 
-1. A **thread de trás** (dona dos caches) obtém, na posição da entrada, as faixas modificadas pela GPU
-   (`gpu_modified_ranges`) e baixa só essas faixas do buffer do host. Ela publica o resultado para a frente,
-   que nunca consulta caches (seção 9, item 6).
-2. Compara com o snapshot. Para cada diferença, registra: deslocamento na entrada; se cai num cabeçalho, em
-   dados de método ou em parâmetros de macro; o método e o subcanal; o tipo do último produtor (compute,
-   draw, cópia), a posição dele no ring; e a última espera de host antes da entrada (tipo e posição).
-3. Log limitado (primeiras N entradas, depois amostragem) e contadores por segundo: entradas com faixas da
-   GPU, entradas com bytes diferentes, bytes diferentes em cabeçalhos/métodos/macros.
-4. Em modo diagnóstico, **não muda o que é executado**.
+1. **Versão coerente na posição da entrada:** a frente enfileira um pedido no ring junto com a entrada; a
+   thread de trás o grava no fluxo do Vulkan como cópia GPU → buffer privado do diagnóstico, depois de todo
+   o trabalho enviado antes da entrada e antes de qualquer coisa enviada depois. Não baixa para a memória do
+   jogo nem muda `gpu_modified_ranges`. O resultado é lido de forma assíncrona, frames depois. Isso reduz a
+   perturbação, mas não a zera: há barreiras e cópias a mais no fluxo, e o tempo muda.
+2. **Comparação:** palavras usadas pelo parser contra a versão coerente. Para cada diferença: deslocamento;
+   cabeçalho, dados de método ou parâmetros de macro; método e subcanal; tipo e posição do último produtor
+   da faixa; última espera de host antes da entrada (tipo, condição e posição).
+3. **Escrita perdida (ponto cego da primeira escrita):** na posição da entrada, a thread de trás confere se
+   algum produtor executado **depois** de a frente ter lido a entrada (enviado antes dela, ainda na fila no
+   momento da leitura) escreveu nas páginas da entrada. Conta esses casos mesmo quando a página não estava
+   marcada na leitura (ideia do `CheckMissedWrite` do Lichii, e3d8e9c).
+4. **Pontos cegos que continuam:** produtores fora do buffer cache (imagens, render targets, storage images
+   com alias, queries, escritas de HLE). O diagnóstico lista os que conseguir identificar e diz o que não
+   cobre.
+5. Log limitado (primeiras N entradas, depois amostragem) e contadores por segundo.
 
-O mesmo build no FE mede o custo do filtro (quantas entradas caem em páginas com faixas da GPU). Se for ~0,
-o consumidor da seção 4.2 é grátis no FE.
+No FE, o mesmo build mede: entradas candidatas, marcações por segundo no caminho de draws, consultas por
+página e esperas de host que o protocolo da 4.2 acrescentaria. **~0 entradas candidatas elimina quase todo o
+custo das transferências; o custo fixo (marcações e consultas) e o das esperas precisa ser medido.**
 
-**4.1.3 O que decide:** diferenças em cabeçalhos ou dados de método (não só em parâmetros de macro),
-precedidas por uma espera de host, nas entradas dos draws do terreno, confirmam a hipótese e o protocolo.
-Sem diferenças fora de macros, a causa do chão preto está em outro lugar (bissecção de `EDEN_GPU_HIGH_PARTS`
-com 14, 2, 4 e 8, e a seção 4.4 do plano de arquitetura).
+**4.1.3 O que o diagnóstico pode e não pode concluir.** Diferenças em cabeçalhos ou dados de método,
+precedidas por uma espera de host, nas entradas dos draws do terreno, **sustentam** a hipótese nesses casos.
+Não demonstram que toda produção relevante passa por uma espera, nem que essas diferenças causam o chão
+preto. A causalidade só vem com o consumidor em modo experimental. Escritas perdidas (item 3) sem espera de
+host antes derrubam a regra da 4.2, item 2. Sem diferenças fora de macros, a causa está em outro lugar
+(bissecção de `EDEN_GPU_HIGH_PARTS` com 14, 2, 4 e 8).
 
-### 4.2 Consumidor de command lists (só depois do diagnóstico; opt-in até validar)
+**4.1.4 Casos dirigidos (antes do consumidor).** Um harness fora da árvore, como os do split (ring real,
+`DmaPusher` e puller reais, buffer cache e GPU falsos com produtores roteirizados), com a versão esperada de
+cada entrada em cada caso:
 
-**Versão correta de uma entrada:** o snapshot da submissão com as faixas escritas por produtores que vêm
-antes do fetch na ordem da GPU. Não a memória atual. Isso evita tanto os bytes velhos quanto os novos demais.
+| Caso | Roteiro | O que precisa sair certo |
+| --- | --- | --- |
+| Primeira escrita | página nunca marcada; produtor na fila quando a frente lê a entrada consumidora | a entrada vê o produtor (ou o caso é detectado e contado) |
+| Produtor de outro canal | produtor no canal A, consumidor no canal B depois de um acquire de syncpoint | a entrada só executa depois de a condição do acquire ser satisfeita |
+| Retomada dentro da entrada | acquire no meio da entrada; produtor antes do release | as palavras depois do acquire são a versão coerente |
+| Reuso pela CPU | o jogo observa a conclusão (sinalizada antes da hora) e reescreve a memória submetida | a entrada executa a versão da submissão mais o produtor, não a reescrita |
+| Dois produtores na mesma faixa | P1 e P2 escrevem a mesma faixa antes do fetch; um deles depois da espera | a versão escolhida é a definida no item 3 da 4.2 |
 
-**Protocolo mínimo (exato, sem especulação):**
+### 4.2 Consumidor de command lists (só depois do diagnóstico e dos casos dirigidos; opt-in)
 
-1. **Filtro conservador:** bitmap de páginas com faixas modificadas pela GPU, 1 bit por 4 KiB (2 MiB),
-   marcado pela thread de trás quando executa uma escrita da GPU. Bit desligado = a página certamente não
-   tem dado da GPU **entre os produtores já executados**. Ele é só um filtro: a autoridade sobre quais
-   bytes são da GPU continua nos caches (`gpu_modified_ranges`, faixas exatas).
-2. **Produtor pendente:** um produtor ainda na fila de trás não marcou o bitmap. A regra vem do hardware
-   (3.1): o produtor só é visível ao fetch depois de uma espera de host. A frente anota as esperas de host
-   que **não** drenam hoje (acquire de syncpoint, WFI, bit de sync sem "Sync Memory Operations"). Na
-   primeira entrada depois de uma espera nova, ela espera a thread de trás passar dessa espera (uma vez por
-   espera, não por entrada) e só então consulta o bitmap. Os acquires de semáforo já drenam.
-3. **Execução do produtor versus GPU:** a thread de trás ter passado do produtor não quer dizer que a GPU
-   terminou. A cópia das faixas é gravada no fluxo de comandos depois do produtor e lida só quando a fence
-   dela concluir.
-4. **Publicação:** a thread de trás grava as faixas num buffer próprio da entrada e publica com
-   release/acquire. A frente sobrepõe as faixas ao snapshot e executa. Nenhuma versão "de página" é marcada
-   como atual a partir de uma cópia parcial.
-5. **Entradas retomadas depois de um acquire** (`command_resume_offset != 0`) seguem a mesma regra, em vez
-   da memória atual sem flush. Isso muda um caminho existente: fica atrás da chave e com contador.
+Só pode ser chamado de exato depois dos casos da 4.1.4.
 
-**Custo no FE:** bitmap consultado por página de cada entrada (leitura atômica, barata mas não zero) e
-uma espera por espera de host não drenada. As duas coisas são medidas pelo diagnóstico antes.
+**Versão de uma entrada (definição):** o snapshot da submissão com as faixas escritas por todo produtor
+enviado ao ring **antes** da entrada, e só por eles. Produtores enviados entre a espera de host e a entrada
+entram (na ordem do fluxo eles vêm antes); no hardware a visibilidade deles sem espera é indefinida, e
+esta é uma escolha, documentada.
 
-**Riscos e pontos abertos:**
-- A regra do item 2 é hipótese. Se o diagnóstico mostrar entradas com diferenças **sem** espera de host
-  antes, o protocolo não basta, e a alternativa conservadora é esperar a de trás em toda entrada que cai no
-  bitmap (não em toda entrada).
-- Produtores que não passam pelo buffer cache (imagens, render targets, storage images com alias, queries,
-  escritas de HLE) não marcam o bitmap. O diagnóstico precisa de um inventário deles (seção 7, item 3).
-- Bits nunca limpos geram falsos positivos (páginas reaproveitadas). Medir páginas marcadas contra entradas
-  com bytes realmente diferentes.
+**Protocolo:**
+
+1. **Filtro:** bitmap de 1 bit por 4 KiB (2 MiB), marcado pela thread de trás quando executa uma escrita da
+   GPU. **Bit desligado não dispensa espera por si só:** só prova que nenhum produtor **já executado**
+   escreveu ali.
+2. **Dependências, não posições (revisão 2).** "A thread de trás processou o método de espera" não é "a
+   dependência foi satisfeita":
+   - Acquire de semáforo: já é satisfeito hoje (a frente drena e confere o valor).
+   - Acquire de syncpoint: **não é implementado** (`WaitFence` comentado, `puller.cpp:126-132`; só agenda
+     `ReleaseFences`). Para servir de dependência, precisa virar uma espera real pela condição
+     (syncpoint ≥ valor), usando o valor que sobe na conclusão na GPU (`IncrementHost` na fence,
+     `fence_manager.h:142-146`). O valor que o jogo vê sobe antes (`IncrementGuest`, `:143`). Riscos:
+     incrementos vindos de outros clientes do host1x, valores que nunca chegam (precisa de limite de tempo,
+     contador e log) e custo no FE.
+   - WFI: grava um evento no fluxo do Vulkan (`vk_rasterizer.cpp:1125-1145`); serve de marco de ordem, não
+     de conclusão.
+   - Bit de sync da entrada: drena só com "Sync Memory Operations"; sem isso, é só marco de ordem.
+   Com isso, a regra é: na primeira entrada depois de uma dependência nova, a frente espera **a dependência
+   ser satisfeita** e a thread de trás passar dela, e só então consulta o bitmap.
+3. **Cópia ordenada na posição da entrada:** o pedido de cópia é enviado ao ring junto com a entrada,
+   então fica depois de todo produtor enviado antes e antes de qualquer outro. A thread de trás grava a
+   cópia (GPU → buffer da entrada, com barreira) nessa posição; a frente lê depois da fence da cópia. Custo:
+   uma ida e volta (thread de trás + GPU) por entrada **candidata**. Cópias preservadas na hora do produtor
+   (como o 8f1435f do Lichii) são uma otimização posterior, com o mesmo critério de versão.
+4. **Publicação:** buffer próprio da entrada, release/acquire. A frente sobrepõe as faixas ao snapshot.
+5. **Entradas retomadas** seguem a mesma regra, em vez da memória atual sem flush. Muda um caminho
+   existente: atrás da chave, com contador.
+6. **Reuso pela CPU (revisão 2: não é necessariamente corrida do jogo).** Em Fast, o emulador sinaliza
+   conclusões antes da GPU emulada chegar nelas: `SignalFenceCoalesced` roda o callback na hora
+   (`fence_manager.h:80-96`) e o syncpoint que o jogo vê sobe no `IncrementGuest`. O jogo pode então
+   reutilizar, legalmente do ponto de vista dele, a memória de uma lista que o emulador ainda vai executar.
+   Para faixas candidatas, uma escrita da CPU nessa situação não pode chegar ao buffer do host antes de a
+   entrada consumidora ser executada. Duas saídas, a decidir com o caso dirigido "reuso pela CPU": segurar
+   essas escritas (o mecanismo de escritas seguradas já existe) até a entrada passar, ou preservar a saída
+   do produtor no momento em que ele escreve.
+
+**Sem a regra do item 2:** a única opção exata é esperar a thread de trás chegar à entrada (todo o trabalho
+anterior) em **toda** entrada enquanto houver produtor na fila. Ela é conservadora de verdade e cara no FE.
+Por isso fica só como política opt-in (`list_fetch=exact-drain`), nunca como padrão. Um jogo que precisar
+dela a liga na configuração por jogo, e os outros não pagam.
+
+**Riscos:** produtores fora do buffer cache não marcam o bitmap (inventário da seção 7, item 3). Bits nunca
+limpos geram falsos positivos; medir contra entradas com bytes realmente diferentes. A espera real do
+acquire de syncpoint muda o comportamento de todos os jogos que usam syncpoint, e por isso entra atrás de
+chave própria, com A/B no FE.
 
 **Chave:** `EDEN_GPU_LISTS=0/1` (padrão 0 até validar no Bananza e no FE).
 
 ### 4.3 Releitura de macro
 
-Fica como está (opt-in para o FE: `EDEN_NX2_MACRO_REFRESH=0` restaura as macros na frente) até o consumidor
-da 4.2 provar que cobre os parâmetros de macro, incluindo parâmetros que atravessam entradas e retomadas
-depois de acquire. Depois disso, o 6d3dd9a sai e a releitura volta ao Accurate e ao bit 1. O override de
-diagnóstico continua.
+Fica como está (`EDEN_NX2_MACRO_REFRESH=0` restaura as macros na frente) até o consumidor da 4.2 provar
+que cobre os parâmetros de macro, incluindo parâmetros que atravessam entradas e retomadas depois de
+acquire. Depois disso, o 6d3dd9a sai e a releitura volta ao Accurate e ao bit 1. O override de diagnóstico
+continua.
 
 ### 4.4 Correções pequenas
 
@@ -215,30 +262,35 @@ Seção 3.4.
 1. Matriz 4.1.1 (usuário) e, no mesmo build, FE na praça com `EDEN_NX2_MACRO_REFRESH=0` e `=1`.
 2. Build de diagnóstico 4.1.2 (código), no Bananza e no FE.
 3. Teste e port do 15126fb (independente).
-4. Protocolo e consumidor 4.2, opt-in. Aceite: chão certo no Bananza em Fast; no FE, draws/s da praça e do
-   palácio ≥ os de antes do 6d3dd9a; contadores com ~0 entradas filtradas no FE.
-5. Só então: reverter o 6d3dd9a e decidir o padrão do consumidor.
+4. Harness com os casos dirigidos da 4.1.4.
+5. Espera real do acquire de syncpoint, atrás de chave, com A/B no FE.
+6. Consumidor 4.2, opt-in. Aceite: casos dirigidos passando; chão certo no Bananza em Fast; no FE, draws/s
+   da praça e do palácio ≥ os de antes do 6d3dd9a, e o custo fixo medido (marcações, consultas, esperas).
+7. Só então: reverter o 6d3dd9a e decidir o padrão do consumidor.
 
 ## 6. O que não fazer
 
 - Ligar correções por título.
 - Executar comandos possivelmente velhos como política padrão.
 - Ler a memória atual de uma lista sem saber qual versão ela representa.
+- Dispensar uma espera porque um bit está desligado, sem antes satisfazer as dependências.
+- Tratar "a thread de trás processou o método" como "a dependência foi satisfeita".
 - Consultar ou fazer flush dos caches na frente depois de uma espera parcial.
 - Portar em bloco dos forks.
 
-## 7. Perguntas abertas (revisão 1)
+## 7. Perguntas abertas (revisão 2)
 
-1. A regra "produtor só é visível ao fetch depois de uma espera de host" vale para o NVN? O diagnóstico
-   responde no Bananza; vale conferir em mais jogos.
-2. A sobreposição "snapshot + faixas da GPU" erra quando a CPU do jogo reescreve, depois da submissão, uma
-   faixa que a GPU produziu antes do fetch. No hardware isso seria uma corrida do próprio jogo. Aceitável?
+1. A regra "produtor só é visível ao fetch depois de uma dependência satisfeita" vale para o NVN? O e3d8e9c
+   é pista, não garantia do hardware. O diagnóstico (escritas perdidas) e os casos dirigidos respondem
+   parte; o resto depende de mais jogos.
+2. Para o reuso pela CPU (4.2, item 6): segurar as escritas da CPU ou preservar a saída do produtor? A
+   primeira reaproveita um mecanismo existente; a segunda custa uma cópia por produtor em página candidata.
 3. Inventário de produtores: storage buffers de draws e compute, imagens, storage images e render targets
    com alias, queries, escritas de CPU e HLE, cópias, mudanças de mapeamento. Quais podem produzir comandos?
-4. O caminho de entradas retomadas (`UnsafeRead`) já causa problemas hoje em algum jogo? O diagnóstico pode
-   contar diferenças entre a memória atual e a versão coerente nessas entradas.
-5. Os forks desenham o chão do Bananza em Fast? Ajuda, mas não confirma (diferem em shaders, coerência e
-   sincronização).
+4. O caminho de entradas retomadas (`UnsafeRead`) já causa problemas hoje? O diagnóstico conta.
+5. A espera real do acquire de syncpoint é viável sem travar jogos que esperam incrementos de outros
+   clientes do host1x (decodificador de vídeo, VIC)?
+6. Os forks desenham o chão do Bananza em Fast? Ajuda, mas não confirma.
 
 ## 8. Referências
 
@@ -268,3 +320,14 @@ Seção 3.4.
 | — | "Primeira leitura velha da CPU" não demonstrado | **Discordo em parte:** no Vulkan, `GetFlushArea` retorna `preemtive = true` para buffers (`vk_rasterizer.cpp:883-908`) e `OnCPURead` não baixa nada nesse caso (`gpu.cpp:257-272`). O `BufferCache::GetFlushArea` citado na revisão é usado pelo OpenGL (`gl_rasterizer.cpp:523`). | Mantido, com escopo: vale para dados lidos pela CPU no Vulkan e **não** justifica nada para comandos |
 | — | Texturas: o bit 2 limita a detecção automática, não o download explícito | Sim, `vk_rasterizer.cpp:845-850` | Seção 2 corrigida |
 | — | Memória global escolhe a base mais próxima abaixo do endereço | Sim, `spirv_emit_context.cpp:976` | Levado ao plano de arquitetura |
+
+## 10. Revisão 2: o que mudou e por quê
+
+| # | Ponto da revisão | Conferido | Mudança |
+| --- | --- | --- | --- |
+| — | Primeira leitura da CPU no Vulkan | A revisão aceitou a contestação | Sem mudança |
+| 1 | Passar pelo acquire de syncpoint não satisfaz o acquire; WFI só grava um evento | Sim, `puller.cpp:126-132` (`WaitFence` comentado), `vk_rasterizer.cpp:1125-1145`. Além disso, o syncpoint que o jogo vê sobe antes da GPU (`fence_manager.h:142-146`) | 4.2, item 2: dependências satisfeitas; espera real do acquire de syncpoint como passo próprio (5.5) |
+| 2 | O fallback "esperar em toda entrada que cai no bitmap" perde a primeira escrita | Sim (contraexemplo correto) | Fallback reescrito: a única opção exata sem a regra é esperar em toda entrada com produtor na fila; só opt-in |
+| 3 | `gpu_modified_ranges` não guarda versões; a cópia pode pegar uma versão posterior; reuso pela CPU não é necessariamente corrida do jogo | Sim; o reuso legal vem das conclusões sinalizadas antes da hora (`fence_manager.h:80-96`) | Versão definida pela posição da entrada no ring, com a cópia ordenada ali (item 3); reuso pela CPU como item 6, com duas saídas a decidir |
+| 4 | O diagnóstico tem pontos cegos e não pode confirmar o que a 4.1.3 prometia | Sim | Diagnóstico cobre entradas retomadas, conta escritas perdidas e declara o que não cobre; 4.1.3 rebaixada; casos dirigidos (4.1.4) |
+| 5 | "~0 entradas filtradas ⇒ grátis no FE" | Sim | Frase trocada pela da revisão |
