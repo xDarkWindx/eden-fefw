@@ -1597,10 +1597,21 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 (u64{width} << 48));
             break;
         }
-        case 0x919: case 0x9c3: { // S2R / S2UR thread and workgroup identities.
+        case 0x919: case 0x9c3: { // S2R / S2UR: special registers the Maxwell S2R handles.
+            // Same numbering as Maxwell (list from Eglantine): lane id (0), invocation id/info,
+            // Y direction, thread kill (17-19, 29; Donkey Kong Bananza's geometry programs read
+            // invocation info), W scale factors (30-31), thread and workgroup ids, lane masks.
             const u32 special = insn.Bits(72, 8);
+            if (special == 132 && !insn.words[1] && insn.words[2] == (special << 8)) {
+                // SR_VARIABLE_RATE: without variable-rate shading every fragment is 1x1, its width
+                // and height in bytes 1 and 2.
+                const u32 target = opcode == 0x9c3 ? uniform_register(static_cast<u32>(dest)) : static_cast<u32>(dest);
+                if (target == ~0U) return fail(index, "native uniform special destination");
+                mov_imm(target, 0x00010100);
+                break;
+            }
             if (insn.words[1] || insn.words[2] != (special << 8) ||
-                (special != 0 && special != 33 && special != 34 && special != 35 &&
+                (special != 0 && (special < 17 || special > 19) && (special < 29 || special > 35) &&
                  special != 37 && special != 38 && special != 39 &&
                  special != 56 && special != 57 && special != 58 && special != 59 && special != 60))
                 return fail(index, "native special register");

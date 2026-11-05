@@ -7240,6 +7240,25 @@ TEST_CASE("Native geometry programs lower their output instructions", "[native-s
     REQUIRE(((outputs[1] >> 39) & 3) == 2);         // cut
 }
 
+TEST_CASE("Native special registers include invocation info and variable rate", "[native-shader]") {
+    // S2R R0 = SR_INVOCATION_INFO (Donkey Kong Bananza geometry programs).
+    const std::array<Native, 2> info{{{{0x00007919, 0, 0x00001d00, 0x001e2200}}, VertexTransform.back()}};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(info);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    const auto s2r = std::ranges::find_if(lowered.instructions, [](u64 word) {
+        return Shader::Maxwell::Decode(word) == Shader::Maxwell::Opcode::S2R;
+    });
+    REQUIRE(s2r != lowered.instructions.end());
+    REQUIRE(((*s2r >> 20) & 0xff) == 29);
+    // SR_VARIABLE_RATE (132) reads as a 1x1 fragment.
+    const std::array<Native, 2> rate{{{{0x00057919, 0, 0x00008400, 0}}, VertexTransform.back()}};
+    REQUIRE(Shader::Ampere::LowerToMaxwell(rate));
+    // An unknown special register stays rejected.
+    const std::array<Native, 2> unknown{{{{0x00007919, 0, 0x00002800, 0}}, VertexTransform.back()}};
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(unknown));
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);
