@@ -593,10 +593,23 @@ private:
             if (frame.eos) stream_ended = true;
             output_properties.push_back(properties);
             image->available = false;
-            system.Host1x().GetSyncpointManager().IncrementGuest(*operation_syncpoint);
-            system.Host1x().GetSyncpointManager().IncrementHost(*operation_syncpoint);
+            // Each written frame reaches the fence of the image it fills. An image released after
+            // the end of a stream (EDEN_NX2_VDEC_EOS_RELEASE_NOW) got a fence already reached:
+            // advancing the syncpoint for it would reach every later fence a frame early.
+            auto& syncpoints = system.Host1x().GetSyncpointManager();
+            if (static_cast<s32>(static_cast<u32>(image->completion_value) -
+                                 syncpoints.GetGuestSyncpointValue(*operation_syncpoint)) > 0) {
+                syncpoints.IncrementGuest(*operation_syncpoint);
+                syncpoints.IncrementHost(*operation_syncpoint);
+            }
             LOG_DEBUG(Service_AM, "native AV1 output written image={}, dimensions={}x{}, threshold={}",
                       image->id, frame.widths[0], frame.heights[0], image->completion_value);
+        }
+        // H.264 decodes ahead of the images, as AV1's worker and Eglantine's decoder do: inputs
+        // waiting for an image kept the queue full, and Donkey Kong Bananza, restarting its
+        // looping movie with both images filled, waited for room to submit that never came.
+        while (h264_context && decoded_frames.size() < MaximumDecodedAhead && !pending_inputs.empty()) {
+            R_TRY(DecodePendingInput());
         }
         if (submission_event) {
             std::unique_lock lock{decode_mutex};
