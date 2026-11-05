@@ -205,7 +205,7 @@ Uma tabela única (`video_core/policy.h`), lida uma vez no início, com sintaxe 
 
 | Política | Modos | Padrão |
 | --- | --- | --- |
-| `list_fetch` | `submitted` / `exact` | `submitted` até a validação (gpu-produced-data-plan 4.2) |
+| `list_fetch` | `submitted` / `exact-drain` / `after-dependency` (experimental) | `submitted` até a validação (gpu-produced-data-plan 4.2) |
 | `macro_params` | `submitted` / `exact` | como hoje |
 | `cpu_buffer_read` | `none` / `learned` / `fence` | `learned` (concessão de precisão que já existe no Vulkan; seção 12.3) |
 | `cpu_texture_read` | `none` / `exact` | `none` (hoje) |
