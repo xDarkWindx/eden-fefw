@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página e caminho quente) em desenho; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página e caminho quente) com desenho escrito na seção 3.7, sem código; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -369,6 +369,357 @@ deslocar a probabilidade da janela; não impõe ordem entre elas. A medição de
 
 **Alternativa descartada:** mutex folha no registro. Não ordena o pop contra a aplicação, mas põe uma aresta nova
 na thread da CPU do jogo, e **não resolveria o vínculo com o lote** (que exige os contadores do `Gather`).
+
+### 3.7 T3a.1: amostragem por página, cobertura declarada, caminho quente (desenho, sem código)
+
+Escopo: o bloco "T3a.1" da seção 11 (revisão 4). **Nada do emulador foi escrito.** Não muda: o protocolo dos slots
+(3.4), o dos lotes (3.3, 3.3.1), a precondição P0, nem o comportamento com o diagnóstico desligado. Mudam só o que
+o escritor faz por aviso, o que a aplicação afirma sobre cobertura, o recorte do pop e a contagem. Graus de certeza
+como no resto do documento; números de linha são os de `1d41515`.
+
+#### 3.7.1 Três caminhos no escritor e o predicado
+
+| Estado | O que o escritor faz em `core/memory.cpp:768` (`CollectNotice`, `list_diag.h:105`) |
+| --- | --- |
+| desligado | `manager.Collect` = `CollectT<false>`, como hoje; a flag é uma leitura relaxada |
+| ligado, página **fora** da amostra | `manager.CollectT<true>`; **sem** ledger, **sem** carga de `lot_started`/`lot_done`/`apply_started_lot`, **sem** contador compartilhado. Só `seen` do próprio núcleo (3.7.5) |
+| ligado, página **na** amostra | `CollectObserved` completo (3.3) mais o protocolo de cobertura (3.7.3) |
+
+**Predicado:** `Sampled(a) = Mix(seed ^ (a >> 12)) % N == 0`, com `Mix` o finalizador do splitmix64. `N == 1` retorna
+`true` sem calcular o hash; `N` potência de 2 usa máscara (o padrão 8); outro `N` usa o `%` de 64 bits (~20 a 40
+ciclos por aviso, dito). `N` e `seed` vêm de `EDEN_LIST_DIAG_SAMPLE` (inteiro ≥ 1, padrão 8, teto 2^32; valor
+inválido ou zero volta ao padrão e a linha "ligado" diz isso) e `EDEN_LIST_DIAG_SEED` (decimal ou `0x`, padrão 1).
+Lidos uma vez, como `g_parts`; só os testes os mudam, com o sistema parado. **O predicado não recebe o núcleo.**
+
+**Onde entra em cada hook, e por que o endereço é o mesmo (verificado):**
+
+| Hook | Arquivo:linha | Endereço que o predicado vê |
+| --- | --- | --- |
+| Escritor | `list_diag.h:105` (`CollectNotice`), chamado de `core/memory.cpp:768` | `address` do lambda de `ApplyOpOnPointer`: o `d_address` que `ApplyOpOnPAddr` calcula (`core/device_memory_manager.h:78-90`), passado como `PAddr` a `Collect`. **Um DAddr** com tipo `PAddr` (`common_types.h:51-52`: os dois são `u64`) |
+| Retirada (`GatherAll`) | `protocol.h:178` (callback), do `GatherT` em `gpu_dirty_memory_manager.h:156` | `a = (transform.address << 11) + offset`, e `transform.address = u32(address >> 11)` (`BuildTransform`, `:209`). Então `a >> 12 == address >> 12` enquanto `address < 2^43`; a conversão `PAddr → DAddr` é só `static_cast` (`gpu.cpp:133`, `:142`) |
+| `MakeBatch` | `protocol.h:197` | endereço da faixa **final**, que a junção de `gpu.cpp:143-161` mantém dentro de uma página (`(address >> 12) == (last.first >> 12)`) |
+| Aplicação | `buffer_cache.h:145` (`NoteApplyHook`) → `NoteApply`, `protocol.h:248` | `device_addr`, o mesmo `DAddr` da faixa final |
+| Pop | `buffer_cache.h:728` (`NotePopHook`) → `NotePop`, `protocol.h:308` | cada fragmento de página de `[start, end)`, em `DAddr` (3.7.4) |
+
+- **Mesma página nos três.** O escritor passa o `DAddr` ao `Collect`; o `Gather` devolve esse mesmo endereço com
+  os 11 bits baixos refeitos (a granularidade da transformação é 2 KiB, `page_bits = DEVICE_PAGEBITS - 1`, `:100`).
+  Duas transformações de 2 KiB formam uma página de 4 KiB e **recebem o mesmo veredito**, porque o hash usa
+  `>> 12`. A conta `address < 2^43` vale com folga para `DAddr` (o espaço é muito menor: **hipótese**, não abri o
+  limite do `DeviceMemoryManager`).
+- **Independente do núcleo.** Duas threads que escrevem a mesma página, em núcleos diferentes, têm o mesmo
+  veredito; a retirada junta os núcleos e a aplicação não precisa saber de qual veio.
+- **Escrita não atravessa página (verificado, `core/memory.cpp:268-283`, `:322`, `:337`):** `WalkBlock` entrega
+  pedaços dentro de uma página de guest de 4 KiB, e cada pedaço chama `HandleRasterizerWrite`. Logo um `Collect`
+  tem uma página de 4 KiB; o veredito é o da página do primeiro byte. **Hipótese lida, não executada:** um pedaço
+  que cruze o limite de 2 KiB da transformação faz `BuildTransform` calcular `top_bit > 32` (`:204-212`,
+  `CreateMask` com deslocamento negativo): comportamento anterior ao diagnóstico, **não mexo nele**, e o veredito
+  continua o mesmo (a página da transformação é a mesma que o `Gather` entrega). Vale um olhar do dono do código.
+- **Aliases de dispositivo:** `ApplyOpOnPAddr` chama a operação uma vez por `DAddr` (`:86-89`). Cada `DAddr` é um
+  aviso próprio com o seu veredito; nada disso muda.
+- **Faixas de aplicação e de pop:** a aplicação só recebe faixas dentro de uma página (acima). O pop recebe
+  faixas que cruzam páginas: é o único lugar que recorta (3.7.4).
+
+**Por que `CollectT<true>` fora da amostra não quebra a prova da 3.3.** Ela exige que **todo** acesso a `current`
+seja `seq_cst` (P1 a P3, a ordem total `S`). `CollectT<true>` é exatamente isso. O aviso fora da amostra não é
+reivindicado, então não precisa das cargas do lote; e **a prova não pergunta quem escreveu** o que `current` ou
+`back_buffer` guardam: P3 só usa "a primeira retirada depois da leitura `seq_cst` de `current` vê o que a leitura
+viu ou mais". Um aviso não amostrado mexe em `current`/`back_buffer` e a prova continua valendo, desde que **toda**
+escrita use a variante `seq_cst`. É por isso que o caminho fora da amostra não pode ser `Collect<false>` (a
+revisão 4, item 1). **Custo que sobra (x86-64, mapeamento padrão, não conferido no binário):** a carga é um `mov`
+nas duas variantes; o CAS e o `exchange` já têm `lock`; a diferença deve ser pequena. Em ARM a diferença é maior
+(`ldar`/`stlr` contra `ldapr`/`stlr`; **a medir**).
+
+#### 3.7.2 O que a aplicação e o pop fazem com páginas fora da amostra
+
+- `NoteApply`: a primeira linha avalia o predicado em `addr >> 12`. Fora da amostra: `apply_ranges_seen++` e
+  retorna. **Nada** de varredura, de `blk_*`, nem de leitura de contadores de núcleo. (Os dois contadores da
+  aplicação ficam na linha compartilhada de `Counters`: só a thread que aplica os toca, sob o `buffer_cache.mutex`
+  que ela já tem.)
+- `MakeBatch` só calcula a união de núcleos (hoje `O(finais × pré)`, `protocol.h:197-211`) das faixas finais da
+  amostra. `Gathered::pre` continua completo, porque `gpu.cpp:141-144` o usa para montar `cached_writes`: **o que é
+  aplicado não muda**.
+- Faixa fora da amostra com bytes da GPU: nada é afirmado sobre ela. O relatório diz que `blk` é só da amostra.
+
+#### 3.7.3 Cobertura incompleta declarada
+
+**O que se perde hoje (verificado).** Um aviso amostrado pode **não chegar a um registro aplicável**:
+(a) `Register` estoura os 8 slots (`ledger.h:160-210`, `notice_overflow`); (b) um registro publicado, expirado e
+não encerrado é **reciclado** por outro (`ledger.h:166-201`, `notice_expired`); (c) o registro é marcado `late` e
+liberado pelo escritor (3.3.1): o que a aplicação já varreu não o viu; (d) um registro **ambíguo** é publicado
+depois da varredura (**achado do desenho:** `CollectObserved` retorna em `protocol.h:127-130` antes da checagem de
+`apply_started_lot`, então o ambíguo não tem proteção contra publicação tardia). Nos quatro, o `exact` do `blk`
+fica **sem aquele aviso** e, se há outros registros do mesmo bloco e lote, `AccountBlock` afirma `at_risk` sobre bytes
+que a CPU escreveu.
+
+**Correção à revisão 4, item 2 (conferido no código):** "sem nenhum registro o trecho inteiro conta como em risco
+(`protocol.h:677`)" **não procede em `1d41515`**: `protocol.h:677` é o `blk_bytes_exact`, e a linha `:695`
+(`if (ambiguous || merged_exact.empty())`) já devolve **ambíguo** quando `exact` está vazio. Os 70% ambíguos do 8.4
+já incluem esses trechos. O que **procede** é a perda **parcial**: um registro achado e outro perdido no mesmo
+bloco e lote deixam `exact` não vazio e incompleto, e `at_risk` é afirmado. É esse o buraco que o T3a.1 fecha.
+
+**Mecanismo: duas palavras por núcleo, escritas só pelo escritor do núcleo** (`WriterShared`, uma linha de 64 B,
+fora do `GatherLotState`, que fica como está):
+
+- `open` (0 ou 1): "há um aviso amostrado deste núcleo entre o `Collect` e o fim do registro".
+- `incomplete_floor` (monotônico): **todo lote ≤ `incomplete_floor` deste núcleo tem cobertura incompleta.**
+
+**Escritor (`CollectObserved`, os passos novos em negrito):**
+
+1. **`open.store(1, seq_cst)`** (O1).
+2. `d = lot_done`, `s = lot_started` (3.3); `CollectT<true>`; `s2 = lot_started`.
+3. Inequívoco (`s == d && s2 == s`): lote `L = d + 1`, `hi = L`. Ambíguo: `hi = s2 + 1`.
+4. **`now = NowUs()`**, a única leitura do aviso (3.7.5); `Register(..., lot_or_hi, now, ...)`. O registro
+   ambíguo passa a guardar **`hi` no campo `lot`** (hoje 0); só `Suspect` o lê e ele consulta `ambiguous` antes
+   (`protocol.h:595-598`). Isso muda o sentido de um campo do payload, não o protocolo do slot.
+5. **Antes do CAS** que recicla um slot `publicado`, expirado e ainda sem `applied`/`late` (conferido por uma
+   leitura de `marks`): `RaiseIncomplete(core, slot.lot)`. Reciclar um registro já encerrado não marca.
+6. Estouro dos 8 slots: **`RaiseIncomplete(core, hi)`**. Registro marcado `late` (3.3.1): **`RaiseIncomplete(core, L)`**,
+   antes da liberação.
+7. **`open.store(0, release)`** (O2).
+
+`RaiseIncomplete(core, h)`: `floor = max(floor, h)`, `store seq_cst`. **Um escritor só por núcleo** (o `sys_core` é
+serializado por `sys_core_guard`, `core/memory.cpp:709-717`), então `load` + `store` bastam, sem CAS.
+
+**Aplicação (`NoteApply`, só faixa da amostra):**
+
+1. **ρ:** para cada núcleo `c` do `mask` da faixa, `open_c = open.load(seq_cst)`. **Antes** da varredura.
+2. σ: a varredura de hoje, sem mudança (`protocol.h:262-297`).
+3. **φ:** para cada `c` do `mask`, `floor_c = incomplete_floor.load(seq_cst)`. **Depois** da varredura.
+4. Classificação, por precedência, **exclusiva**: (i) ambíguo, como hoje (`ambiguous || !linked || exact vazio`)
+   → `blk_ambiguous`; (ii) senão, **incompleto** se algum `open_c == 1` (`blk_incomplete_open`), ou algum
+   `floor_c ≥ lots[c]` (`blk_incomplete_floor`), ou a junção está desligada (`blk_incomplete_nomerge`); (iii) senão
+   **afirmado** (`blk_affirmed`) e só então `at_risk` conta. No incompleto, `blk_gpu_bytes_at_risk` **não** sobe e
+   `blk_incomplete_gpu_bytes` recebe o que o T3a teria afirmado (a identidade do teste de `N=1`, 3.7.7).
+
+**Proposição (nunca falso "completo").** Se a aplicação de uma faixa `R` da amostra afirma `blk_affirmed`, então todo
+aviso amostrado `n` do núcleo `c` com bytes em `R` e lote retirado `X = lots[c]` tem o seu registro **em `exact`**
+(aposentado por esta aplicação).
+
+*Premissas:* (π1) o único produtor é `CollectNotice` (`grep` em `src/`, fora de testes: nenhum outro `Collect`,
+**verificado**; os produtores estrangeiros são o T3c); (π2) as faixas finais de um lote são disjuntas (a junção de
+`gpu.cpp:143-161`; com `EDEN_HELD_WRITE_MERGE=0` não vale, e por isso `blk_incomplete_nomerge`); (π3) P0 (se violada,
+`Suspect` e o relatório de violação continuam valendo); (π4) um escritor por núcleo.
+
+*Prova.* Seja `n` amostrado, do núcleo `c`, com bytes em `R`, retirado no lote `X`. Como os bytes de `n` estão em `R`,
+`R` foi montada a partir de faixas que o `Gather` de `c` entregou; logo `c` está no `mask` e `X = lots[c]`. A
+retirada `E` que leva `n` é a primeira depois da primeira leitura `seq_cst` de `current` do `Collect` de `n`
+(`L_n`, P3), e `L_n` vem depois de O1 na ordem do programa. A aplicação vem depois da retirada, na mesma thread
+(`GatherAll` e `OnCachedWrites` rodam na mesma chamada de `InvalidateGPUCache`, `gpu.cpp:140` e `:182`). Na ordem
+total `S`: `O1 < L_n < E < ρ`.
+
+- **Limite do lote (para o caso ambíguo).** O número da retirada `E` é (retiradas anteriores) + 1 sob o `guard`. As
+  retiradas anteriores a `E` são as anteriores a `L_n` (por definição de "primeira"), cada uma incrementou
+  `lot_started` antes, e `s2` é lido depois de `L_n`: então `X ≤ s2 + 1`. E `X ≥ d + 1` por P1. Logo `X ≤ hi`, nos
+  dois casos (inequívoco: `X = d + 1 = hi`).
+- ρ lê `open` depois de O1 em `S`. Como `open` tem um escritor e O1 é `seq_cst`, ρ devolve o valor de O1 ou de uma
+  gravação posterior. **(1)** Se devolve 1 (de O1 ou de um O1 de aviso seguinte), a faixa é incompleta
+  (`blk_incomplete_open`): **não é "afirmado"**. **(2)** Se devolve 0, a gravação lida é O2 de `n` ou posterior
+  (as de antes de O1 estão excluídas). O2 é `release`, ρ é `acquire`: tudo que o escritor fez antes de O2 acontece
+  antes de σ e de φ. Casos do resultado do registro de `n`, todos terminados **antes** de O2:
+  - (2a) **estouro**: `RaiseIncomplete(c, hi)` com `hi ≥ X`; φ lê `floor ≥ X` (monotônico): incompleto.
+  - (2b) **registrado, não tardio, inequívoco**: o `state publicado` (`seq_cst`) vem antes de O2; σ lê o `state`
+    depois de ρ e o vê publicado ou **depois**. "Depois" só pode ser a reciclagem (a liberação é da aplicação deste
+    lote, e por π2 nenhuma outra faixa o aposentou): a reciclagem faz `RaiseIncomplete` **antes do CAS**
+    (passo 5), e como a leitura de σ que viu o `state` novo vem depois do CAS em `S`, que vem depois da gravação do
+    piso, φ lê o piso: incompleto. Se σ o vê publicado, o registro tem `lot == X`, `core == c` e está contido na
+    faixa (um registro que só cruza a borda vira `apply_partial`, ambíguo, T3a): entra em `exact`.
+  - (2c) **registrado e `late`**: o piso subiu antes da liberação (passo 6): φ lê `floor ≥ X`: incompleto.
+  - (2d) **registrado ambíguo**: publicado antes de O2, σ o vê (ou a reciclagem, como em 2b), e o vê como `Suspect`:
+    `ambiguous`, que tem precedência (i). O piso cobre `hi ≥ X`.
+  Em nenhum caso a faixa sai "afirmada" com `n` fora de `exact`. ∎
+
+*Overflow de lote ambíguo.* É o passo 6 com `hi = s2 + 1`: marca os lotes de `d + 1` a `s2 + 1` (e os `≤ d + 1`
+que ainda não foram aplicados, o excesso abaixo). **Não marca os seguintes:** o lote `s2 + 2` ou maior não pode
+conter o aviso (limite acima), então o piso **não** envenena o futuro. (A frase do escopo "marca todos os lotes a
+partir dele, como o `violation_floor`" fica assim: o `violation_floor` também é um teto, `lote ≤ piso`; "dali em
+diante" sem teto cobriria o núcleo para sempre e zeraria a cobertura no primeiro aviso ambíguo.)
+
+*Expiração.* Passo 5: o registro velho é reciclado **depois** de o piso subir (antes do CAS), então nenhuma
+varredura vê "slot trocado" sem enxergar o piso. Só um registro **não encerrado** marca; um já `applied`/`late`
+não. **Observação (medida só em parte):** registros ambíguos nunca são aposentados (T3a, "o não aposentado expira")
+e expiram em 5 s; o piso subiria para um lote já aplicado há 5 s e não muda nada (monotônico, antigo). O que a
+expiração marca de fato é o caso raro de a aplicação do lote do registro ainda não ter acontecido em 5 s.
+
+**Falso "incompleto" aceito, e contado.** (i) O piso é um teto: o lote anterior a `d + 1`, se retirado e ainda não
+aplicado (no máximo um, por P0), é marcado sem necessidade. (ii) `open == 1` na hora da leitura (um aviso no meio do
+registro, ~centenas de ns): se a fração do tempo com `open` ligado em um núcleo for ~0,2% (**estimativa**: ~12 mil
+avisos amostrados por segundo por núcleo no `N = 8`, ~200 ns cada), é ~0,2% das faixas. (iii) a faixa fica
+incompleta por um estouro em **outra página** do mesmo (núcleo, lote) (a granularidade, abaixo). Tudo isso vira
+`blk_incomplete_*`; nunca "afirmado".
+
+**Granularidade: (núcleo, lote), recomendada; (núcleo, lote, página) descrita e adiada.**
+
+| | (núcleo, lote) | (núcleo, lote, página) |
+| --- | --- | --- |
+| Estado por núcleo | 2 palavras: `open`, `incomplete_floor` | tabela de `K` entradas (página, teto) endereçada pela página, mais `open` por núcleo |
+| Escritor, na falha | 1 `store` | 1 `store` na tabela; **colisão com entrada viva de outra página cai no (núcleo, lote)** (senão perderia informação e daria falso "completo") |
+| Aplicação | ≤ 6 cargas de `open` e ≤ 6 de piso | o mesmo mais a busca na tabela por faixa |
+| Prova | acima | refazer 2b a 2d com a página, mais o caso da colisão |
+| Falso "incompleto" | uma falha marca todas as faixas amostradas do (núcleo, lote) | só a página da falha (e as da mesma colisão) |
+| Ganho esperado | `N = 8`: o lote tem em média **4,6 páginas** (8.4, medido, com diagnóstico), então ~0,6 página amostrada por lote: a diferença entre as duas é **pequena**. `N = 1`: quase toda página tem falha (80% de estouro, medido), a página não ajuda | Aparece com `N = 2` a `4` e taxa de falha baixa mas não nula |
+
+**Decisão proposta:** (núcleo, lote). Critério para trocar, medido em casa: `blk_incomplete_floor ÷
+(blk_applies_over_gpu)` acima de ~10% em `N = 2` a `4` **e** `notice_overflow + cov_expired` baixos; senão a página
+não compra nada.
+
+**Pop e cobertura:** o recorte não depende da cobertura. Mas `pop_over_notice` em uma página amostrada com
+`notice_overflow` ou `cov_expired` diferente de zero é **um piso** (avisos perdidos não aparecem). O resumo diz isso
+com os dois contadores ao lado.
+
+#### 3.7.4 Pop: recorte por página só dentro do diagnóstico
+
+`PopAsyncBuffers` (`buffer_cache.h:725-729`) chama `NotePopHook(start, end, &read_mapped_memory[start - device_addr])`
+e, em seguida, `WriteBlockUnsafe(start, ..., end - start)`: **a escrita do download não muda**. Dentro de
+`NotePop` (`protocol.h:308`):
+
+```
+pop_ranges++                                   // originais, como hoje
+first = start >> 12;  last = (end - 1) >> 12
+pop_fragments += last - first + 1
+selecionados = N == 1 ? (last - first + 1) : #{p em first..last : Sampled(p << 12)}
+pop_fragments_selected += selecionados
+se selecionados == 0: retorna                   // não varre o ledger
+varre o ledger UMA vez sobre [start, end) (como hoje); cada registro cai no fragmento
+  da sua página (addr >> 12). Hash e amostra: bytes + (lo - start), lo = max(start, v.addr),
+  a mesma conta de hoje; o ponteiro deslocado de cada fragmento é bytes + (frag_lo - start).
+agrega por pop original: pop_over_notice (+1 se algum fragmento atingiu), pop_over_notice_bytes
+  (soma), pop_over_notice_fragments (fragmentos selecionados atingidos)
+```
+
+- **Por que uma varredura e não uma por fragmento.** `ForEachLive` custa o número de registros vivos, e os
+  registros só existem em páginas selecionadas (o escritor não registra as outras). Varrer a faixa inteira dá o
+  mesmo resultado que varrer fragmento por fragmento e custa uma vez; o recorte serve para **contar** e para
+  **saltar** a varredura quando nenhum fragmento é da amostra. A equivalência (cada registro cabe em uma página)
+  é teste (3.7.7, linha 8), contra uma referência que varre por fragmento.
+- **Vínculo (núcleo, lote) intacto:** o pop não usa lote (usa `Suspect` e `checked`); nada muda.
+- **Eventos agrupados pelo pop original:** o evento `PopHit` continua um por registro atingido, com `v[0], v[1]` =
+  o `[start, end)` **original** e `v[2]` = os bytes da interseção; ganha `v[4]` = fragmentos do pop e `v[5]` =
+  fragmentos selecionados, para o leitor agrupar linhas do mesmo pop sem recorrer ao tempo.
+- **Duas taxas, dois denominadores:** `pop_over_notice ÷ pop_ranges` (por pop original, **viesada** pelo número
+  de páginas do pop) e `pop_over_notice_fragments ÷ pop_fragments_selected` (por página amostrada: a taxa limpa).
+  O relatório imprime as duas e a diferença. **Sem multiplicar por `N`.**
+- `N = 1`: todos os fragmentos selecionados, uma varredura sobre a faixa inteira: **o `NotePop` de hoje**, mais os
+  contadores novos.
+
+#### 3.7.5 Caminho quente
+
+**Relógio: uma leitura por aviso** (hoje, até 9 por `Register`: `ledger.h:355` em cada slot publicado examinado,
+`:185` para `t_write`, `:250` em `Mark`, e `protocol.h:137` na saída). Passa a ser `now`, lido uma vez depois do
+`Collect` e passado a `Register(…, now, …)`: `Expired(s, now)`, `t_write = now`, e o `Mark` de `Checked`/`Late`
+recebe `t_write` e **não lê o relógio** (só `Popped` e `Applied` usam a hora, para a largura; ficam como estão,
+na thread da aplicação/pop, sob o mutex). Efeito na largura: `t_write` fica alguns ns antes da publicação.
+
+**Contadores do lado do escritor, por núcleo (`WriterCounters`, `alignas(64)`, 8 palavras = 1 linha):** `seen`,
+`sampled`, `registered`, `ambiguous`, `late`, `overflow`, `expired`, `floor_raises`. `std::atomic<u64>` **relaxado**,
+com um escritor por núcleo: o incremento é `store(load() + 1)`, sem RMW (sem `lock`). Se a premissa π4 falhar, o
+incremento perde contagens (nunca corrompe) e a conservação do resumo acusa. Saem da `struct Counters`
+compartilhada (hoje `notice_registered`, `notice_overflow` etc. na mesma linha, incrementados pelos seis núcleos e
+pela aplicação: `counters.h:20`, `:36-43`); ficam nela só os contadores da aplicação, do pop e do `blk`, que
+são incrementados em uma thread por vez, sob o `buffer_cache.mutex`, e `observation_lost` (rara, várias threads).
+`open` e `incomplete_floor` ficam em **outra** linha (`WriterShared`), porque a aplicação as lê e não deve
+invalidar a linha dos contadores do escritor.
+
+**Fora da amostra, o que o escritor faz:** a flag, o hash, `seen` do próprio núcleo (um `load`+`store` na própria
+linha), `CollectT<true>`. **Nenhum** outro dado compartilhado, nenhuma leitura de relógio. (`seen` é opcional: dá a
+fração observada de páginas amostradas, que o resumo compara com 1/N. Se o revisor o quiser fora, a verificação do
+predicado passa a ser só o teste 15.)
+
+**Aviso amostrado:** a mais, `open` (um `store seq_cst`, em x86 um `xchg`, e um `store release`, um `mov`); 3
+cargas `seq_cst` do lote como hoje; `Register` com uma leitura de relógio.
+
+**Soma no relatório:** `ReportLines` e `SummaryLines` leem cada `WriterCounters[c]` (relaxado) e somam. Com a
+execução em andamento a soma **não é um corte consistente**: os campos são lidos em instantes diferentes. Por isso
+as linhas `[total]` de 30 s e o relatório por segundo dizem "(aproximado)"; **a conservação só vale no resumo final
+com a execução parada**, e o resumo imprime as identidades com o resíduo e essa ressalva.
+
+#### 3.7.6 Relatório: campos novos
+
+- **Linha "ligado"** (`list_diag.h:149`): `[ListDiag] ligado: partes=pop,blk; amostra=1/8 de paginas de 4 KiB
+  (semente=0x1, hash=splitmix64, N valido); resumo ao fechar o jogo e totais a cada 30 s (aproximados: lidos com a
+  execucao em andamento)`. Com valor inválido: `N=8 (padrao: EDEN_LIST_DIAG_SAMPLE='abc' invalido)`.
+- **Linhas `[total]`** (a cada 30 s), grupo novo `sample`: `seen`, `sampled` (e `sampled/seen`, **observado**, contra
+  `1/N`), `apply_ranges_seen`, `apply_ranges_selected`, `pop_fragments`, `pop_fragments_selected`,
+  `pop_over_notice_fragments`. No grupo `notices`: os de hoje (somados) e `floor_raises`. No grupo `blk`:
+  `blk_incomplete` (`_open`, `_floor`, `_nomerge`), `blk_incomplete_gpu_bytes`, `blk_affirmed`,
+  `blk_ambiguous_no_record` (dentro de `blk_ambiguous`: o `exact` vazio, a causa que a revisão 4 queria separar).
+  Prefixo `(aprox.)` em todas.
+- **Resumo final:** os mesmos, mais (1) `amostra`: `N`, semente, `seen`, `sampled`, fração observada; (2) `cobertura`:
+  `notice_overflow`, `cov_expired`, `late`, `ambiguous` e `floor_raises` lado a lado com `blk_incomplete*`, e a frase
+  "pop_over_notice nas paginas amostradas e um piso enquanto estes forem diferentes de zero"; (3) `conservacao (so com
+  a execucao parada)`: `sampled = registered + overflow`; `registered = applied + late + expired + pendentes`;
+  `blk_applies = apply_ranges_selected`; `blk_applies_over_gpu = blk_ambiguous + blk_incomplete + blk_affirmed`;
+  `pop_ranges ≤ pop_fragments`, `pop_fragments_selected ≤ pop_fragments`; cada uma com os dois lados e a diferença;
+  (4) `escala: nenhuma (valores observados; a amostra e 1/N das paginas, nao e multiplicada)`.
+
+#### 3.7.7 Testes novos do harness (`tools/list-diag-harness/`, mesmo código do emulador)
+
+Os pontos de parada novos (`Hooks::At`): `w.after_open`, `w.after_overflow`, `w.before_open_clear`,
+`r.before_reclaim_cas`, `a.after_open_read`, `a.after_sweep`. Páginas "da amostra" e "fora" são escolhidas pelo teste
+chamando o predicado real com `N` e semente fixos.
+
+| # | Teste | Confere |
+| --- | --- | --- |
+| 1 | **Mistura nos três caminhos do `Collect`** (CAS, `guard`, "já coberto"), páginas da amostra e fora no **mesmo** gerenciador e lote | a saída do `Gather` é igual à do `Collect` de antes para a mesma sequência (equivalência, 40 000 passos); o lote de cada aviso **amostrado** é o do roteiro (identidade, com o mutante "lote seguinte"); os fora da amostra não aparecem em nenhum slot |
+| 2 | **Aviso fora da amostra nunca toca o ledger nem os contadores do lote** | M avisos fora: os 6 anéis byte a byte iguais (todo `state` zero), `GatherLotState` igual, **todo** campo de `Counters` zero, índice de vivos zero, leituras de relógio = 0; só `seen[núcleo]` subiu |
+| 3 | **Overflow parcial e total no mesmo bloco e lote** (anel pequeno, `kScan` curto) | parcial: a, c registrados e b estourado no bloco: `exact = {a, c}`, `blk_incomplete_floor = 1`, `blk_gpu_bytes_at_risk = 0`, `blk_incomplete_gpu_bytes` = o que o T3a afirmaria. Total: `exact` vazio, `blk_ambiguous_no_record = 1`. Controle negativo `NaiveNoCoverage`: afirma `at_risk` sobre os bytes de b |
+| 4 | **Overflow com lote ambíguo** (`Gather` parado no meio, como o teste de ambiguidade) | piso = `s2 + 1`; as aplicações dos lotes `d + 1` a `s2 + 1` são incompletas; a do lote `s2 + 2` é **completa** (o piso não envenena o futuro) |
+| 5 | **Expiração antes da aplicação** (relógio manual) | registro velho não encerrado, o aviso seguinte o recicla: `cov_expired = 1`, a aplicação do lote dele é incompleta; com o registro **já aplicado**, nada marca; parada em `r.before_reclaim_cas`: a aplicação rodando **entre** a subida do piso e o CAS nunca sai completa (nas duas ordens) |
+| 6 | **`open`, determinístico** | escritor parado depois do `Collect` (`w.after_open`): o `Gather` retira e a aplicação roda: `blk_incomplete_open`, sem `at_risk`; solto, o lote seguinte é completo. Escritor parado antes de O2: idem. Mutante `NaiveNoOpenFlag`: a **falsa completude aparece** (o teste é sensível) |
+| 7 | **Publicação tardia e ambíguo tardio** (3.3.1 e o achado 3.7.3.d) | o aviso é publicado depois da aplicação: `late`, piso sobe, a aplicação seguinte do lote é incompleta; o ambíguo publicado depois da varredura: `open` ou piso o declara; sem os dois (mutante) o trecho sai "afirmado" |
+| 8 | **Pop atravessando páginas da amostra e fora** | faixa de 4 páginas, 2 da amostra: `pop_ranges = 1`, `pop_fragments = 4`, `pop_fragments_selected = 2`, `pop_over_notice = 1` (não 2), `pop_over_notice_fragments = 2`; bytes distintos por posição: o hash do fragmento sai de `bytes + (lo - start)` (o ponteiro errado dá `sample_different` com guest igual); faixa que começa e termina no meio de página; a varredura única é igual a uma varredura por fragmento de referência |
+| 9 | **`N = 1` equivalente ao T3a** | o mesmo roteiro aleatório contra uma cópia congelada do protocolo do T3a (`1d41515`): todos os contadores e eventos iguais **exceto** os novos; `blk_gpu_bytes_at_risk(T3a) = blk_gpu_bytes_at_risk(T3a.1) + blk_incomplete_gpu_bytes` |
+| 10 | **Conservação na amostra com a execução parada** | 6 escritores, `Gather`/aplicação e pop em threads, `N` = 1, 8 e 64: ao parar, `sampled = registered + overflow` (por núcleo e no total), `registered = applied + late + expired + pendentes`, e as demais identidades de 3.7.6; fração `sampled/seen` a menos de 4σ de 1/N; **nenhum falso completo**: para cada faixa afirmada, o conjunto de avisos da referência (a saída do `Gather` com a identidade de cada aviso) está contido em `exact`; os mutantes dos testes 3 e 6 produzem ao menos um falso completo aqui. Também sob **TSan** |
+| 11 | **Contadores por núcleo** | `static_assert(sizeof == alignof == 64)` de `WriterCounters` e `WriterShared`; `Counters` não tem mais os campos do escritor; a soma por núcleo = o que o roteiro mandou |
+| 12 | **Uma leitura de relógio por `Register`** | anel com 8 slots publicados e não expirados: estouro com 1 leitura (hoje 9); registro normal: 1 |
+| 13 | **Desligado: nada muda, nada é alocado** | os roteiros de hoje; `WriterCounters`/`WriterShared` não alocados; o caminho é `CollectT<false>` |
+| 14 | **`N` e semente** | valores inválidos voltam ao padrão e a linha "ligado" diz; semente em decimal e hexadecimal |
+| 15 | **O predicado é um só** | `Sampled(a)` do escritor = o da faixa que o `Gather` real devolve (a ida e volta `u32(a >> 11)`) = o da aplicação = o de cada fragmento do pop, para endereços aleatórios inclusive as duas metades de 2 KiB de uma página; **independe do núcleo**; uniformidade (qui-quadrado) para `N` = 2, 8, 64 |
+
+#### 3.7.8 Os 2,6 vezes mais lotes de aplicação com o diagnóstico ligado (8.4): hipóteses lidas no código
+
+Fato medido (8.4): sem o diagnóstico ~400 lotes/s (27,5 trechos, 10,2 páginas); com ele ~1 040/s (10,7 trechos, 4,6
+páginas); trechos por segundo parecidos (~11 mil). O contador do lote é `OnCachedWrites` com dados
+(`vk_rasterizer.cpp:959`). **Só hipóteses; nada foi tentado.**
+
+1. **O `buffer_cache.mutex` fica mais tempo ocupado pela aplicação, e o escritor espera nele.** `NoteApply` varre o
+   ledger **por faixa**, sob o mutex (`buffer_cache.h:145`, dentro de `CachedWriteMemory`); com ~20% dos avisos
+   registrados e vida de 6 ms, há centenas de registros vivos (**estimativa**, não medida) e dezenas de faixas por
+   lote. O escritor, para uma página que ainda não "lembra", chama `OnCPUWrite`, que toma o **mesmo** mutex
+   (`vk_rasterizer.cpp:998`). Mais espera na CPU do jogo muda quando os avisos chegam em relação às chamadas de
+   `InvalidateGPUCache`.
+2. **Sobreposição de rajadas.** As chamadas vêm da thread de trás e das listas e fences
+   (`gpu_thread.cpp:79,106`, `fence_manager.h:139`), **não** das escritas; um lote tem dados se alguma escrita
+   caiu entre duas chamadas. Escritas mais lentas alongam as rajadas, e mais chamadas caem dentro delas: lotes
+   **mais frequentes e menores**, com o total de trechos igual. Isso bate com o formato do que foi medido (2,6×
+   mais lotes, 2,6× menos trechos por lote) **e é só uma leitura**.
+3. **A taxa de chamadas sem o diagnóstico não é conhecida.** `invalidate_calls` e `invalidate_empty` existem só com o
+   diagnóstico ligado (`counters.h`, `protocol.h:163-195`); o `BackStats` não conta chamadas, só lotes com dados.
+   Os 54 509 chamadas e 48% vazias do 8.4 são totais da sessão, os ~1 040 lotes/s são do último intervalo: **não
+   se comparam**. Sem a taxa de chamadas sem o diagnóstico, não se separa "mais chamadas" de "mais chamadas com dados".
+4. **Descartadas pela direção (lido):** o custo de `GatherAll` e de `MakeBatch` (6 `GatherT<true>`, 2 `fetch_add`
+   `seq_cst`, o `std::function` por núcleo, `MakeBatch` em `O(finais × pré)`) alonga a chamada e deveria **juntar**
+   mais avisos por lote, o contrário do medido. O `gather_epoch` continua incrementado nas duas variantes
+   (`gpu_dirty_memory_manager.h:126`), então o "esquecimento" de páginas lembradas pelo escritor
+   (`core/memory.cpp`, `ForgetBefore`) não difere.
+
+**O que o T3a.1 muda:** o escritor perde, em 7/8 das páginas (`N = 8`), tudo menos o hash e o `CollectT<true>`; nas
+amostradas, 1 leitura de relógio em vez de até 9 e sem linha compartilhada; a aplicação varre `1/N` das faixas e
+cada varredura vê `1/N` dos registros vivos (custo da varredura ~`1/N²`, **estimativa**), o que ataca (1). Se com
+`N = 8` os lotes/s voltarem para ~400, a causa estava no custo por aviso ou na varredura sob o mutex. Se ficarem em
+~1 040, a causa está no que o T3a.1 **não** muda (`CollectT<true>` ou o `Gather`/`MakeBatch`/`BeginApply` de cada
+chamada). **Experimento que separa as duas, só com variável de ambiente:** `EDEN_LIST_DIAG_SAMPLE` enorme (2^20:
+quase nada amostrado) deixa só o custo fixo; se a perturbação persiste, é do caminho fora da amostra. Para (3),
+proponho (**fora do escopo aprovado, a decidir**) dois contadores só no `BackStats`, sem o diagnóstico:
+chamadas de `InvalidateGPUCache` e chamadas vazias.
+
+#### 3.7.9 O que não muda e o que fica em aberto
+
+- Não muda: protocolo dos slots e dos lotes; P0; 3.3 e 3.3.1; o que é aplicado; o desligado. A única mudança de
+  **sentido** é o campo `lot` do registro ambíguo (guarda `hi`; 3.7.3, passo 4).
+- Em aberto: (a) a hipótese do `BuildTransform` com escrita que cruza 2 KiB (3.7.1); (b) o custo do `seq_cst` em ARM;
+  (c) a granularidade por página, só se a medição pedir; (d) os contadores do `BackStats` do item 3 acima;
+  (e) `EDEN_HELD_WRITE_MERGE=0` torna toda cobertura incompleta, por premissa.
+
 
 ## 4. Problema A: janela do pop (contadores e logs próprios)
 
@@ -753,7 +1104,7 @@ custo do T3a.
 | 13 (achado ao implementar) | (não veio da revisão) a varredura do livro-razão por faixa lia 6 × 1024 slots, sob o `buffer_cache.mutex` | Sim, e é custo que perturba justamente o que o diagnóstico mede: a praça tem centenas de faixas por lote | 3.4: índice de slots vivos (bitmap) com a ordem publicar-depois-ligar e a releitura em `Free`; o teste confere o índice contra os slots publicados |
 | 14 (revisão 4, sobre `dc4d0a9`) | (1) Com o diagnóstico ligado, um aviso de página não amostrada deve continuar em `CollectT<true>`: misturar com `CollectT<false>` no mesmo gerenciador quebra as premissas da prova, porque os avisos não amostrados também mexem no mesmo `current` e empurram dados para `back_buffer`. (2) Overflow parcial no mesmo bloco e lote deixa `exact` incompleta sem marcar ambíguo; pede teste e mecanismo conservador. (3) Amostra por página, sim; predicado pelo mesmo endereço em todos os hooks, independente do núcleo, com `N` e semente fixos e registrados; resultados observados em primeiro lugar, sem multiplicar tudo por `N`. (4) Recorte do pop por página só no diagnóstico, com o deslocamento do ponteiro, o vínculo `(núcleo, lote)` intacto e contagens separadas (pops originais, fragmentos, fragmentos selecionados). (5) A ociosidade da trás não localiza o custo: o `other busy` sobe de 15,2% para 20,2%. (6) Contadores por núcleo continuam atômicos; conservação só com a execução parada | (1) Sim: `CollectT<true>` só troca as ordens de memória de `current` para `seq_cst` (`gpu_dirty_memory_manager.h:56-85`), e a prova da 3.3 assume essa ordem em todo acesso a `current`. No x86-64, CAS e `exchange` já são instruções com trava nas duas variantes, e a carga `seq_cst` é um `mov`: a economia perdida deve ser pequena (mapeamento padrão, não conferido no binário). (2) Sim, e é **pior**: sem nenhum registro, `exact` fica vazia e o trecho inteiro conta como em risco (`protocol.h:265-300`, `:677`), contra o que a seção 5 diz. Achado meu: a reciclagem por expiração (`ledger.h:166-201`) também perde um registro antes da aplicação dele, e cai no mesmo caso. (3) e (4) Sim. (5) Sim, conferido nos logs; achado meu: o diagnóstico reparte a aplicação em 2,6 vezes mais lotes (8.4). (6) Sim | 8.4 corrigido (custo distribuído, `at_risk` não confiável, A não mostrado como raro). Escopo do T3a.1 abaixo |
 
-**T3a.1 (escopo aprovado pelo revisor, revisão 4; desenho a cargo do codador):**
+**T3a.1 (escopo aprovado pelo revisor, revisão 4; desenho na seção 3.7, sem código):**
 - **Três caminhos no escritor:** desligado = `CollectT<false>` (como hoje); ligado e página fora da amostra =
   `CollectT<true>`, sem ledger, sem carga do lote, sem contador compartilhado; ligado e página na amostra =
   `CollectObserved` completo.
