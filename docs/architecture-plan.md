@@ -248,3 +248,27 @@ o padrão antes de medir.
 | Contagem de 19 variáveis sem critério | Critério e lista na seção 1 |
 | Ordem: diagnóstico e protocolo antes da arquitetura global | Seção 5 reescrita conforme a revisão |
 | (revisão 2) Posição no ring não é dependência satisfeita | 3.3 e passo 4 da seção 5 |
+
+## 11. Teste com casos reais: os Zeldas do Lichii
+
+Os commits do Lichii para Hyrule Warriors: Age of Imprisonment e para "Ocarina" (o Zelda que eles chamam
+de "green-hat kid adventure") servem para testar a promessa da seção 0. Classificação (lida nos commits,
+não reproduzida):
+
+| Commit | O que corrige | Camada | Com esta arquitetura |
+| --- | --- | --- | --- |
+| b328477, c9ebb5c (shader), e442211, fc517e3, 982cab9, a10e013 | Formas de shader, sombreamento de registradores (porta da casa do Link com NaN) | L0 | Continua por jogo, como esperado |
+| b6706b0 | `WaitIfEqual64` (arbitragem tipo 3) no kernel | Serviços/kernel | Continua por jogo, como esperado |
+| 9e33027 | Primeira escrita: argumentos de draw de 4 palavras em página nova, lidos antes de o compute rodar; contornado esperando escritores só em entradas de até 8 palavras | L1/L2 | Coberto pelo protocolo de dependências, sem limiar de tamanho (é o contraexemplo da revisão 2, item 2, num jogo real) |
+| b13c4c1 | Escrita da CPU ao lado de bytes da GPU na mesma página; o rastreio por página perdia os bytes da GPU | L1 | Coberto pela autoridade por faixas exatas (3.2), não por página |
+| 3165a2b (#103) | Desempenho da correção anterior (Ocarina: thread de trás esperando 60% do tempo) | L1 | O mesmo item: com faixas exatas, a escrita da CPU vai ao buffer sem download |
+| 15126fb | Downloads pendentes da mesma faixa se confundindo (device lost) | L1 | Coberto pelas transferências com faixas e versão próprias (3.2) |
+| 92a1a0f | Draws com contagens de lixo quando o compute produtor foi rejeitado | Princípio 4 | Vira regra geral: consumidor de produtor rejeitado falha fechado |
+
+Resumo: de 12 commits, 7 são o trabalho esperado (ISA e kernel) e 5 são contornos de coerência e ordem que
+esta arquitetura pretende tornar desnecessários. "Pretende": nada disso está implementado, e o protocolo
+ainda tem perguntas abertas (seção 9 e `docs/gpu-produced-data-plan.md`, seção 7).
+
+Este fork: o `WriteMemory` daqui não baixa a página (`buffer_cache.h:132-138`), então o b13c4c1 não se
+aplica como está; falta verificar se o upload de páginas marcadas pela CPU sobrescreve bytes da GPU no
+mesmo buffer. Esse é o caso dirigido "escrita parcial de página" do outro plano.

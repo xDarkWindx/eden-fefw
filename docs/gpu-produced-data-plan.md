@@ -184,6 +184,8 @@ cada entrada em cada caso:
 | Retomada dentro da entrada | acquire no meio da entrada; produtor antes do release | as palavras depois do acquire são a versão coerente |
 | Reuso pela CPU | o jogo observa a conclusão (sinalizada antes da hora) e reescreve a memória submetida | a entrada executa a versão da submissão mais o produtor, não a reescrita |
 | Dois produtores na mesma faixa | P1 e P2 escrevem a mesma faixa antes do fetch; um deles depois da espera | a versão escolhida é a definida no item 3 da 4.2 |
+| Argumentos pequenos em página nova (caso real: Hyrule Warriors, Lichii 9e33027) | compute escreve 4 palavras de argumentos em memória nunca escrita pela GPU; a entrada que as lê vem logo depois | a entrada vê os argumentos sem depender de um limiar de tamanho |
+| Escrita parcial de página (caso real: Lichii b13c4c1, #103) | a CPU escreve uma estrutura pequena ao lado de bytes da GPU na mesma página | os bytes da GPU sobrevivem ao upload, sem download síncrono |
 
 ### 4.2 Consumidor de command lists (só depois do diagnóstico e dos casos dirigidos; opt-in)
 
