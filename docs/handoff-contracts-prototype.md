@@ -61,7 +61,8 @@ ponto único e trocável. **Nenhum código do emulador foi alterado até aqui**;
 | `3884db6` | **Bug real achado pela revisão:** a validade das transferências cobria só as faixas copiadas. `Transfer` ganhou `covered`; casos `stale_empty_transfer` e `stale_two_pages`; negativos **tipados** (`WordMismatch`, `DependencyViolated`...) |
 | `61d936e` | Docs: `exact-drain` é a referência e o padrão; a regra por dependências é experimental |
 | `622659f` | Dois modos de incremento do host (`host-early`, `host-deferred`), casos `syncpoint_before_gpu`, `syncpoint_trusted_as_ready`, `other_channel_missing_dependency`, **downloads** GPU → memória do jogo (`pending_download_vs_cpu_write` e dois negativos) e a correção do F1 no plano de listas |
-| (este commit) | Escritas seguradas em três etapas (`held_write_vs_pending_download` e a versão protegida), este handoff |
+| `638dd77` | Escritas seguradas em três etapas (`held_write_vs_pending_download` e a versão protegida), este handoff |
+| (sessão do T3, parte 1) | Harness: avisos em blocos de 64 bytes (`ModelKnobs::notice_block_words`) e os casos `held_write_block_clobbers_gpu_bytes` (negativo, `WordMismatch` sempre) e `held_write_block_exact_notices` (positivo), em tabela separada da janela do pop. Planos: requisitos e princípio para o T4 (`docs/gpu-produced-data-plan.md`, 12.1 e 12.2). **Desenho do T3 em `docs/list-diag-design.md`, aguardando aprovação do usuário: nenhum código do emulador foi escrito** |
 
 ### T2: inventário (feito)
 
@@ -160,9 +161,38 @@ Outros fatos que o T3 não pode esquecer: em Switch 2 (`UsesNativeTiling`) só o
 (`nvhost_gpu.cpp:395`); o acquire de syncpoint não satisfaz nada hoje (`puller.cpp:126-132`); na frente do
 split nunca se consultam caches nem o scheduler (`docs/architecture-plan.md`, 3.3).
 
+## 5.1 Acréscimos do usuário ao T3 (sessão do T3)
+
+Valem para tudo o que o T3 escrever. O desenho está em `docs/list-diag-design.md`.
+
+1. **Dois problemas separados**, com contadores e logs separados (corrigir um não resolve o outro): (a) a
+   **janela do pop** (faixa do download, faixa da escrita, ordem escrita, pop, aplicação); (b) os **blocos de 64
+   bytes** (endereço, tamanho do bloco, bytes da GPU cobertos).
+2. **Observar sem corrigir.** Nada de travas novas que ordenem o pop em relação à aplicação dos avisos, nem
+   aplicação antecipada. A leitura do estado dos avisos pela thread de fences não pode ser um `Gather` nem um
+   peek no `GPUDirtyMemoryManager` (o `Gather` consome, e o peek não vê o aviso entre o `Gather` e a aplicação):
+   livro-razão próprio, sem trava no escritor (`docs/list-diag-design.md`, 3.2, com o que ele deixa de ver).
+3. **Custo:** contadores agregados (no `EDEN_BACK_THREAD_STATS`) e logs limitados (primeiras N, depois
+   amostragem). Plano de teste no FE: diagnóstico desligado contra ligado na praça e no palácio (draws/s, com
+   as estatísticas de tempo desligadas), além do Bananza (`docs/list-diag-design.md`, 8.3).
+4. **Harness:** feito (acima). O positivo com avisos exatos mostra só que a proteção modelada funciona.
+5. **Para o T4** (`docs/gpu-produced-data-plan.md`, 12.2): "aplicar os avisos antes do pop" não pode rodar
+   uploads e operações do scheduler na thread de fences (donos e ordem de travas); "o pop respeita avisos
+   pendentes" exige a proteção publicada antes de os bytes ficarem vulneráveis, sem que retirá-la abra outra
+   janela; **uma intercalação encontrada e reproduzida justifica a correção, a medição dimensiona exposição e
+   custo, e uma execução sem ocorrências não a invalida.**
+
+**Alcance a manter em todo texto novo:** no harness, as duas perdas de dados foram reproduzidas e as proteções
+modeladas passaram; no emulador, há caminhos plausíveis identificados por leitura, sem ocorrência nem
+frequência medidas; a correção de produção está em aberto, e o positivo do harness não decide qual mecanismo
+integrar.
+
 ## 6. Tarefas, em ordem (pare e reporte ao fim de cada uma)
 
 ### T3 — Build de diagnóstico de listas (código real, **desligado por padrão**)
+
+**Estado:** harness feito; **desenho proposto e aguardando aprovação** (`docs/list-diag-design.md`, decisões na
+seção 10). Não escreva código do emulador antes dela. Fases propostas: T3a (`pop` e `blk`) e T3b (`list`).
 
 Escopo que o revisor pediu: **pequeno, opt-in, com testes de integração, sem habilitar nada por padrão.**
 Não comece sem ler a seção 5 acima e `docs/gpu-produced-data-plan.md`, 4.1.2.

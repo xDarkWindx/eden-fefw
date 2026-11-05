@@ -412,6 +412,8 @@ dele.
 | 12 | Janela das escritas seguradas: a CPU escreve numa página com dados da GPU, o aviso fica segurado e o pop assíncrono de um download pendente cai por cima dos bytes novos antes da aplicação | A ausência de proteção é verificada no código (`docs/gpu-contract-inventory.md`, 7.1, itens a a e); a probabilidade não foi medida. O harness reproduz a sequência: `held_write_vs_pending_download` falha com `WordMismatch` em `gpu-lags` e `both-lag` (todas as rodadas), e o positivo `held_write_vs_pending_download_protected` (o pop pula os bytes cobertos por avisos segurados) passa em todos os escalonamentos e nos dois modos de host | Nenhuma mudança de código. Pendência do T4 (seção 12 abaixo) |
 | 13 | (revisão do T1) Precisão: em `host-deferred` o consumidor que confia no syncpoint passa porque a política dá uma garantia mais forte; o erro é depender dela sem declará-la | Sim. `syncpoint_trusted_as_ready` passa em `host-deferred` e falha com `WordMismatch` em `host-early` (aleatório, `gpu-lags` e `both-lag`); o texto do README foi corrigido | A regra da 4.2, item 3, fica como está: a conclusão vem da fence da própria cópia, nunca da política de callbacks |
 
+| 14 | Hipótese 7.2 (avisos segurados em blocos de 64 bytes): a aplicação do aviso cobre bytes vizinhos só da GPU? | No modelo, sim: `held_write_block_clobbers_gpu_bytes` (aviso em bloco de 64 bytes; a GPU escreveu o bloco, a CPU escreve uma palavra) falha com `WordMismatch` em todas as rodadas e escalonamentos; o positivo `held_write_block_exact_notices` (avisos exatos) passa. **Problema separado da janela do pop** (linha 12): sem download no roteiro, e corrigir um não resolve o outro | Nenhuma mudança de código. Pendência do T4 (seção 12). No emulador é caminho plausível por leitura (`core/gpu_dirty_memory_manager.h:66-79,94-96,113-121`, `buffer_cache.h:141-157,2105-2128`), **sem ocorrência nem frequência medidas**; o positivo do modelo não decide o mecanismo |
+
 Resultado do último `run.sh` (três builds), na data deste commit: ver `tools/gpu-contract-harness/README.md`,
 "Resultado do último `run.sh`": `-O2` com 2000 rodadas aleatórias e 200 forçadas por escalonamento (por caso,
 regra e modo de host), TSan e ASan/UBSan com 200 e 20; o LeakSanitizer rodou (confirmado num programa que
@@ -432,8 +434,51 @@ do plano de arquitetura:
 | Caminhos afetados | `PopAsyncBuffers`; leitura dos avisos pelo dirty manager; o texture cache e as queries também têm pop, e não foram analisados | A thread de fences (`ReleaseThreadFunc`) e a ordem entre `InvalidateGPUCache` e `PopAsyncFlushes`; o `OnCPURead` já faz isso no caminho síncrono (`gpu.cpp:263-268`) |
 | Teste | `held_write_vs_pending_download_protected` (já existe) | Roteiro com `ApplyHeld` **antes** de `WaitDownloads` no harness (a acrescentar) |
 
-Antes de escolher: medir a janela no emulador (contar, no build de diagnóstico do T3, pops que gravam sobre um
-aviso segurado ainda não aplicado) e verificar a hipótese da granularidade de 64 bytes (`docs/gpu-contract-inventory.md`,
-7.2). Mudanças de política de fence continuam sendo medidas à
-parte no FE.
+### 12.1 Dois problemas, separados
+
+| | Janela do pop | Blocos de 64 bytes |
+| --- | --- | --- |
+| O que é | um download antigo é publicado (pop) sobre bytes que têm um aviso de escrita segurado ainda não aplicado; a aplicação então sobe os bytes velhos | a aplicação de um aviso segurado cobre um bloco de 64 bytes que inclui bytes ainda em `gpu_modified_ranges`; o upload do bloco sobrescreve no host dados vizinhos só da GPU |
+| Natureza | **ordem** entre o pop e a aplicação | **granularidade** do aviso (e da subtração em `gpu_modified_ranges`) |
+| Harness | `held_write_vs_pending_download` (negativo) e `..._protected` (positivo) | `held_write_block_clobbers_gpu_bytes` (negativo) e `held_write_block_exact_notices` (positivo) |
+| Contadores e logs no T3 | próprios (`docs/list-diag-design.md`, 4) | próprios (idem, 5) |
+
+Corrigir um não resolve o outro: a direção (2) (aplicar os avisos antes do pop) não muda o tamanho do bloco que a
+aplicação sobe, e avisos exatos não mudam a ordem entre pop e aplicação.
+
+### 12.2 Requisitos registrados para o T4 (revisão do T3)
+
+Nenhuma delas é correção proposta nem decidida; são condições que qualquer das direções da tabela acima precisa
+cumprir, para que a escolha não reintroduza uma janela.
+
+1. **"Aplicar os avisos antes do pop" não pode significar rodar uploads e operações do scheduler na thread de
+   fences.** A aplicação (`OnCachedWrites`, `vk_rasterizer.cpp:958-992`) toma o `texture_cache.mutex` e o
+   `buffer_cache.mutex` **um de cada vez**, em blocos separados (**verificado**), e `CachedWriteMemory` termina em
+   `InlineMemoryImplementation`, que sincroniza o buffer e grava no scheduler
+   (`SynchronizeBuffer`, `runtime.CopyBuffer`/`ImmediateUpload`, `buffer_cache.h:2110-2127`); a thread de fences
+   toma os dois mutexes **juntos** no pop, num `scoped_lock` (`fence_manager.h:286-293`). Esses uploads e
+   operações têm **donos** (a thread de trás com o split, a thread da GPU sem ele:
+   `docs/gpu-contract-inventory.md`, 1) e uma **ordem de travas** que o T4 precisa levantar por leitura antes de
+   propor a direção (2): não a afirmo aqui (**hipótese**: o scheduler como folha). A direção (2) tem de preservar
+   os donos e a ordem; por exemplo, a thread de fences só **entrega**
+   a tarefa de aplicação ao dono (e o pop espera essa conclusão, ou o pop é adiado), em vez de executá-la. Isso
+   precisa de teste de ordem de travas (TSan) no harness, com a espera nova declarada pela seção 2.2.
+2. **"O pop respeita avisos pendentes" exige que a proteção esteja publicada antes de os bytes ficarem
+   vulneráveis, e que retirá-la não abra outra janela.** Hoje o aviso segurado só é registrado no `Collect`
+   (`core/memory.cpp:765`) **antes** de o `memcpy` no guest (`:587-590`, `:649-653`); a direção (1) precisa que
+   o registro que o pop consulta esteja visível ao pop pelo menos desde o instante em que o `memcpy` pode
+   ocorrer, e que a retirada da proteção (na aplicação) só aconteça depois de o upload ter lido os bytes
+   novos. Retirar a proteção cedo reabre a janela (o pop cai entre a retirada e o upload); retirá-la tarde
+   mantém a faixa em `async_downloads`/`gpu_modified_ranges` (recurso retido, linha "Recursos retidos" da
+   tabela da seção 12). O teste do harness tem de forçar o pop **entre a retirada e o upload**.
+3. **Princípio (decisão do usuário): uma intercalação encontrada e reproduzida justifica a correção.** A medição no
+   jogo (o build de diagnóstico do T3) serve para **dimensionar** a exposição e o custo, e uma execução sem
+   ocorrências **não invalida** a correção: a janela é uma propriedade da ordem permitida pelas travas, não de
+   um jogo ou de uma sessão. O que a medição pode mudar é a **escolha entre as direções** e o orçamento de custo
+   (seção 12.1 do plano de arquitetura), não a existência do problema. O alcance continua sendo: no harness, as
+   duas perdas de dados foram reproduzidas e as proteções modeladas passaram; no emulador, há caminhos
+   plausíveis identificados por leitura, sem ocorrência nem frequência medidas; a correção de produção está em
+   aberto e o positivo do harness não decide qual mecanismo integrar.
+
+Mudanças de política de fence continuam sendo medidas à parte no FE.
 

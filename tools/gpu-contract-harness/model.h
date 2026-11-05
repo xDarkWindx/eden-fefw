@@ -67,6 +67,12 @@ struct ModelKnobs {
     bool cancel_pending_downloads = true;   // a CPU write cancels pending downloads over it
     bool single_pending_set = false;        // one pending set for all downloads (pre 15126fb)
     bool pop_skips_held = false;            // the download pop skips words covered by held notices
+    // Granularity of the held notices, in words. 0 = the exact words written (what the earlier
+    // held_write_* cases use). 16 = 64-byte blocks aligned to 64 bytes, as
+    // GPUDirtyMemoryManager::Gather hands them to the caches (core/gpu_dirty_memory_manager.h:
+    // 66-79, 94-96, 113-121): CachedWriteMemory then reads the whole block from guest memory and
+    // uploads it (buffer_cache.h:141-157, 2105-2128).
+    std::uint32_t notice_block_words = 0;
 };
 
 enum class OpKind {

@@ -427,6 +427,39 @@ std::vector<Case> BuildCases() {
         c.after_satisfied = c.exact_drain = Expect::MustPass();
         cases.push_back(c);
     }
+    { // Second problem, separate from the window of the pop above: the granularity of the held
+      // notices (docs/gpu-contract-inventory.md, 7.2). No download is involved. The GPU writes
+      // 16 words (one 64-byte block) that only it knows: the CPU never read them, so under
+      // Switch 2 downloads (buffer_cache_base.h:541-562) they are not copied back and guest
+      // memory still holds the old words. The CPU then writes one word of the same block; the
+      // write goes to guest memory at once and its notice is held. When the notice is applied
+      // it covers the whole block (Gather rounds to 64 bytes, gpu_dirty_memory_manager.h:66-79,
+      // 113-121): CachedWriteMemory reads the block from guest memory and uploads it, and
+      // InlineMemoryImplementation drops the block from gpu_modified_ranges
+      // (buffer_cache.h:141-157, 2105-2128), so the neighbouring GPU words are overwritten on
+      // the host by their old guest values and never copied back.
+        const std::uint32_t b = Page(5) + 16; // aligned to 16 words = 64 bytes
+        const std::vector<Word> w{0x71};
+        Case c{"held_write_block_clobbers_gpu_bytes",
+               "aviso segurado em bloco de 64 bytes cobre palavras so da GPU (comportamento atual)"};
+        c.knobs.notice_block_words = 16;
+        c.channels = {{Produce(1, b, 16),
+                       Simple(OpKind::WaitBack),           // the producer is recorded: page is GPU-modified
+                       CpuWriteHeld(b + 4, w),             // (i)   one word; the notice is the block
+                       Simple(OpKind::ApplyHeld),          // (iii) InvalidateGPUCache
+                       Simple(OpKind::WaitBack),
+                       CheckGuest(b + 4, Expected(b + 4, 1).Put(0, w)),
+                       CheckHost(b, Expected(b, 16).Put(0, ProducerValues(1, 16)).Put(4, w).words)}};
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
+        cases.push_back(c);
+        // The same script with exact notices: the upload carries only the written word, and the
+        // neighbouring GPU words survive on the host.
+        c.name = "held_write_block_exact_notices";
+        c.title = "o mesmo roteiro, com avisos exatos (positivo)";
+        c.knobs.notice_block_words = 0;
+        c.after_satisfied = c.exact_drain = Expect::MustPass();
+        cases.push_back(c);
+    }
     return cases;
 }
 

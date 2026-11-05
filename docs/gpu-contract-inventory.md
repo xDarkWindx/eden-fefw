@@ -394,7 +394,14 @@ O `Gather` entrega as faixas em blocos de 64 bytes alinhados (`core/gpu_dirty_me
 arredondado do guest (`buffer_cache.h:153-156`, `InlineMemoryImplementation`, que também subtrai o trecho
 inteiro de `gpu_modified_ranges`, `:2107-2108`). **Hipótese (lida, não executada):** bytes vizinhos da GPU,
 dentro do mesmo bloco de 64 bytes que a escrita da CPU e ainda não baixados, seriam cobertos pelos bytes
-antigos do guest. O harness usa avisos exatos e não cobre isso (README, "O que o modelo não cobre").
+antigos do guest. **Modelada no harness (T3, item 4):** `held_write_block_clobbers_gpu_bytes` reproduz a perda
+com avisos em blocos de 64 bytes (falha com `WordMismatch` em todas as rodadas) e `held_write_block_exact_notices`
+(avisos exatos) passa; **problema separado da janela do pop** (7.1), sem download no roteiro. No emulador
+continua sendo caminho plausível por leitura, sem ocorrência nem frequência medidas; o build de diagnóstico
+(`docs/list-diag-design.md`, 5) conta os bytes da GPU cobertos por bloco aplicado. Em Switch 2 só se baixa o que a
+CPU leu (`buffer_cache_base.h:541-562`), então os vizinhos que a CPU nunca leu **só existem no host**: o upload do
+bloco os troca pelos bytes antigos do guest e a subtração em `gpu_modified_ranges` impede que alguma coisa os
+devolva.
 
 ### Pendências de localização
 

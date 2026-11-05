@@ -171,6 +171,31 @@ Negativos dos mecanismos (cada um desliga uma peça e tem de falhar com as duas 
 `NeverWait` é um controle do harness, não o comportamento atual do emulador: mostra quais casos dependem
 de alguma espera da regra.
 
+### Blocos de 64 bytes (segundo problema, separado da janela do pop)
+
+Dois problemas diferentes, com mecanismos, casos e correções próprios (corrigir um não resolve o outro): a
+**janela do pop** (`held_write_vs_pending_download*`, acima) é uma questão de **ordem** entre o pop e a
+aplicação do aviso; os **blocos de 64 bytes** (abaixo) são uma questão de **granularidade** do aviso, sem
+download nenhum no roteiro. Hipótese 7.2 de `docs/gpu-contract-inventory.md`: o `Gather` entrega os avisos em
+blocos de 64 bytes alinhados e a aplicação lê o bloco inteiro do guest e o sobe para o host
+(`core/gpu_dirty_memory_manager.h:66-79,94-96,113-121`; `buffer_cache.h:141-157,2105-2128`).
+
+`ModelKnobs::notice_block_words` é a granularidade do aviso segurado: `0` são as palavras exatas (os casos
+`held_write_vs_pending_download*` continuam assim), `16` são blocos de 16 palavras de 4 bytes = 64 bytes
+alinhados. O `memcpy` no guest continua escrevendo só as palavras da CPU; o que muda é o trecho que a
+aplicação (`ApplyHeldNotices`) lê do guest e sobe.
+
+| Caso | Roteiro | Onde falha (tipo esperado) |
+| --- | --- | --- |
+| `held_write_block_clobbers_gpu_bytes` | **o comportamento atual (negativo):** a GPU escreve 16 palavras (um bloco de 64 bytes) que só ela conhece (a CPU nunca as leu, então em Switch 2 não há download: o guest tem as palavras velhas); a CPU escreve **uma** palavra no mesmo bloco (segurada); o aviso, em bloco, é aplicado. As outras 15 palavras da GPU voltam no host ao valor antigo do guest, e `gpu_modified_` do bloco é limpo, então nada as devolve | todas as rodadas de todos os escalonamentos, nos dois modos de host (`WordMismatch`): não depende de intercalação, é determinístico no modelo |
+| `held_write_block_exact_notices` | o mesmo roteiro com avisos exatos (`notice_block_words = 0`) | **positivo:** passa em todos os escalonamentos e nos dois modos de host |
+
+Alcance (o que isso mostra e o que não): no modelo, a perda de dados é reproduzida e o aviso exato a evita. O
+modelo **não** diz que o emulador a sofre, nem com que frequência: no emulador são caminhos plausíveis
+identificados por leitura, sem ocorrência medida. O positivo (avisos exatos) mostra só que a proteção modelada
+funciona, e **não decide** qual mecanismo integrar (por exemplo, guardar o intervalo exato no `Collect` ou
+subtrair as faixas da GPU do trecho que a aplicação sobe).
+
 ## Resultado do último `run.sh`
 
 Preenchido ao fim da rodada que acompanha cada commit; o texto abaixo vale para o commit que o contém.
@@ -223,8 +248,10 @@ cópia, não da política de callbacks.
   quando a página não tem dados da GPU; a escrita em página com dados da GPU é segurada e tem os três passos
   separados nos casos `held_write_*` (acima). Esses casos usam o aviso exato em palavras; o emulador junta os
   avisos em granularidade de **64 bytes** (`core/gpu_dirty_memory_manager.h:90-96,113-121`), e o upload da
-  aplicação copia o trecho arredondado (`buffer_cache.h:141-157`): bytes vizinhos da GPU dentro do mesmo trecho
-  de 64 bytes não são modelados (hipótese em `gpu-contract-inventory.md`, 7.2).
+  aplicação copia o trecho arredondado (`buffer_cache.h:141-157`): os casos `held_write_block_*` (acima)
+  modelam isso com `notice_block_words`, **sem** download pendente. O cruzamento dos dois (um bloco de 64 bytes
+  sobre bytes de um download pendente) não é modelado, e a junção de avisos por página (`gpu.cpp:138-161`)
+  também não.
 - **O pop não tira as faixas de `gpu_modified_ranges`** (`buffer_cache.h:723-725`) nem usa o conjunto
   contado de `async_downloads`; a aplicação dos avisos sempre faz o upload exato dos bytes, sem o caminho
   `WriteMemory` (que marcaria a página para o upload seguinte; os bytes lidos são os mesmos).
@@ -237,4 +264,4 @@ cópia, não da política de callbacks.
 - **Configurações do emulador:** split ligado/desligado, DMA Safe, "Sync Memory Operations" e canais sem ABI
   nativa (que não têm snapshot) não entram.
 
-**Último run.sh:** `run.sh` completo (2000 aleatórias + 200 forçadas por escalonamento no `-O2`; 200 + 20 no TSan e no ASan/UBSan), nos dois modos de host e com 26 casos × 3 regras: `ALL EXPECTATIONS MET` nos três builds, sem aviso de sanitizer, **LeakSanitizer ativo e sem vazamentos**, saída 0 ("all three builds met every expectation without sanitizer reports").
+**Último run.sh:** `run.sh` completo (2000 aleatórias + 200 forçadas por escalonamento no `-O2`; 200 + 20 no TSan e no ASan/UBSan), nos dois modos de host e com 28 casos × 3 regras (incluindo `held_write_block_clobbers_gpu_bytes` e `held_write_block_exact_notices`): `ALL EXPECTATIONS MET` nos três builds, sem aviso de sanitizer, LeakSanitizer ativo e sem vazamentos, saída 0 ("all three builds met every expectation without sanitizer reports").

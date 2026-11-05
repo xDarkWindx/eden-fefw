@@ -755,10 +755,22 @@ private:
                 }
                 return true;
             }
-            // Critical section 2: GPUDirtyMemoryManager::Collect (core/memory.cpp:765).
+            // Critical section 2: GPUDirtyMemoryManager::Collect (core/memory.cpp:765). The
+            // notice is the written words, or the 64-byte blocks that contain them
+            // (notice_block_words): the bytes written to guest memory below stay the exact ones.
+            std::vector<std::uint32_t> notice = phys;
+            if (knobs_.notice_block_words != 0) {
+                const std::uint32_t block = knobs_.notice_block_words;
+                const std::uint32_t begin = phys.front() / block * block;
+                const std::uint32_t end = (phys.back() / block + 1) * block;
+                notice.clear();
+                for (std::uint32_t w = begin; w < end; ++w) {
+                    notice.push_back(w);
+                }
+            }
             {
                 std::lock_guard lock{held_mutex_};
-                held_notices_.push_back(phys);
+                held_notices_.push_back(std::move(notice));
             }
             // Critical section 3: the memcpy into guest memory, outside every cache lock.
             {
