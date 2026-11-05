@@ -6959,6 +6959,69 @@ TEST_CASE("Native unsigned integer-to-float conversion honors nearest and upward
 }
 
 
+TEST_CASE("Native uniform wide multiply-add keeps the 64-bit sum with an aliased addend", "[native-shader]") {
+    // UIMAD.WIDE.U32 UR10 = UR12 * UR14 + UR10:UR11 (Donkey Kong Bananza compute). UR10..UR15
+    // live in R226..R231.
+    const std::array<Native, 2> input{{{{0x0c0a72a5, 0x0000000e, 0x0f8e000a, 0x000fe200}},
+                                       VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    const std::array<u32, 6> values{{0, 1, 0xffffU, 0x10000U, 0x80000000U, 0xffffffffU}};
+    for (u32 a : values) for (u32 b : values) for (u32 low : values) for (u32 high : {0U, 7U, 0xffffffffU}) {
+        ScalarNativeMachine machine;
+        machine.regs[228] = a;
+        machine.regs[230] = b;
+        machine.regs[226] = low;
+        machine.regs[227] = high;
+        machine.Execute(block);
+        const u64 expected = u64{a} * b + ((u64{high} << 32) | low);
+        REQUIRE(machine.regs[226] == static_cast<u32>(expected));
+        REQUIRE(machine.regs[227] == static_cast<u32>(expected >> 32));
+        REQUIRE(machine.regs[228] == a);
+        REQUIRE(machine.regs[230] == b);
+    }
+}
+
+TEST_CASE("Native floating min/max reads a uniform register source", "[native-shader]") {
+    // FMNMX.FTZ R34 = min(R34, UR6) (Donkey Kong Bananza graphics). UR6 lives in R222.
+    const std::array<Native, 2> input{{{{0x22227c09, 0x00000006, 0x0b810000, 0x000fe200}},
+                                       VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    for (const float x : {-3.0f, 0.5f, 2.0f}) for (const float y : {-1.0f, 1.0f, 4.0f}) {
+        ScalarNativeMachine machine;
+        machine.regs[34] = std::bit_cast<u32>(x);
+        machine.regs[222] = std::bit_cast<u32>(y);
+        machine.Execute(block);
+        REQUIRE(std::bit_cast<float>(machine.regs[34]) == std::fmin(x, y));
+        REQUIRE(std::bit_cast<float>(machine.regs[222]) == y);
+    }
+}
+
+TEST_CASE("Native Array2D explicit-LOD sample keeps layer XY LOD and a source-aliased destination", "[native-shader]") {
+    // TEX.LL ARRAY_2D R4 = tex(R6 = {layer, x}, R4 = {y, lod}), red only (Donkey Kong Bananza).
+    const std::array<Native, 2> input{{{{0x06047b60, 0xb0800804, 0x059e01ff, 0x100f4200}},
+                                       VertexTransform.back()}};
+    Shader::ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    TranslateScalarNative(input, block);
+    u32 samples{};
+    std::vector<std::pair<u32, u32>> copies;
+    for (const auto& inst : block.Instructions()) {
+        if (inst.GetOpcode() == IR::Opcode::BoundImageSampleExplicitLod) {
+            REQUIRE(inst.Flags<IR::TextureInstInfo>().type.Value() == Shader::TextureType::ColorArray2D);
+            ++samples;
+        }
+        if (inst.GetOpcode() == IR::Opcode::SetRegister && inst.Arg(1).Inst()->GetOpcode() == IR::Opcode::GetRegister)
+            copies.emplace_back(static_cast<u32>(inst.Arg(0).Reg()), static_cast<u32>(inst.Arg(1).Inst()->Arg(0).Reg()));
+    }
+    REQUIRE(samples == 1);
+    // The sources are copied out before the sample, and only the red result is written back.
+    REQUIRE(copies == std::vector<std::pair<u32, u32>>{{250, 6}, {251, 7}, {252, 4}, {253, 5}, {4, 250}});
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);
