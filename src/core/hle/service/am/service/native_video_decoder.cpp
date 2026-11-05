@@ -178,7 +178,9 @@ private:
         std::chrono::steady_clock::duration decode_time{};
     };
 
-    static constexpr size_t MaximumPendingInputs = 3;
+    // Eight, as in Eglantine and Lichii: a full queue rejects submissions (0x1c266f) and holds back
+    // the submission event, which stalled Donkey Kong Bananza's movie restart.
+    static constexpr size_t MaximumPendingInputs = 8;
     // AV1 frames the decode worker may hold decoded ahead of the images the game hands back.
     static constexpr size_t MaximumDecodedAhead = 2;
 
