@@ -495,6 +495,36 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             [&](u32 bank, u32 offset) { return ReadCbufValue(bank, offset); });
         native_indirect_tables.clear();
         static std::atomic<u32> logged{};
+        // With dump_guest_shaders, keep programs with indirect branches too: they are lowered
+        // and translated differently from the rest, and their table comes from a constant buffer
+        // the dump alone would not have. The tables go to a text file next to the code.
+        if (Settings::values.dump_guest_shaders && !tables.tables.empty()) {
+            static std::mutex dumped_mutex;
+            static std::set<GPUVAddr> dumped;
+            const bool first = [&] {
+                std::scoped_lock lock{dumped_mutex};
+                return dumped.insert(program_base).second;
+            }();
+            const auto dump_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)};
+            if (first && Common::FS::CreateDir(dump_dir)) {
+                const auto stem = fmt::format("{:016x}_native_{:x}_brx_stage{}",
+                                              Settings::GetCurrentProgramID(), program_base, stage_index);
+                std::ofstream code_file(dump_dir / (stem + ".bin"), std::ios::binary | std::ios::trunc);
+                code_file.write(reinterpret_cast<const char*>(native.data()),
+                                static_cast<std::streamsize>(native.size() * sizeof(Instruction)));
+                std::ofstream table_file(dump_dir / (stem + ".txt"), std::ios::trunc);
+                table_file << fmt::format("base {:#x} extended {} header {:#x}\n", tables.base,
+                                          tables.extended, native_header_size);
+                for (const auto& table : tables.tables) {
+                    table_file << fmt::format("branch {} words", table.branch);
+                    for (const u32 value : table.values) table_file << fmt::format(" {:#x}", value);
+                    table_file << " targets";
+                    for (const auto target : table.targets) table_file << fmt::format(" {}", target);
+                    table_file << "\n";
+                }
+                LOG_INFO(Shader, "Dumped native shader with indirect branches to {}.bin", stem);
+            }
+        }
         for (const auto& table : tables.tables) {
             native_indirect_tables.emplace_back(table.branch, table.targets);
             if (logged.fetch_add(1) < 400) {
