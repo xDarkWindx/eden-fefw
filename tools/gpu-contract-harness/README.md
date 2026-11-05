@@ -62,6 +62,26 @@ diagnósticos de suspensão e as escritas perdidas).
   conferências são `CheckGuest` (memória do jogo) e `CheckHost` (buffer do host, depois de esvaziar trás e GPU).
   O dono das faixas, o conjunto de downloads e as leituras da CPU ficam sob um mutex (o do buffer cache); a
   ordem de travas é memória do jogo, depois esse; o buffer do host tem mutex próprio.
+- **Escritas seguradas em três etapas** (`CpuWriteHeld`, `ApplyHeld`; `docs/gpu-contract-inventory.md`, 7.1).
+  Uma escrita da CPU numa página com dados da GPU não passa por `WriteMemory`: ela é segurada
+  (`buffer_cache.h:169-174`). O modelo separa o que o emulador separa, cada passo numa seção crítica
+  própria:
+
+  | Passo | Quem | Seção crítica | Código real |
+  | --- | --- | --- | --- |
+  | (i-a) decidir se a página tem dados da GPU | frente | `dl_mutex_` (o mutex do buffer cache), só para decidir | `OnCPUWrite`, `vk_rasterizer.cpp:994-1003`, `buffer_cache.h:160-180` |
+  | (i-b) registrar o aviso segurado | frente | `held_mutex_`, sozinho | `GPUDirtyMemoryManager::Collect`, `core/memory.cpp:765`, `core/gpu_dirty_memory_manager.h:26-48` |
+  | (i-c) gravar os bytes na memória do jogo | frente | `guest_mutex_`, sozinho | o `memcpy` depois de `GetPointerImpl`, `core/memory.cpp:649-653` |
+  | (ii) a thread de fences publica o download (o "pop") | GPU (faz o papel da thread de fences) | `guest_mutex_` + `dl_mutex_` | `PopAsyncBuffers`, `buffer_cache.h:703-730`, chamado de `fence_manager.h:241-263,286-293` |
+  | (iii) aplicar o aviso: ler a memória do jogo e subir para o host | trás (item `HeldApply` do ring; também no fim de todo `Fence`, `fence_manager.h:139`) | `guest_mutex_` + `dl_mutex_` + `held_mutex_`, e o upload é empurrado **sem trava** | `InvalidateGPUCache` → `OnCachedWrites` → `CachedWriteMemory`, `gpu.cpp:123-163`, `vk_rasterizer.cpp:958-992`, `buffer_cache.h:141-157,2105-2128` |
+
+  **Nenhuma trava cobre (i)–(iii):** as travas são tomadas e soltas dentro de cada passo; a ordem é
+  `guest_mutex_`, depois `dl_mutex_`, depois `held_mutex_` (o buffer do host é folha), e a frente toma
+  `held_mutex_` e `guest_mutex_` **sozinhos**, nunca aninhados. A prova de que a janela existe é o próprio
+  caso negativo: ele falha em `gpu-lags` e `both-lag` em todas as rodadas (o pop acontece entre (i) e (iii)).
+  O roteiro fixa a ordem (i) → (ii) → (iii) com `WaitDownloads` (que libera a GPU e espera o pop) e
+  `ApplyHeld`; o escalonamento decide se o pop já tinha acontecido antes de (i): em `eager` sim, e o caso
+  passa.
 - **Validade:** `valid_until` guarda a época do mapeamento e a soma das épocas de **todas** as páginas de
   `covered`, inclusive as que o filtro descartou (sobem com produtor gravado e escrita da CPU). "A GPU não
   escreveu nada aqui" também é informação e envelhece do mesmo jeito. A validade é lida antes do filtro, e
@@ -129,6 +149,7 @@ Um caso "pass" não pode falhar em nenhum escalonamento. Um negativo declara o *
 | `syncpoint_before_gpu` | canal 1 produz e incrementa; canal 0 espera o syncpoint e busca. Em `host-early` guest e host alcançam o valor com a GPU atrasada (o resultado exige que isso tenha acontecido em todas as rodadas `gpu-lags` e `both-lag`) | o syncpoint prova ordem, não conclusão: a entrada vê o produtor porque espera a fence **da própria cópia**, ordenada depois do produtor no fluxo |
 | `other_channel_missing_dependency` | produtor no canal 1, consumidor no canal 0, **nenhuma** dependência entre eles | esperar a cópia não substitui a dependência: a cópia é ordenada na posição do fetch, e o produtor não está antes dela no fluxo. Falha em todo escalonamento, com as duas regras e nos dois modos (`WordMismatch`). É o caso que o protocolo não pode corrigir sozinho: a dependência tem de existir e o protocolo precisa identificar qual trabalho a satisfaz |
 | `pending_download_vs_cpu_write` | P1 escreve 16 palavras que a CPU lê; fence F1 (download D1); a CPU escreve 4 palavras no meio (D1 as perde); P2 escreve as 8 últimas; fence F2 (D2); D1 e D2 concluem; WFI; busca | (Lichii 3165a2b e 15126fb) a escrita nova sobrevive na memória do jogo, o download antigo não a sobrescreve nem consome o novo, e o upload seguinte para o host leva os bytes novos (`CheckGuest`, entrada vista pela busca e `CheckHost`). Ordens adversas: `eager` conclui o download **antes** da escrita; `gpu-lags` e `both-lag` conclui **depois**; o aleatório inclui o meio (entre a cópia para o staging e a aplicação) |
+| `held_write_vs_pending_download_protected` | o roteiro do negativo abaixo (`held_write_vs_pending_download`), com o pop pulando as palavras cobertas por avisos segurados ainda não aplicados | **positivo:** passa em todos os escalonamentos, com as duas regras e nos dois modos de host. Nenhum mecanismo do emulador faz isso hoje: o `OnCPURead` aplica as escritas seguradas antes de um download **síncrono** (`gpu.cpp:263-268`), o que não protege o pop assíncrono da thread de fences. A direção alternativa (aplicar os avisos antes do pop) também fecha a janela e fica como pendência do T4 |
 
 Os dois `stale_*` reproduzem um bug da primeira versão do harness, em que a validade cobria só as faixas
 copiadas: com `exact-drain` eles falhavam (20/20 no `eager`, 28–37% no aleatório), porque a regra não manda
@@ -145,9 +166,29 @@ Negativos dos mecanismos (cada um desliga uma peça e tem de falhar com as duas 
 | `syncpoint_trusted_as_ready` | esperar a fence da própria cópia (o consumidor lê o buffer do host logo depois do acquire) | **`host-early`:** aleatório, `gpu-lags` e `both-lag` — `WordMismatch`. **`host-deferred`:** passa (o syncpoint também prova conclusão), por isso a expectativa muda com o modo |
 | `pending_download_no_cancel` | cancelar os downloads pendentes antes de a CPU escrever | `gpu-lags`, `both-lag`, aleatório (e parte de `back-lags`) — `WordMismatch`: o download antigo cai por cima da escrita nova. Não em `eager`, onde conclui antes da escrita |
 | `pending_download_single_set` | um conjunto único de faixas pendentes para downloads diferentes da mesma faixa (antes do 15126fb) | `gpu-lags`, `both-lag`, aleatório e parte de `back-lags` — `WordMismatch`: o download antigo consome a entrada do novo, que fica sem aplicar e a memória do jogo termina com os bytes velhos |
+| `held_write_vs_pending_download` | **o comportamento atual**: download D1 pendente; (i) a CPU escreve 4 palavras (bytes na memória do jogo, aviso segurado); (ii) o pop de D1; (iii) o aviso é aplicado e o upload lê a memória do jogo | `gpu-lags` e `both-lag` em todas as rodadas, mais parte do aleatório e do `back-lags` — `WordMismatch` (a escrita nova se perde na memória do jogo e no host). Não em `eager`, onde o pop vem antes da escrita |
 
 `NeverWait` é um controle do harness, não o comportamento atual do emulador: mostra quais casos dependem
 de alguma espera da regra.
+
+## Resultado do último `run.sh`
+
+Preenchido ao fim da rodada que acompanha cada commit; o texto abaixo vale para o commit que o contém.
+
+- Três builds: `-O2` (2000 rodadas aleatórias e 200 forçadas por escalonamento, para cada caso, regra e modo
+  de host), `-fsanitize=thread` (200 e 20) e `-fsanitize=address,undefined` (200 e 20, com
+  `-fno-sanitize-recover=all`, `detect_leaks=1` e `halt_on_error=1`).
+- O **LeakSanitizer rodou**: com as mesmas opções ele reporta um vazamento num programa de teste que perde
+  64 bytes de propósito (saída 1, `LeakSanitizer: detected memory leaks`), então o silêncio na rodada do
+  harness quer dizer "sem vazamentos".
+- Estado: ver o fim deste arquivo (linha "Último run.sh").
+
+**Precisão sobre `syncpoint_trusted_as_ready` (revisão):** em `host-deferred` o consumidor que lê o buffer do
+host logo depois do acquire **passa**, e passa porque a política de fence adiada dá uma garantia mais forte
+(o valor do host só sobe quando a GPU conclui). O erro do consumidor não é falhar nesse modo: é **depender
+dessa garantia sem declará-la**. Em `host-early` (Fast com fences `Default`) a mesma leitura falha. Por isso o
+caso tem expectativas diferentes por modo, e a regra do protocolo é que a conclusão vem da fence da própria
+cópia, não da política de callbacks.
 
 ## O que o modelo não cobre
 
@@ -178,11 +219,15 @@ de alguma espera da regra.
 - **Downloads simplificados:** um fence enfileira um download por vez de todas as palavras GPU-escritas e
   lidas pela CPU, e a aplicação é uma etapa só na thread da "GPU"; não há `async_downloads`, junção de
   buffers, preflush, `cpu_read_ranges` por página, nem a fila de fences com a thread própria
-  (`fence_manager.h:241-272`). O cancelamento acontece **na hora da escrita da CPU**; no emulador, uma escrita
-  em página com dados da GPU é **segurada** e só avisa os caches quando é aplicada (`OnCPUWrite`,
-  `buffer_cache.h:169-174`; `InlineMemoryImplementation`, `:2107-2108`), então a janela entre a escrita no
-  guest e o cancelamento do download pendente **não** é coberta. Hipótese: um download aplicado nessa janela
-  pode cair sobre os bytes novos (não verificado no emulador).
+  (`fence_manager.h:241-272`). A escrita comum cancela o pendente **na hora**, que é o que o emulador faz
+  quando a página não tem dados da GPU; a escrita em página com dados da GPU é segurada e tem os três passos
+  separados nos casos `held_write_*` (acima). Esses casos usam o aviso exato em palavras; o emulador junta os
+  avisos em granularidade de **64 bytes** (`core/gpu_dirty_memory_manager.h:90-96,113-121`), e o upload da
+  aplicação copia o trecho arredondado (`buffer_cache.h:141-157`): bytes vizinhos da GPU dentro do mesmo trecho
+  de 64 bytes não são modelados (hipótese em `gpu-contract-inventory.md`, 7.2).
+- **O pop não tira as faixas de `gpu_modified_ranges`** (`buffer_cache.h:723-725`) nem usa o conjunto
+  contado de `async_downloads`; a aplicação dos avisos sempre faz o upload exato dos bytes, sem o caminho
+  `WriteMemory` (que marcaria a página para o upload seguinte; os bytes lidos são os mesmos).
 - **Os modos de fence são dois, não a política inteira.** `host-early` e `host-deferred` cobrem só quando o
   valor do host sobe; `Balanced`/`Accurate` também mudam `runtime.Finish()` em DMA e a sincronização em
   `FindBuffer`, que o modelo não tem.
@@ -191,3 +236,5 @@ de alguma espera da regra.
   nenhum caso a satisfaz depois.
 - **Configurações do emulador:** split ligado/desligado, DMA Safe, "Sync Memory Operations" e canais sem ABI
   nativa (que não têm snapshot) não entram.
+
+**Último run.sh:** `run.sh` completo (2000 aleatórias + 200 forçadas por escalonamento no `-O2`; 200 + 20 no TSan e no ASan/UBSan), nos dois modos de host e com 26 casos × 3 regras: `ALL EXPECTATIONS MET` nos três builds, sem aviso de sanitizer, **LeakSanitizer ativo e sem vazamentos**, saída 0 ("all three builds met every expectation without sanitizer reports").

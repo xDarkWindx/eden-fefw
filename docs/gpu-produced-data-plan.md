@@ -409,3 +409,31 @@ dele.
 | 9 | (revisão do T1) O valor host do syncpoint não sobe na conclusão da GPU em Fast com fences `Default`: o item 2 da 4.2 dizia que sobe na conclusão (`fence_manager.h:142-146`) e confundia valor observado, processamento pela trás e conclusão | Sim, `fence_manager.h:123-130` (callback na sinalização) e `:113` (adiado só em High, `Balanced` ou `Accurate`). Nos modos adiados o callback espera a fence (`:123-125`) | 4.2, itens 2 e 3: as três coisas separadas; um acquire pelo host prova ordem, não conclusão; a transferência tem conclusão própria (a fence da cópia); produtor de outro canal exige dependência identificada; política de fence medida à parte. Harness: dois modos de incremento do host (`host-early`, `host-deferred`), todos os casos nos dois |
 | 10 | O harness não tinha o produtor de outro canal sem dependência nem o syncpoint que chega antes da GPU | Sim. `syncpoint_before_gpu` (passa nos dois modos: a entrada espera a fence da própria cópia), `syncpoint_trusted_as_ready` (negativo: falha com `WordMismatch` em `host-early`, passa em `host-deferred`) e `other_channel_missing_dependency` (falha com `WordMismatch` com as duas regras: esperar a cópia não substitui a dependência) | Requisito do consumidor: não ler bytes por causa de um syncpoint; conclusão pela fence da cópia |
 | 11 | O harness não tinha downloads da GPU para a memória do jogo (Lichii 3165a2b e 15126fb) | Sim. `pending_download_vs_cpu_write` passa (escrita nova sobrevive; o upload seguinte leva os bytes novos) em ordens em que o download conclui antes e depois da escrita. Negativos: sem cancelar os pendentes antes da escrita da CPU (`pending_download_no_cancel`, `WordMismatch`); com um conjunto único de faixas pendentes (`pending_download_single_set`, `WordMismatch`) | Requisitos do mecanismo de downloads: cancelar o pendente na escrita da CPU (`ClearDownload`, `buffer_cache.h:209-216`) e um conjunto por download. Fora do modelo: a janela da escrita **segurada** (README do harness) |
+| 12 | Janela das escritas seguradas: a CPU escreve numa página com dados da GPU, o aviso fica segurado e o pop assíncrono de um download pendente cai por cima dos bytes novos antes da aplicação | A ausência de proteção é verificada no código (`docs/gpu-contract-inventory.md`, 7.1, itens a a e); a probabilidade não foi medida. O harness reproduz a sequência: `held_write_vs_pending_download` falha com `WordMismatch` em `gpu-lags` e `both-lag` (todas as rodadas), e o positivo `held_write_vs_pending_download_protected` (o pop pula os bytes cobertos por avisos segurados) passa em todos os escalonamentos e nos dois modos de host | Nenhuma mudança de código. Pendência do T4 (seção 12 abaixo) |
+| 13 | (revisão do T1) Precisão: em `host-deferred` o consumidor que confia no syncpoint passa porque a política dá uma garantia mais forte; o erro é depender dela sem declará-la | Sim. `syncpoint_trusted_as_ready` passa em `host-deferred` e falha com `WordMismatch` em `host-early` (aleatório, `gpu-lags` e `both-lag`); o texto do README foi corrigido | A regra da 4.2, item 3, fica como está: a conclusão vem da fence da própria cópia, nunca da política de callbacks |
+
+Resultado do último `run.sh` (três builds), na data deste commit: ver `tools/gpu-contract-harness/README.md`,
+"Resultado do último `run.sh`": `-O2` com 2000 rodadas aleatórias e 200 forçadas por escalonamento (por caso,
+regra e modo de host), TSan e ASan/UBSan com 200 e 20; o LeakSanitizer rodou (confirmado num programa que
+vaza de propósito, com as mesmas opções).
+
+## 12. Pendência do T4: escritas seguradas contra downloads pendentes
+
+Só descrição; **nenhuma correção foi proposta no emulador nem será feita antes do T4**. O problema e o grau de
+certeza estão em `docs/gpu-contract-inventory.md`, 7.1. Duas direções, cada uma com a declaração da seção 2.2
+do plano de arquitetura:
+
+| Declaração | (1) o pop respeita os avisos segurados | (2) as escritas seguradas são aplicadas antes do pop |
+| --- | --- | --- |
+| Condição nova | O pop (`PopAsyncBuffers`, `buffer_cache.h:703-730`) não grava na memória do jogo os bytes cobertos por um aviso segurado ainda não aplicado | A thread de fences aplica os avisos segurados (o equivalente de `InvalidateGPUCache`) antes de cada pop |
+| Esperas novas | Nenhuma esperando outra thread; o pop consulta os avisos (hoje em `GPUDirtyMemoryManager`, atômicos e um `guard`, `core/gpu_dirty_memory_manager.h:26-48`) sem consumi-los, o que o `Gather` atual não permite (ele troca os buffers, `:56-65`) | O pop passa a esperar a aplicação, que toma `buffer_cache.mutex` e consome os avisos de todos os núcleos; a thread de fences ganha uma chamada de `GatherGPUDirtyMemory` (o `static thread_local` de `gpu.cpp:129` já a suporta por thread) |
+| Recursos retidos | A faixa fica em `async_downloads` e `gpu_modified_ranges` até o aviso ser aplicado (hoje o pop a tira, `:723-725`): um conjunto de faixas "órfãs" por aviso pendente | Nenhum novo; os avisos já existem |
+| Custo sem uso | Uma consulta por faixa de download, sem avisos pendentes; hipótese: desprezível, **a medir** no FE (orçamento da seção 12.1 do plano de arquitetura) | Um `Gather` por fence na thread de fences, mesmo sem escrita segurada: hipótese de custo pequeno, mas toca todos os núcleos; **a medir** |
+| Caminhos afetados | `PopAsyncBuffers`; leitura dos avisos pelo dirty manager; o texture cache e as queries também têm pop, e não foram analisados | A thread de fences (`ReleaseThreadFunc`) e a ordem entre `InvalidateGPUCache` e `PopAsyncFlushes`; o `OnCPURead` já faz isso no caminho síncrono (`gpu.cpp:263-268`) |
+| Teste | `held_write_vs_pending_download_protected` (já existe) | Roteiro com `ApplyHeld` **antes** de `WaitDownloads` no harness (a acrescentar) |
+
+Antes de escolher: medir a janela no emulador (contar, no build de diagnóstico do T3, pops que gravam sobre um
+aviso segurado ainda não aplicado) e verificar a hipótese da granularidade de 64 bytes (`docs/gpu-contract-inventory.md`,
+7.2). Mudanças de política de fence continuam sendo medidas à
+parte no FE.
+

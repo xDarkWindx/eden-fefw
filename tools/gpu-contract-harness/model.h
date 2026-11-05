@@ -66,6 +66,7 @@ struct ModelKnobs {
     bool trust_syncpoint_as_ready = false;  // consumer reads the host buffer after the acquire
     bool cancel_pending_downloads = true;   // a CPU write cancels pending downloads over it
     bool single_pending_set = false;        // one pending set for all downloads (pre 15126fb)
+    bool pop_skips_held = false;            // the download pop skips words covered by held notices
 };
 
 enum class OpKind {
@@ -87,6 +88,9 @@ enum class OpKind {
     WaitDownloads, // front waits until every queued download is applied to guest memory
     CheckGuest,    // guest memory [pa, pa + expected.size()) must equal `expected`
     CheckHost,     // host buffer [pa, ...) must equal `expected` once everything is drained
+    CpuWriteHeld,  // (i) CPU write to a GPU-modified page: bytes into guest memory now, the
+                   //     notice to the caches held until ApplyHeld (HandleRasterizerWrite)
+    ApplyHeld,     // (iii) InvalidateGPUCache: apply the held notices (CachedWriteMemory)
 };
 
 struct Op {

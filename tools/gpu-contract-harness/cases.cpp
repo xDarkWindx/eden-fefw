@@ -126,6 +126,12 @@ Op CpuRead(std::uint32_t pa, std::uint32_t len) {
     op.len = len;
     return op;
 }
+Op CpuWriteHeld(std::uint32_t pa, std::vector<Word> values) {
+    Op op{OpKind::CpuWriteHeld};
+    op.pa = pa;
+    op.values = std::move(values);
+    return op;
+}
 Op CheckGuest(std::uint32_t pa, const Expected& e) {
     Op op{OpKind::CheckGuest};
     op.pa = pa;
@@ -386,6 +392,39 @@ std::vector<Case> BuildCases() {
         c.title = "um conjunto unico de faixas pendentes para downloads da mesma faixa (negativo)";
         c.knobs.cancel_pending_downloads = true;
         c.knobs.single_pending_set = true;
+        cases.push_back(c);
+    }
+    { // The window of the held writes, in the three steps the emulator has (README, "Escritas
+      // seguradas em três etapas"). A download of GPU data (P1) is pending in an async buffer
+      // when the CPU writes over part of it. The write goes into guest memory at once and its
+      // notice to the caches is held (HandleRasterizerWrite, core/memory.cpp:703-767); the
+      // fence thread pops the old download in a critical section of its own, over the new bytes
+      // (PopAsyncBuffers, buffer_cache.h:703-730; nothing removed the range from
+      // async_downloads, because a held write calls neither WriteMemory nor ClearDownload,
+      // :169-174); the notice is applied later (InvalidateGPUCache) and CachedWriteMemory reads
+      // the guest bytes, now the old ones, and uploads them to the host.
+        const std::uint32_t b = Page(3);
+        const std::vector<Word> w{0x61, 0x62, 0x63, 0x64};
+        Case c{"held_write_vs_pending_download",
+               "escrita segurada contra download pendente (comportamento atual)"};
+        c.channels = {{Produce(1, b, 16), CpuRead(b, 16), Simple(OpKind::Fence),
+                       Simple(OpKind::WaitBack),          // download D1 queued
+                       CpuWriteHeld(b + 4, w),            // (i)   guest written, notice held
+                       Simple(OpKind::WaitDownloads),     // (ii)  pop of the old download D1
+                       Simple(OpKind::ApplyHeld),         // (iii) InvalidateGPUCache
+                       Simple(OpKind::WaitBack),
+                       CheckGuest(b + 4, Expected(b + 4, 4).Put(0, w)),
+                       CheckHost(b + 4, w)}};
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
+        cases.push_back(c);
+        // The same script with the pop skipping the words that an unapplied held notice
+        // covers. No mechanism of the emulator does this today: OnCPURead applies the held
+        // writes before a synchronous download (gpu.cpp:263-268), which does not help the
+        // asynchronous pop on the fence thread.
+        c.name = "held_write_vs_pending_download_protected";
+        c.title = "o mesmo roteiro, com o pop pulando os bytes de avisos segurados (positivo)";
+        c.knobs.pop_skips_held = true;
+        c.after_satisfied = c.exact_drain = Expect::MustPass();
         cases.push_back(c);
     }
     return cases;

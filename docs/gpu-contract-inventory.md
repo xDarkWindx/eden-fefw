@@ -50,6 +50,11 @@ argumentos indiretos); só comando exige modo exato. **Dado** pode aceitar uma c
    composite em voo e libera quadros do decodificador pelo valor **guest** do syncpoint, com espera de 100 ms
    e escrita mesmo assim (seção 6). Dados que não são comandos não têm proteção equivalente (hipótese).
 
+7. **Possível bug latente (seção 7.1):** uma escrita da CPU **segurada** pode ser desfeita pelo pop assíncrono
+   de um download pendente antes de o aviso ser aplicado, e o upload então lê os bytes velhos. A sequência é
+   possível pelo código lido (nenhuma trava a impede); nunca foi observada nem reproduzida. Grau: **possível
+   bug latente, lido e não executado**. Uma segunda hipótese, de granularidade de 64 bytes, está na 7.2.
+
 ## 2. Consumidores de dados que a GPU produz
 
 "Contrato" é o que deveria atender o consumidor segundo a seção 2.2 do plano de arquitetura. "Tipo" segue o
@@ -339,6 +344,57 @@ Perguntas abertas:
    Se sim, `Query` precisa marcar o filtro e escrever na ordem do fluxo.
 2. Imagens com alias de buffer (P6) produzem comandos em algum jogo? O Bananza usa buffers (hipótese).
 3. A espera real do acquire de syncpoint (T4) deve usar o valor host ou o guest em Fast? (F1)
+
+### 7.1 Possível bug latente: escrita segurada contra download assíncrono pendente
+
+**Sequência em questão:** a CPU escreve → o aviso aos caches fica segurado → o pop do download antigo grava a
+memória do jogo por cima → o aviso é aplicado → o upload lê os bytes antigos.
+
+**O que abri (cada item com `arquivo:linha`):**
+
+| | Afirmação | Onde está |
+| --- | --- | --- |
+| a | A escrita da CPU vai para a memória do jogo **na hora** e o aviso aos caches fica **segurado**. `GetPointerImpl` chama `HandleRasterizerWrite` e só então devolve o ponteiro (`core/memory.cpp:587-590`), e o `memcpy` vem depois (`:649-653`). `HandleRasterizerWrite` pergunta ao rasterizador (`:751-755`) e, se ele segura (`true`), só registra o aviso em `gpu_dirty_managers[core].Collect` (`:765`, `core/gpu_dirty_memory_manager.h:26-48`). `OnCPUWrite` devolve `true` para página com dados da GPU **sem chamar `WriteMemory`** (`buffer_cache.h:169-174`). O aviso só chega aos caches em `InvalidateGPUCache` (`gpu.cpp:123-163`, `Gather` em `core/gpu_dirty_memory_manager.h:56-82`, aplicação em `vk_rasterizer.cpp:958-992`), chamado no início de cada lista (`gpu_thread.cpp:100-106`; no split, adiado para a trás, `:79`), no fim de cada `SignalFence` (`fence_manager.h:139`) e no `OnCPURead` (`gpu.cpp:266`). O próprio comentário diz "by default at the next fence" (`gpu_thread.cpp:101-102`) | verificado |
+| b | No Vulkan a thread de fences publica downloads **de forma assíncrona**: `HAS_ASYNC_CHECK = true` (`vk_fence_manager.h:49`) cria `fence_thread` (`fence_manager.h:184-187`), que espera a fence do host e chama `PopAsyncFlushes` (`:241-263`), sob `buffer_cache.mutex` (`:286-293`). Sem a thread assíncrona o pop viria de `TryReleasePendingFences`, que só roda `if constexpr (!can_async_check)` (`:115-117,157-158`). O pop (`buffer_cache.h:703-730`) grava na memória do jogo, com `WriteBlockUnsafe`, **as partes da cópia que ainda estão em `async_downloads`** (`:719-722`) e depois as subtrai dali e de `gpu_modified_ranges` (`:723-725`). As faixas entram em `async_downloads` no commit da fence (`:682`, de `CommitAsyncFlushes`, `fence_manager.h:118`) | verificado |
+| c | **Nada retira a faixa de `async_downloads` antes de a escrita segurada ser aplicada.** O único código que remove faixas é `ClearDownload` (`buffer_cache.h:210-216`), chamado em `WriteMemory` (`:134`), `DMACopy` (`:231`), `DMAClear` (`:295`), `ObtainCPUBuffer(DiscardWrite)` (`:337`), `InlineMemoryImplementation` (`:2107`) e `DownloadBufferMemory` (`:2159`); `async_downloads` só é tocado em `:211,682,719,723`. O ramo "segurar" de `OnCPUWrite` (`:169-174`) não chama nenhum deles | verificado |
+| d | Quando o aviso é aplicado, `CachedWriteMemory` **lê a memória do jogo e sobe para o host**: com dados da GPU na região, `ReadBlockUnsafe` do guest (`buffer_cache.h:153-154`) e `InlineMemoryImplementation` (`:156`, `:2105-2128`: `ClearDownload`, subtração, upload dos bytes); sem dados da GPU (o pop já subtraiu a faixa, `:723-725`), `WriteMemory` (`:149`), que marca a página como modificada pela CPU, e o upload seguinte (`SynchronizeBuffer`, `:1993-2000`) copia o guest. Nos dois caminhos os bytes vêm do guest **depois do pop** | verificado |
+| e | O que já protege algo parecido: `OnCPURead` aplica as escritas seguradas **antes** de baixar (`gpu.cpp:263-268`, comentário "from PokeDinner"). Isso cobre o download **síncrono** pedido pela leitura da CPU (`FlushRegion`, `vk_rasterizer.cpp:841-860`) e não o pop assíncrono da thread de fences. Os outros chamadores de `FlushRegion` (por exemplo `SafeRead`, `memory_manager.cpp:417,426`, e `ReadNativeSemaphoreWord`, `puller.cpp:39`) não aplicam as escritas seguradas antes: hipótese, não abri todos | verificado para o `OnCPURead`; hipótese para os outros |
+
+**Conclusão: a sequência é possível neste fork**, por três seções críticas separadas, nenhuma cobrindo as
+outras: a decisão de segurar (`buffer_cache.mutex`, `vk_rasterizer.cpp:997-1003`), o `memcpy` no guest (sem
+trava) e o pop (`buffer_cache.mutex` na thread de fences) contra a aplicação (`buffer_cache.mutex` na
+thread da GPU ou da trás, `vk_rasterizer.cpp:972-981`). **Condições para ela acontecer:**
+
+1. A escrita cai numa página que o rastreio diz ter dados da GPU (`buffer_cache.h:169-174`), para ser segurada.
+2. **Os mesmos bytes** estão num download pendente: a GPU os escreveu por `MarkWrittenBuffer`, que enfileirou
+   o download (`:1735-1737`), e uma fence os commitou (`:682`) sem que o pop tenha rodado. Em canais de
+   **Switch 2** (`UsesNativeTiling`) só entra no download o que está em `cpu_read_ranges`, isto é, o que a CPU
+   já leu antes (`buffer_cache_base.h:546-562`, `NoteCpuRead`, `buffer_cache.h:733-743`); nos outros canais,
+   toda faixa escrita pela GPU entra (`buffer_cache_base.h:554-558`), então a exposição é maior fora do Switch 2.
+3. **Ordem:** o `memcpy` no guest vem **antes** do pop, e o pop vem **antes** da próxima `InvalidateGPUCache`.
+   Se o pop vier antes do `memcpy`, nada se perde; se a aplicação vier antes do pop, o
+   `ClearDownload` de `InlineMemoryImplementation` (`:2107`) tira a faixa de `async_downloads` e o pop a pula.
+4. A interseção (escrita ∩ faixa do download) decide quais bytes se perdem: só ela.
+
+**Efeito:** os bytes novos da CPU somem da memória do jogo e do buffer do host; o jogo lê o valor antigo.
+
+**Grau de certeza:** a ausência de proteção é **verificada no código** (a, b, c, d); a **probabilidade** de a
+janela abrir depende de tempo (latência da fence do host contra o intervalo até a próxima lista ou fence) e
+**não foi medida nem reproduzida**; o modelo do harness reproduz a sequência quando o roteiro a força
+(`held_write_vs_pending_download`). Registro como **possível bug latente**; nenhuma mudança de código foi feita.
+
+**Direção, como pendência do T4 (sem correção agora):** (1) o pop respeita os avisos segurados ainda não
+aplicados (o caso `held_write_vs_pending_download_protected` do harness); ou (2) as escritas seguradas são
+aplicadas antes do pop. A declaração da seção 2.2 de cada uma está em `docs/gpu-produced-data-plan.md`, seção 12.
+
+### 7.2 Segunda hipótese: avisos segurados em granularidade de 64 bytes
+
+O `Gather` entrega as faixas em blocos de 64 bytes alinhados (`core/gpu_dirty_memory_manager.h:66-79`,
+`align_bits = 6`, `:94-96`; `BuildTransform` arredonda para fora, `:113-121`), e a aplicação copia o trecho
+arredondado do guest (`buffer_cache.h:153-156`, `InlineMemoryImplementation`, que também subtrai o trecho
+inteiro de `gpu_modified_ranges`, `:2107-2108`). **Hipótese (lida, não executada):** bytes vizinhos da GPU,
+dentro do mesmo bloco de 64 bytes que a escrita da CPU e ainda não baixados, seriam cobertos pelos bytes
+antigos do guest. O harness usa avisos exatos e não cobre isso (README, "O que o modelo não cobre").
 
 ### Pendências de localização
 

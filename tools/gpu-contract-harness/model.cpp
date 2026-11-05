@@ -146,6 +146,7 @@ enum class RingKind {
     Copy,
     FetchMarker,
     NoteRead, // the guest CPU read these words (they are worth downloading)
+    HeldApply, // InvalidateGPUCache: apply the held notices
     Fence,    // a fence: queue the download of the GPU written, CPU read words
     Stop
 };
@@ -722,6 +723,63 @@ private:
         case OpKind::WaitBack:
             WaitBackPassed(tail_seq_);
             return true;
+        case OpKind::CpuWriteHeld: {
+            std::vector<std::uint32_t> phys(op.values.size());
+            for (std::size_t i = 0; i < phys.size(); ++i) {
+                phys[i] = op.pa + static_cast<std::uint32_t>(i);
+            }
+            // Critical section 1: OnCPUWrite under the buffer cache mutex decides whether the
+            // page holds GPU data. Nothing else is done there for a held write: no
+            // ClearDownload, no gpu_modified_ranges change (buffer_cache.h:169-174).
+            bool held = false;
+            {
+                std::lock_guard dl{dl_mutex_};
+                for (std::uint32_t w : phys) {
+                    const std::uint32_t page_begin = w / kPageWords * kPageWords;
+                    for (std::uint32_t a = page_begin; a < page_begin + kPageWords && !held; ++a) {
+                        held = gpu_modified_[a] != 0;
+                    }
+                }
+            }
+            if (!held) {
+                // Not held: WriteMemory at once, as CpuWrite does.
+                std::lock_guard lock{guest_mutex_};
+                std::lock_guard dl{dl_mutex_};
+                for (std::size_t i = 0; i < phys.size(); ++i) {
+                    guest_[phys[i]] = op.values[i];
+                    cpu_dirty_[phys[i]] = 1;
+                    gpu_modified_[phys[i]] = 0;
+                }
+                if (knobs_.cancel_pending_downloads) {
+                    CancelPendingDownloadsLocked(phys);
+                }
+                return true;
+            }
+            // Critical section 2: GPUDirtyMemoryManager::Collect (core/memory.cpp:765).
+            {
+                std::lock_guard lock{held_mutex_};
+                held_notices_.push_back(phys);
+            }
+            // Critical section 3: the memcpy into guest memory, outside every cache lock.
+            {
+                std::lock_guard lock{guest_mutex_};
+                for (std::size_t i = 0; i < phys.size(); ++i) {
+                    guest_[phys[i]] = op.values[i];
+                }
+            }
+            for (std::uint32_t page = op.pa / kPageWords;
+                 page <= (op.pa + static_cast<std::uint32_t>(phys.size()) - 1) / kPageWords;
+                 ++page) {
+                page_epoch_[page].fetch_add(1, std::memory_order_acq_rel);
+            }
+            return true;
+        }
+        case OpKind::ApplyHeld: {
+            RingItem item;
+            item.kind = RingKind::HeldApply;
+            Push(std::move(item));
+            return true;
+        }
         case OpKind::WaitDownloads:
             WaitBackPassed(tail_seq_);
             while (downloads_applied_.load(std::memory_order_acquire) <
@@ -766,6 +824,16 @@ private:
         }
         }
         return true;
+    }
+
+    bool CoveredByHeldNotice(std::uint32_t w) {
+        std::lock_guard lock{held_mutex_};
+        for (const auto& notice : held_notices_) {
+            if (std::find(notice.begin(), notice.end(), w) != notice.end()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // A CPU write over a word cancels the pending downloads of it: the old GPU data must not
@@ -933,6 +1001,38 @@ private:
         gpu_enqueued_.fetch_add(1, std::memory_order_acq_rel);
     }
 
+    // InvalidateGPUCache -> OnCachedWrites -> CachedWriteMemory (buffer_cache.h:141-157): for each
+    // held notice, read the words from guest memory NOW and upload them to the host buffer, after
+    // dropping the pending downloads and the GPU ranges over them (InlineMemoryImplementation,
+    // :2107-2108). One critical section of its own: not held while the write was made nor while
+    // the downloads were popped.
+    void ApplyHeldNotices(Seq seq) {
+        GpuCmd cmd;
+        cmd.kind = GpuKind::Write;
+        cmd.seq = seq;
+        {
+            std::lock_guard lock{guest_mutex_};
+            std::lock_guard dl{dl_mutex_};
+            std::lock_guard held{held_mutex_};
+            for (const auto& notice : held_notices_) {
+                for (std::uint32_t w : notice) {
+                    cmd.phys.push_back(w);
+                    cmd.values.push_back(guest_[w]);
+                    gpu_modified_[w] = 0;
+                    cpu_dirty_[w] = 0;
+                }
+                if (knobs_.cancel_pending_downloads) {
+                    CancelPendingDownloadsLocked(notice);
+                }
+            }
+            held_notices_.clear();
+        }
+        // Pushed with no lock held: the GPU thread takes the same locks to apply downloads.
+        if (!cmd.phys.empty()) {
+            PushGpu(std::move(cmd));
+        }
+    }
+
     // Records the upload of CPU-written words in `ranges`, as the buffer cache does
     // before a use. Exact words by default; whole pages with the negative knob.
     void UploadCpuWrites(Seq seq, const std::vector<PhysRange>& ranges) {
@@ -1062,6 +1162,9 @@ private:
                 PushGpu(std::move(cmd));
                 break;
             }
+            case RingKind::HeldApply:
+                ApplyHeldNotices(seq);
+                break;
             case RingKind::NoteRead: {
                 std::lock_guard dl{dl_mutex_};
                 for (const PhysRange& r : item->ranges) {
@@ -1102,6 +1205,8 @@ private:
                     cmd.download = std::move(download);
                     PushGpu(std::move(cmd));
                 }
+                // SignalFence ends with InvalidateGPUCache (fence_manager.h:139).
+                ApplyHeldNotices(seq);
                 break;
             }
             case RingKind::FetchMarker:
@@ -1186,6 +1291,8 @@ private:
                     jitter.Maybe();
                 }
                 {
+                    // The pop (PopAsyncBuffers, buffer_cache.h:703-730) is its own critical
+                    // section on the fence thread, under the buffer cache mutex.
                     std::lock_guard lock{guest_mutex_};
                     std::lock_guard dl{dl_mutex_};
                     for (std::size_t i = 0; i < d.words.size(); ++i) {
@@ -1194,6 +1301,9 @@ private:
                         const bool live = knobs_.single_pending_set
                                               ? shared_pending_.erase(d.words[i]) > 0
                                               : d.live[i] != 0;
+                        if (live && knobs_.pop_skips_held && CoveredByHeldNotice(d.words[i])) {
+                            continue; // the held write's bytes are newer than the staged copy
+                        }
                         if (live) {
                             guest_[d.words[i]] = d.staged[i];
                         }
@@ -1280,12 +1390,17 @@ private:
 
     // The owner's exact ranges and the downloads, shared by the back thread (records, queues),
     // the GPU thread (applies) and the front (CPU writes cancel): the buffer cache's mutex.
-    // Lock order: guest_mutex_, then dl_mutex_; host_mutex_ is a leaf.
+    // Lock order: guest_mutex_, then dl_mutex_, then held_mutex_; host_mutex_ is a leaf. No lock
+    // is ever held across the three steps of a held write (see CpuWriteHeld).
     std::mutex dl_mutex_;
     std::vector<std::uint8_t> gpu_modified_;
     std::vector<std::uint8_t> cpu_read_;
     std::vector<std::shared_ptr<Download>> pending_downloads_;
     std::set<std::uint32_t> shared_pending_;
+    // Held notices (GPUDirtyMemoryManager): registered by the front, applied by the back thread.
+    // A leaf-most lock: order guest_mutex_, dl_mutex_, then held_mutex_. The front takes it alone.
+    std::mutex held_mutex_;
+    std::vector<std::vector<std::uint32_t>> held_notices_;
     std::atomic<std::uint64_t> downloads_queued_{0};
     std::atomic<std::uint64_t> downloads_applied_{0};
 
