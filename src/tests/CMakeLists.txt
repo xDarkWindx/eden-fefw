@@ -30,6 +30,8 @@ add_executable(tests
     video_core/native_semaphore.cpp
     video_core/native_shader.cpp
     video_core/native_swizzle.cpp
+    video_core/nvn_storage_descriptor.cpp
+    video_core/global_address_tracking.cpp
     video_core/image_overlap.cpp
     video_core/indirect_reset.cpp
     video_core/pending_download.cpp

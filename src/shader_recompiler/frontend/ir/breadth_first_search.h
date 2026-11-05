@@ -82,10 +82,11 @@ auto BreadthFirstSearch(Value value, Pred&& pred, Resolve&& resolve = {})
 /// BreadthFirstSearch's: skipped instructions and everything reachable from them never match, and
 /// an instruction that is not reachable from them is only queued by instructions that are not
 /// either, so those are visited in the same order as without skipping.
-template <typename Pred>
+template <typename Pred, typename Resolve = std::identity>
 auto BreadthFirstSearchPruned(Value value, Pred&& pred,
-                              std::unordered_set<const Inst*>& exhausted)
+                              std::unordered_set<const Inst*>& exhausted, Resolve&& resolve = {})
     -> std::invoke_result_t<Pred, const Inst*> {
+    value = resolve(value);
     if (value.IsImmediate()) {
         return std::nullopt;
     }
@@ -105,7 +106,7 @@ auto BreadthFirstSearchPruned(Value value, Pred&& pred,
         }
         // Visit the right most arguments first
         for (size_t arg = inst->NumArgs(); arg--;) {
-            const Value arg_value{inst->Arg(arg)};
+            const Value arg_value{resolve(inst->Arg(arg))};
             if (arg_value.IsImmediate()) {
                 continue;
             }

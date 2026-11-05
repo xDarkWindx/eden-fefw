@@ -6,6 +6,7 @@
 
 add_library(shader_recompiler STATIC
     backend/bindings.h
+    backend/nvn_storage_descriptor.h
     backend/spirv/emit_spirv.cpp
     backend/spirv/emit_spirv.h
     backend/spirv/emit_spirv_atomic.cpp

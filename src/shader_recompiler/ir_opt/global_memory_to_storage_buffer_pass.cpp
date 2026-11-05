@@ -396,8 +396,16 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
     }};
     if (!native_env) {
         // The predicate depends only on the bias: each caller keeps one set per bias.
-        return exhausted ? IR::BreadthFirstSearchPruned(value, pred, *exhausted)
-                         : BreadthFirstSearch(value, pred);
+        // A pointer loaded from memory is a new address, not an offset into the buffer that
+        // supplied it. Do not follow that load back to its own constant-buffer descriptor.
+        const auto stop_at_memory = [](IR::Value operand) {
+            if (!operand.IsImmediate() && IsGlobalMemory(*operand.InstRecursive())) {
+                return IR::Value{u32{0}};
+            }
+            return operand;
+        };
+        return exhausted ? IR::BreadthFirstSearchPruned(value, pred, *exhausted, stop_at_memory)
+                         : BreadthFirstSearch(value, pred, stop_at_memory);
     }
     // A base pointer survives addition and selection, but not multiplication or a
     // predicate calculation. Searching those expressions can find strides first.
