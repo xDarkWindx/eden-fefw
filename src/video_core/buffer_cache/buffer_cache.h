@@ -20,6 +20,7 @@
 #include "video_core/buffer_cache/storage_range_groups.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/back_thread_stats.h"
+#include "video_core/list_diag.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -139,6 +140,11 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+    // EDEN_LIST_DIAG (parts pop, blk): observe this application BEFORE anything below subtracts from
+    // gpu_modified_ranges or uploads (docs/list-diag-design.md, 4 and 5). Off: the flag, a branch.
+    VideoCommon::ListDiag::NoteApplyHook(
+        device_addr, size, gpu_modified_ranges, cpu_read_ranges, !AsyncBufferDownloads(),
+        [this](u64 address, u8* out, size_t length) { device_memory.ReadBlockUnsafe(address, out, length); });
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -717,6 +723,9 @@ void BufferCache<P>::PopAsyncBuffers() {
         const u64 dst_offset = copy.dst_offset - base_offset;
         const u8* read_mapped_memory = base + dst_offset;
         async_downloads.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end, s32) {
+            // EDEN_LIST_DIAG (part pop): a pop over a registered, not yet applied notice. Observed
+            // only; the write below is the one of always.
+            VideoCommon::ListDiag::NotePopHook(start, end, &read_mapped_memory[start - device_addr]);
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
         });

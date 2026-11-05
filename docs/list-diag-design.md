@@ -1,7 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: proposta (revisão 2), aguardando aprovação. Nenhum código do emulador foi escrito.** Só os harnesses
-(`tools/gpu-contract-harness/` e `tools/list-diag-harness/`) e os planos foram alterados. Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, aguardando as medições do usuário; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -48,17 +47,17 @@ buffer ou trava nova (seção 7).
 
 | Arquivo | O quê |
 | --- | --- |
-| `video_core/list_diag.h` (novo) | `VideoCommon::ListDiag`: `Enabled(Part)`; o livro-razão de avisos registrados (`NoticeLedger<Hooks>`, seção 3.4); `NoteNotice`, `NotePop`, `NoteApply`, `ApplyBatch`; funções puras de contagem de bytes; fila de eventos de log; para `list`: `ListEntryRecord`, `ClassifyWords`, `CompareWithCoherent` e a tabela "último escritor por página". Os `RangeSet` entram como parâmetros de modelo, para os testes usarem os reais. `Hooks` é uma política de modelo (vazia em produção) por onde os testes injetam pontos de parada |
-| `video_core/list_diag.cpp` (novo) | leitura da chave, estado global, rodízio de log, resumo final |
-| `core/gpu_dirty_memory_manager.h` | **só acréscimos:** `lot_started` e `lot_done` (atômicos, ao lado de `gather_epoch`) e variantes **do diagnóstico** de `Collect` e `Gather`, no mesmo arquivo, parametrizadas por um `bool Diag` de modelo. A instanciação `Diag=false` tem exatamente as ordens de memória e o código de hoje (`:26-47`, `:56-82`); a `Diag=true` usa `seq_cst` (3.3). Seção 3.3 |
-| `core/core.h`, `core/core.cpp:644-646` | `System::GatherGPUDirtyMemoryLots(...)`, chamada só pelo diagnóstico; o `GatherGPUDirtyMemory` de hoje fica como está |
-| `core/memory.cpp:765` | **1 ponto:** `if (diag) ListDiag::CollectObserved(manager, core, address, size); else manager.Collect(address, size);` (o `core` já existe ali, `:716-720`; o arquivo já inclui `back_thread_stats.h`, `:34`) |
-| `video_core/gpu.cpp:123-163` (`InvalidateGPUCache`) | ramo do diagnóstico, que **não altera** o vetor `cached_writes` que a junção produz: coleta com `(núcleo, lote)`, monta o `ApplyBatch` (3.3), o publica numa variável `thread_local` ao redor de `OnCachedWrites` e descarrega o log depois (1 por segundo, fora de todas as travas dos caches) |
-| `video_core/buffer_cache/buffer_cache.h:719-722` | **1 ponto:** no laço do pop, antes do `WriteBlockUnsafe`: `ListDiag::NotePop(start, end, bytes)` |
-| `video_core/buffer_cache/buffer_cache.h:141` | **1 ponto:** no topo de `CachedWriteMemory` (antes do `return` de região não registrada e antes de qualquer mudança): `ListDiag::NoteApply(device_addr, size, gpu_modified_ranges, cpu_read_ranges)` |
-| `video_core/back_thread_stats.h/.cpp` | `ListDiagCounters` dentro de `Shared` e um bloco "list diag" no `Report()` (por segundo, janela de 4 s) |
-| `video_core/dma_pusher.cpp:140-165`, `buffer_cache.h:1735` (só `list`) | registro por entrada e `Defer`; tabela por página em `MarkWrittenBuffer` |
-| `src/tests/video_core/list_diag.cpp` (novo), `src/tests/CMakeLists.txt` | testes (seção 8) |
+| `video_core/list_diag/protocol.h`, `ledger.h`, `counters.h`, `hooks.h` (novos, **header-only e autocontidos**) | **Uma implementação só**, incluída pelo emulador e pelos testes, sem cópia: o livro-razão (3.4), `CollectObserved`, `GatherAll`, `MakeBatch`, `BeginApply`/`EndApply`, `NoteApply` (aposentadoria e `blk`), `NotePop`, a fila de eventos de log com limites, a violação de P0 e os relatórios. `Hooks` é uma política de modelo (`ProdHooks` no emulador: sem pontos de parada, relógio de microssegundos) por onde os testes injetam pontos de parada, um relógio e os mutantes (só com `kTest = true`: compilado para fora em produção) |
+| `video_core/list_diag.h` / `.cpp` (novos) | a chave (`EDEN_LIST_DIAG`, `g_parts`), o estado **alocado só quando uma parte liga** (`State()`), os envoltórios que os pontos de gancho chamam (`CollectNotice`, `NoteApplyHook`, `NotePopHook`, `DrainLog`, `LogSummary`), cada um com a leitura da flag e um desvio no início; `list_diag.cpp` só instala o destino do log (`LOG_INFO`) |
+| `core/gpu_dirty_memory_manager.h` | **só acréscimos:** `Core::GatherLotState` (uma linha de cache por núcleo, **fora do gerenciador**: o gerenciador mantém o layout de hoje, conferido por `static_assert` e por teste), `DirtyNoHooks`, e `CollectT<Diag, Hooks>` e `GatherT<Diag, Hooks>`. `Collect` e `Gather` viraram chamadas finas de `CollectT<false>` e `GatherT<false>`: a instanciação `Diag=false` tem as ordens de memória e o código de hoje; a `Diag=true` usa `seq_cst` em `current` e nos contadores (3.3). O estado do lote entra por parâmetro, não por membro |
+| `core/memory.cpp:765` | **1 ponto:** `ListDiag::CollectNotice(gpu_dirty_managers[core], core, address, size)`; desligado, chama o `Collect` de sempre depois da leitura da flag |
+| `video_core/gpu.cpp:123-163` (`InvalidateGPUCache`) | ramo do diagnóstico, que **não altera** o vetor `cached_writes` que a junção produz: `GatherAll` com `(núcleo, lote)` (usa `System::GetGPUDirtyMemoryManager()`, que já existia: `core.cpp` e `core.h` **não mudam**), `MakeBatch` depois da junção, `BeginApply`/`EndApply` ao redor de `OnCachedWrites` (o lote publicado numa variável `thread_local`) e o log descarregado depois (1 por segundo, fora de todas as travas dos caches); o resumo final vai em `NotifyShutdown` |
+| `video_core/buffer_cache/buffer_cache.h:141` | **1 ponto:** no topo de `CachedWriteMemory` (antes do `return` de região não registrada e antes de qualquer mudança): `ListDiag::NoteApplyHook(device_addr, size, gpu_modified_ranges, cpu_read_ranges, !AsyncBufferDownloads(), leitura do guest)` |
+| `video_core/buffer_cache/buffer_cache.h:719-722` | **1 ponto:** no laço do pop, antes do `WriteBlockUnsafe`: `ListDiag::NotePopHook(start, end, bytes)` |
+| `video_core/back_thread_stats.cpp` | o bloco "[ListDiag]" no `Report()` (totais e variação por segundo, janela de 4 s), vazio com o diagnóstico desligado. Os contadores moram no estado do diagnóstico, não em `Shared` |
+| `video_core/CMakeLists.txt`, `tests/CMakeLists.txt` | os arquivos novos |
+| `src/tests/video_core/list_diag.cpp` (novo), `list_diag_legacy_manager.h` | **um só arquivo Catch2**, compilado pelo CMake do emulador e por `tools/list-diag-harness/run.sh` (seção 8); o `list_diag_legacy_manager.h` é o `Collect`/`Gather` de antes, só para a equivalência |
+| `video_core/dma_pusher.cpp:140-165`, `buffer_cache.h:1735` (só `list`, **T3b, não feito**) | registro por entrada e `Defer`; tabela por página em `MarkWrittenBuffer` |
 
 Os pontos de `pop` e `blk` são: `memory.cpp:765`, `gpu.cpp` (ramo do diagnóstico), o laço do pop e o topo de
 `CachedWriteMemory`. Nada muda no que os caches executam.
@@ -114,13 +113,23 @@ preexistente**, registrada em `docs/gpu-contract-inventory.md` (7.3) e **separad
 a corrige nem a esconde**. Ele a vigia com `gather_active` (abaixo), conta `gather_overlapped` e `apply_out_of_order`, e
 trata como **ambíguos** os lotes até ali (`violation_floor`).
 
+**P0 violada invalida o diagnóstico da sessão, não só alguns lotes (revisão 3, C).** Na **primeira** ocorrência de
+`gather_overlapped` ou de `apply_out_of_order` (`CheckViolation`, chamada depois de cada `Gather` e de cada início de
+aplicação, no log e no resumo), o diagnóstico: (1) escreve **uma vez** no log, em destaque, `precondicao P0 violada: os
+resultados do diagnostico a partir daqui nao sao confiaveis`; (2) prefixa com `[P0 VIOLATED: results after this are not
+reliable]` todas as linhas do relatório periódico seguintes; (3) repete o aviso no **resumo final**; (4) guarda um
+**instantâneo de todos os contadores** do instante da violação, que o resumo imprime (`counters at the first
+violation`), para o leitor separar o que veio antes do que veio depois. Os contadores continuam. **Não há trava
+corretiva** no T3a.
+
 **Por que endereço e sobreposição não bastam (contraexemplo da revisão, confirmado no código).** O `Gather` retira
 o lote A de um gerenciador; a CPU registra o aviso B no mesmo bloco de 64 bytes; a aplicação de A encontra B no
 livro-razão por sobreposição e o aposentaria, embora B ainda esteja no manager, e seria dado como "aplicado" um
 aviso que ninguém aplicou (e o pop seguinte o ignoraria). Endereço e sobreposição não identificam o lote.
 
 **Proposta (a da revisão, com duas mudanças que a demonstração exigiu):** dois contadores por gerenciador (por
-núcleo), só do diagnóstico, em `core/gpu_dirty_memory_manager.h`:
+núcleo), só do diagnóstico, em `Core::GatherLotState` (`core/gpu_dirty_memory_manager.h`), **uma linha de cache por
+núcleo, num vetor paralelo fora do gerenciador e alocado só quando o diagnóstico liga**:
 
 - `lot_started`: incrementado pelo `Gather` **antes** de tomar o `guard`.
 - `lot_done`: gravado **depois** da troca do `current` e dos buffers, **ainda sob o `guard`**. Vale o número do
@@ -252,6 +261,22 @@ acha: **janela falsa**. A regra de aposentadoria da 3.3 não basta: a aplicaçã
 
 Um "seqlock" sozinho não basta: há **expiração** (um slot publicado e velho é reaproveitado pelo escritor) e os
 **leitores marcam** slots (`t_pop`, `t_apply`). O protocolo:
+
+**Geração e etiqueta (correção da revisão 3, A).** A geração de um slot tem 62 bits e é o que `state`, o `Handle` e o
+`Free` usam; só `marks` e o payload do pop levam a **etiqueta**, de 16 bits e **nunca zero** (`Tag(g) = g % 65535 + 1`:
+zero significa "sem payload" e "nunca publicado"), e só as operações que comparam uma etiqueta a tiram da geração. O
+primeiro desenho guardava no `Handle` só os 16 bits baixos e o `Free` os comparava com a geração completa: a partir da
+geração 65536 a liberação do registro tardio falhava, o registro ficava `publicado` e a conservação quebrava; além
+disso a etiqueta 0 era tratada como "sem payload" e a amostra do pop se perdia a cada 65 536 gerações. A etiqueta
+repete a cada **65 535** gerações de um slot (o limite de ABA).
+
+**Índice de slots vivos (achado de custo, revisão 3).** O pop e a aplicação varrem o livro-razão **uma vez por faixa**,
+sob o `buffer_cache.mutex`; varrer os 6 × 1024 slots alongaria justamente as seções que o diagnóstico quer medir. Cada
+anel tem um bitmap dos slots publicados, e a varredura custa o número de registros vivos. Ordem: o escritor **publica
+`state` e DEPOIS liga o bit** (`seq_cst`), então a varredura que vem depois da leitura de `apply_started_lot` pelo
+escritor vê o bit (a Dekker da 3.3.1 continua valendo: `P < bit < R < W < V`). Quem libera (`Free`) desliga o bit e
+**relê o `state`**: se um escritor reaproveitou o slot nesse meio, o bit volta. O bit é um índice: quem varre ainda lê
+o `state` de cada slot.
 
 **Anéis.** Um por núcleo, 1024 slots de 64 bytes (6 × 1024 × 64 B = 384 KiB), alocados só com `pop` ou `blk`. O
 escritor de cada anel é único (o `sys_core` é serializado por `sys_core_guard`, `core/memory.cpp:709-717`), o que
@@ -485,9 +510,13 @@ Por isso `list` é medida **à parte** de `pop` e `blk`.
 | | Desligado | Ligado |
 | --- | --- | --- |
 | (a) Leitura da flag e desvio | **uma** leitura `relaxed` e um desvio em `System::GatherGPUDirtyMemory`/`InvalidateGPUCache` (por chamada, **não** por gerenciador: o ramo fica fora do laço dos 6) e um em `memory.cpp:765` (só no caminho do aviso segurado), no laço do pop (por faixa), no topo de `CachedWriteMemory` | idem, mais o trabalho abaixo |
-| (b) Contadores `lot_started`/`lot_done` | **não são gravados.** Cada gerenciador ganha **40 bytes** de layout (cinco `std::atomic<u64>`: `lot_started`, `lot_done`, `gather_active`, `apply_started_lot`, `violation_floor`; ×6); `Collect` e `Gather` de hoje não mudam (`Diag=false`). **Isto é um custo fora do diagnóstico, de memória e de layout**: o acréscimo **pode deslocar campos ativos** (`gather_epoch`, `current`, `guard`) e mudar o layout do gerenciador, inclusive entre linhas de cache; **a verificar por `static_assert` de `sizeof` e `offsetof` e por inspeção, ou por medição**. Não afirmo que não ocupa linha de cache nova. Gravar sempre fica como decisão futura, só se simplificar o protocolo ou mostrar vantagem **medida**; "é barato" é hipótese, não justificativa | `std::atomic<u64>` todos, `seq_cst` (incremento e leituras; gravação de `lot_done`; `apply_started_lot` é um `store` por gerenciador a cada `InvalidateGPUCache`; `violation_floor` só em violação). **O custo de um `store` ou `exchange` `seq_cst` frente ao comum, em x86-64 e em ARM, é a verificar por inspeção do código gerado ou por medição**, e não é afirmado. **Escritores:** `lot_started` e `gather_active` por quem chama `Gather`: a trás com split, a thread única sem split e, **depois de `Drain`**, a frente (3.3, P0); a thread de fences e as da CPU do jogo **não** chamam; `lot_done` idem, sob o `guard`. **Leitores:** a thread da CPU do jogo (no `CollectObserved`, 2 leituras antes e 1 depois por aviso segurado) e o próprio `Gather` |
+| (b) Contadores do lote (`GatherLotState`) | **não são gravados e não existem**: ficam num vetor paralelo, **alocado só quando uma parte liga** (uma linha de cache por núcleo, 6 × 64 B), **fora do `GPUDirtyMemoryManager`**, cujo layout e cujo `Collect`/`Gather` são os de hoje (`CollectT<false>` e `GatherT<false>`; conferido por `static_assert` de `sizeof` e por teste de equivalência). **Não há custo de memória nem de layout fora do diagnóstico.** (A decisão 3 previa os 40 bytes no gerenciador como plano B; não foi preciso.) Gravar sempre continua só com medição que o justifique | seis `std::atomic<u64>` por núcleo, todos `seq_cst` (incremento e leituras; gravação de `lot_done`; `apply_started_lot` é um `store` por gerenciador a cada `InvalidateGPUCache`; `violation_floor` só em violação). **O custo de um `store` ou `exchange` `seq_cst` frente ao comum, em x86-64 e em ARM, é a verificar por inspeção do código gerado ou por medição**; a medição da nuvem (abaixo) é só ordem de grandeza. **Escritores:** `lot_started` e `gather_active` por quem chama `Gather`: a trás com split, a thread única sem split e, **depois de `Drain`**, a frente (3.3, P0); a thread de fences e as da CPU do jogo **não** chamam; `lot_done` idem, sob o `guard`. **Leitores:** a thread da CPU do jogo (no `CollectObserved`, 2 leituras antes e 1 depois por aviso segurado) e o próprio `Gather` |
 | (c) Frequência real | `Gather` por **gerenciador** a cada `InvalidateGPUCache`, vazios inclusive (`core/core.cpp:644-646`, **verificado**); `InvalidateGPUCache` roda no início de cada lista, no fim de cada `SignalFence`, no `OnCPURead` e em outros chamadores (3.3), possivelmente em mais de uma thread (`gpu.cpp:128`). **Sem estimativa por lista ou fence:** o diagnóstico **conta** `invalidate_calls`, `invalidate_empty`, `gather_calls[núcleo]`, `gather_empty[núcleo]`, `gather_overlapped`, `invalidate_thread_switches` | os mesmos contadores, no resumo e no `Report()` |
 | (d) Sincronização | nenhuma nova | **as gravações ficam sob o `guard` existente:** o `Gather` do diagnóstico acrescenta, **dentro** da seção do `guard`, uma leitura `seq_cst` e uma gravação `seq_cst` (`lot_done`), sem trava nem espera; o incremento de `lot_started` fica **fora** (antes). Amplia a seção crítica de uma gravação atômica: a ordem de ns, que a medição de 8.3 deve confirmar, **não** a presumo. O `Collect` do diagnóstico não amplia a seção do `guard` (só muda a ordem de memória das operações em `current`) |
+
+**Medição na nuvem (ordem de grandeza, não o custo no FE; x86-64, `-O2`, uma thread):** `Collect` 14 ns contra 146 ns
+com `CollectObserved` (por aviso segurado); gather + aplicação de 64 avisos, 142 ns por aviso; `NotePop` 107 ns por faixa
+sem registros vivos, 119 ns com 8 e 311 ns com 64. O custo de verdade é o do FE (8.3).
 
 Custo sem uso das outras chamadas (`list`): `MarkWrittenBuffer`, `DmaPusher::Step` (por entrada) e os seis pontos
 de `NoteForeignWrite`: uma leitura e um desvio cada. **A medir** (seção 8.3).
@@ -525,23 +554,24 @@ O `DmaPusher` com rasterizador falso e o `puller` reais para a parte `list` são
 pequena, os casos dirigidos ficam só no harness e o teste de integração cobre `ClassifyWords`, a comparação e a
 tabela por página.
 
-### 8.1.1 O que o harness isolado já cobre (`tools/list-diag-harness/`, feito e rodado)
+### 8.1.1 O que o harness cobre (`tools/list-diag-harness/`, feito e rodado)
 
-Modelo do protocolo, **fora do emulador** (o único código de `src/` que ele compila é o `core/gpu_dirty_memory_manager.h`
-real, por um stub mínimo da página). `Manager<false>` é o `Collect`/`Gather` de hoje, e o teste de **equivalência**
-compara a saída dele, a do real e a de `Manager<true>` em 40 000 passos aleatórios (**passa**). Os testes da tabela
-acima que ele cobre já existem lá, deterministas, com pontos de parada (`Gates`) em vez de sorte:
+**O harness não é mais um modelo: é o código do emulador.** `tools/list-diag-harness/run.sh` compila
+`src/tests/video_core/list_diag.cpp` (o mesmo arquivo Catch2 do CMake do emulador) contra os `src/video_core/list_diag/*.h`
+**reais**, o `src/core/gpu_dirty_memory_manager.h` **real** (a variante `Diag=true` de verdade) e o `Common::RangeSet`
+**real** (Boost). O que fica de fora do `src/` é só um stub de `core/device_memory_manager.h` (o tamanho da página) e o
+destino do log. Os testes: equivalência do manager (40 000 passos, comparando o `Collect`/`Gather` de antes, o `Diag=false`
+e o `Diag=true`); lote e identidade de cada aviso (com o mutante); ambiguidade nos quatro pontos; o contraexemplo A/B;
+"entre o `Gather` e a aplicação"; publicação atrasada (e a variante sem a verificação, que mostra a janela falsa);
+reciclagem (leitura do payload, CAS de `t_pop`, CAS de `t_apply`, payload do pop); **fronteira de geração** (65534 a
+131072, em todos os caminhos); P0 violada (sobreposição e fora de ordem), com o relatório; junção entre núcleos;
+rótulos de amostra; `hit`/`applied`/`never` do log e o limite do log; `blk` (bloco, bytes em risco, ambíguo, sem
+rastreio de leitura da CPU, partes isoladas); a chave; **desligado, nada muda, e nada é alocado**; ligado, o caminho de
+produção; e o estresse com threads (verdade de referência vinda do `Gather`, sem janela falsa, conservação e um mutante).
 
-- lote nos três caminhos e identidade (com o mutante), ambiguidade nos quatro pontos de intercalação, o
-  contraexemplo A/B, "entre o `Gather` e a aplicação", a publicação atrasada (a, b, c, d e a variante sem a
-  verificação), a reciclagem (durante a leitura do payload, a CAS de `t_pop`, a de `t_apply`, a escrita atrasada do
-  payload do pop e o payload de outra geração), a violação de P0, a junção entre núcleos, os rótulos de amostra e
-  um **estresse** com threads (escritores por núcleo, um invalidador por vez, uma thread de pop), com verdade de
-  referência vinda do `Gather` (lote de cada bloco único), sem janela falsa e com conservação de fim de vida;
-- o estresse tem também um **mutante** (lote errado), que ele tem de ver;
-- **o que o harness não faz:** não instancia `BufferCache`, não tem o `memcpy` concorrente do guest (as amostras usam um guest
-  de mentira), o `Hooks` do emulador é aqui um ponteiro de `Gates` (a política de modelo é do código real), e o
-  estresse usa blocos únicos por aviso (a repetição de bloco é coberta pelos roteiros, não pelo estresse).
+**O que ele não faz:** não instancia `BufferCache` (o laço do pop e o topo de `CachedWriteMemory` são conferidos por
+compilação no emulador e por leitura, não por execução); o `memcpy` concorrente do guest não existe (as amostras usam um guest
+de mentira); o estresse usa blocos únicos por aviso (a repetição de bloco é coberta pelos roteiros).
 
 ### 8.2 Verificação na nuvem
 
@@ -550,22 +580,38 @@ ASan+UBSan, LeakSanitizer ativo e confirmado com um programa que vaza de propós
 `g++ -std=c++20 -fsyntax-only -Wall` dos arquivos alterados (método de `docs/handoff-aggressive.md` e
 `docs/perf-handoff.md`). A cadeia completa de build do emulador não roda na nuvem.
 
-### 8.3 Plano de teste no FE (usuário, em casa)
+### 8.3 Plano de teste no FE e no Bananza (usuário, em casa)
 
-Orçamento: `docs/architecture-plan.md`, 12.1 (até 5% de draws/s por item). **Estatísticas de tempo desligadas**
-(`EDEN_BACK_THREAD_STATS` ausente) nas medições de draws/s, para o diagnóstico não medir a si mesmo; o resumo final
-do diagnóstico sai no log de qualquer forma.
+Orçamento: `docs/architecture-plan.md`, 12.1 (até 5% de draws/s por item). **`EDEN_BACK_THREAD_STATS` ausente** nas
+medições de draws/s, para o diagnóstico não medir a si mesmo. O diagnóstico escreve no log do emulador
+(`user\log\eden_log.txt`): as linhas de evento na hora (no máximo 1 descarga por segundo) e o **resumo ao fechar o jogo**
+(`GPU::NotifyShutdown`); o bloco periódico por segundo só aparece com `EDEN_BACK_THREAD_STATS=1`, que **não** se usa nas
+medições de draws/s.
 
-| Rodada | Configuração | Onde | O que sai |
-| --- | --- | --- | --- |
-| A | sem `EDEN_LIST_DIAG` | praça e palácio do FE | draws/s de referência; **repita A duas vezes** para o ruído |
-| B | `EDEN_LIST_DIAG=pop,blk` | praça e palácio | draws/s (livro-razão, ordens `seq_cst`, hooks); contadores no resumo final, **inclusive as chamadas reais ao `Gather`** (7, c) |
-| C | `EDEN_LIST_DIAG=1` | praça e palácio | draws/s com as cópias (custo da parte `list`) |
-| Bananza | `pop,blk` e depois `=1` | onde o chão some | contadores e logs das seções 4 a 6 |
+PowerShell novo a cada rodada, mesmo build, mesmo lugar e mesma câmera:
 
-Alternar A/B/A/B no mesmo build, lugar e câmera, PowerShell novo por rodada. Registrar também o número em degraus
-de FPS (12.1). Uma rodada com zero ocorrências **não** invalida a janela nem os blocos (seção 0); uma com
-ocorrências dimensiona exposição, e **não decide o mecanismo**.
+| Rodada | PowerShell | O que medir |
+| --- | --- | --- |
+| A (referência) | `.\eden.exe` (sem `EDEN_LIST_DIAG`) | draws/s; repita A duas vezes para o ruído |
+| B (T3a) | `$env:EDEN_LIST_DIAG="pop,blk"; .\eden.exe` | draws/s e o log |
+
+Alternar A, B, A, B, **na praça** e **no palácio** do FE, GPU em Fast, o mesmo método de draws/s que você usa hoje.
+Anotar também os degraus de FPS. Fechar o jogo pelo menu (para o resumo sair no log) em cada rodada B.
+
+**Bananza**, onde o chão some, GPU em Fast, com o split como está (sem `EDEN_GPU_SPLIT=0`): uma rodada
+`$env:EDEN_LIST_DIAG="pop,blk"`, o tempo que for preciso para o chão aparecer ou não, e fechar pelo menu.
+
+**O que me mandar** (de `user\log\eden_log.txt`; `Select-String -Path user\log\eden_log.txt -Pattern "ListDiag"`):
+
+1. **Todas** as linhas `[ListDiag][summary]` (os contadores totais e, por núcleo, as chamadas ao `Gather`);
+2. **qualquer** linha com `P0`: `precondicao P0 violada` (se existir, o resto do diagnóstico daquela sessão não é confiável);
+3. as **primeiras 20** linhas `[ListDiag][pop]` e as **primeiras 20** `[ListDiag][blk]` (são as 32 primeiras de cada tipo, depois uma
+   amostra; 20 bastam);
+4. os números de draws/s de cada rodada, e o hash do commit do build.
+
+O que cada contador diz e **não** diz está em 4 e 5 e em 9: `pop_over_notice` e `blk_gpu_bytes_at_risk` são **limites
+superiores** (aviso registrado, não escrita concluída; bytes em risco, não perdidos), e uma rodada com zero ocorrências
+**não** invalida a janela nem os blocos (seção 0).
 
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 
@@ -587,25 +633,17 @@ ocorrências dimensiona exposição, e **não decide o mecanismo**.
 - **Efeitos de tempo do Vulkan** (barreiras, várias filas, caches da GPU): o diagnóstico não os mede.
 - **Mudança da flag durante a sessão:** não suportada (lida uma vez).
 
-## 10. Decisões que preciso de você antes de escrever código no emulador
+## 10. Decisões
 
-1. **Fases.** **T3a** (`pop` e `blk`: livro-razão, lote, publicação atrasada, 4 pontos, contadores, logs, testes)
-   primeiro, porque responde a pergunta que a seção 12 do plano deixou aberta para o T4 sem cópias na GPU; **T3b**
-   (`list`) depois, com o resultado de custo. Aprovado?
-2. **`Diag` como parâmetro de modelo no `GPUDirtyMemoryManager`** (3.3): a instanciação desligada é o código de
-   hoje, e a ligada usa `seq_cst`. A alternativa é gravar os contadores sempre (simplifica, mas é custo fora do
-   diagnóstico). Recomendo o parâmetro; gravar sempre só com medição que o justifique.
-3. **Layout do gerenciador:** o diagnóstico acrescenta 40 bytes (5 atômicos) por gerenciador mesmo desligado
-   (seção 7, b). Aceito, com `static_assert` de `offsetof` dos campos ativos? Ou prefere os contadores num vetor
-   paralelo, fora do gerenciador (o custo é uma indireção só no diagnóstico ligado)?
-4. **P0** (3.3): fica como precondição vigiada pelo diagnóstico (`gather_active`), sem mudar o emulador. Quer, além
-   disso, um `ASSERT` ou contador permanente de sobreposição de `Gather` (mudaria o caminho desligado: não proponho)?
-5. **Hooks de produtores estrangeiros** (seção 6, item 5): os seis dentro de `video_core/` na T3b, ou todos depois?
-6. **Limites:** primeiras 32 ocorrências de cada tipo, depois 1 a cada 64, teto de 512 linhas por sessão; cópias em
-   voo até 16 MiB. Servem?
+**Tomadas pelo usuário (revisão 3) e seguidas no T3a:** (1) T3a (`pop` e `blk`) agora; T3b (`list`) só depois do custo do
+T3a medido no FE. (2) `Diag` como parâmetro de modelo. (3) Contadores do lote numa estrutura paralela fora do
+gerenciador, alocada quando o diagnóstico liga, uma linha de cache por núcleo; **não foi preciso o plano B dos 40 bytes**.
+(4) P0 só vigiada, com o relatório de violação (3.3); nenhum `ASSERT` permanente; a checagem em modo de verificação
+(`EDEN_VERIFY`, `docs/architecture-plan.md` 12.2 g) fica **pendente**. (5) Hooks de produtores fora do
+`MarkWrittenBuffer`: **T3c**, depois. (6) Limites: 32 por tipo e depois 1 a cada 64, 512 linhas, 16 MiB em voo.
 
-**Feitos nesta revisão, sem esperar decisão (só harness):** o caso `held_write_apply_before_memcpy` no harness dos
-contratos (3.5) e o harness isolado do protocolo (8.1.1).
+**Em aberto:** o **mecanismo** de correção (T4), que as medições só dimensionam; e o desenho do T3b/T3c, depois do
+custo do T3a.
 
 ## 11. Revisões
 
@@ -621,3 +659,7 @@ contratos (3.5) e o harness isolado do protocolo (8.1.1).
 | 7 (revisão 2) | A referência do teste de lote ("o endereço aparece no callback") não basta quando vários avisos usam o mesmo bloco | Sim, e o harness mostra o tamanho do buraco: com o mutante "lote seguinte", a conferência por identidade falha em 5 de 5 e a por endereço é enganada 3 vezes | 8.1: roteiros escritos à mão, com a coalescência conhecida e o lote esperado vindo do roteiro; o mutante é parte do teste |
 | 8 (revisão 2) | Custo desligado: retirar "nenhuma linha de cache nova em uso" e "mesmas instruções em x86" | Sim: 16 bytes (agora 40) podem deslocar campos ativos; um `store` `seq_cst` pode custar mais que um comum | Seção 7 e 3.3: as duas frases viram "a verificar por inspeção do código gerado ou medição" |
 | 9 (achado do harness) | (não veio da revisão) A conservação de fim de vida dos registros falhou por 8 no estresse | Sim, **falha do meu protocolo**: reciclar um slot `publicado` e expirado contava `notice_expired` mesmo quando o registro velho já estava `applied` e ainda não liberado (contado duas vezes: retirado e reciclado) | 3.4, passo 3: o escritor sela o `marks` velho por `exchange` e conta `expired` só se o selo não traz `applied` nem `late` |
+| 10 (revisão 3, A) | **Geração truncada:** o `Handle` guarda só `gen16` e o `Free` compara com a geração completa; a partir da 65536 a liberação falha, o registro `late` fica publicado e a conservação quebra. Procurar outros pontos que misturem `gen16` e geração completa | Sim, e achei um segundo: `ReadPop` tratava a etiqueta 0 como "sem payload", então toda geração de 16 bits baixos nulos perdia a amostra. Teste determinístico **antes da correção: 6 falhas** (65536: amostra `unverified`, slot preso `publicado`, conservação; 65537: o `Free` também falha). Outro ponto: o `+7` do teste que montava a etiqueta com 16 bits | 3.4: geração completa no `Handle`, `Tag(g) = g % 65535 + 1` (nunca zero), `Free` pela geração completa. Teste de fronteira (65534, 65535, 65536, 65537, 131071, 131072) nos caminhos normal, tardio (Late + Free), aplicação, pop e expiração, com a conservação dos dois lados. **Depois: 0 falhas**, e a mutação que reintroduz o bug é pega na 65536 |
+| 11 (revisão 3, B) | O mesmo código no teste e no emulador: protocolo único em `src/video_core/list_diag/*.h`, `Diag=true` no próprio `gpu_dirty_memory_manager.h`, o harness testa a variante real; `manager.h` só para a equivalência ou sai | Sim: o harness anterior testava uma cópia, e uma divergência entre a cópia e o emulador passaria despercebida | Seção 2 e 8.1.1: headers autocontidos incluídos pelos dois; a equivalência usa o `Collect`/`Gather` antigo (`list_diag_legacy_manager.h`); o modelo e o `manager.h` saíram |
+| 12 (revisão 3, C) | P0 violada invalida o diagnóstico da sessão, não só alguns lotes: na primeira ocorrência o relatório diz, em destaque e uma vez no log, que os resultados a partir dali não são confiáveis, e o resumo repete | Sim. O `violation_floor` só tornava ambíguos alguns lotes | 3.3: `CheckViolation` (primeira ocorrência de `gather_overlapped` ou `apply_out_of_order`): uma linha no log, o prefixo `[P0 VIOLATED]` no relatório, o aviso no resumo e um **instantâneo dos contadores** no instante da violação; os contadores continuam. Sem trava corretiva |
+| 13 (achado ao implementar) | (não veio da revisão) a varredura do livro-razão por faixa lia 6 × 1024 slots, sob o `buffer_cache.mutex` | Sim, e é custo que perturba justamente o que o diagnóstico mede: a praça tem centenas de faixas por lote | 3.4: índice de slots vivos (bitmap) com a ordem publicar-depois-ligar e a releitura em `Free`; o teste confere o índice contra os slots publicados |

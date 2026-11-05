@@ -101,6 +101,12 @@ add_library(video_core STATIC
     native_semaphore.h
     back_thread_stats.cpp
     back_thread_stats.h
+    list_diag.cpp
+    list_diag.h
+    list_diag/counters.h
+    list_diag/hooks.h
+    list_diag/ledger.h
+    list_diag/protocol.h
     gpu_split.cpp
     gpu_split.h
     gpu_thread.cpp

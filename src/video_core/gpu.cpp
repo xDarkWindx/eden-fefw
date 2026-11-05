@@ -38,6 +38,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/list_diag.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
@@ -131,8 +132,22 @@ struct GPU::Impl {
         std::function<void(PAddr, size_t)> callback_writes([](PAddr address, size_t size) {
             cached_writes.emplace_back(static_cast<DAddr>(address), static_cast<u64>(size));
         });
-        system.GatherGPUDirtyMemory(callback_writes);
+        // EDEN_LIST_DIAG (parts pop, blk): the same Gather of every manager, in the variant that also
+        // takes the lot of each (docs/list-diag-design.md, 3.3); what is applied below is unchanged.
+        const bool diag = VideoCommon::ListDiag::NoticesEnabled();
+        static thread_local VideoCommon::ListDiag::Impl::Gathered diag_gathered;
+        if (diag) {
+            VideoCommon::ListDiag::State().GatherAll(system.GetGPUDirtyMemoryManager(), diag_gathered);
+            for (const auto& range : diag_gathered.pre) {
+                cached_writes.emplace_back(static_cast<DAddr>(range.addr), static_cast<u64>(range.size));
+            }
+        } else {
+            system.GatherGPUDirtyMemory(callback_writes);
+        }
         if (cached_writes.empty()) {
+            if (diag) {
+                VideoCommon::ListDiag::DrainLog();
+            }
             return;
         }
         // Touching and overlapping writes to one 4 KiB page become one range: in the city plaza
@@ -158,6 +173,16 @@ struct GPU::Impl {
                 }
             }
             cached_writes.resize(out + 1);
+        }
+        if (diag) {
+            const std::vector<std::pair<u64, u64>> final_ranges{cached_writes.begin(), cached_writes.end()};
+            const auto batch =
+                VideoCommon::ListDiag::State().MakeBatch(std::move(diag_gathered), final_ranges);
+            VideoCommon::ListDiag::State().BeginApply(batch);
+            renderer->ReadRasterizer()->OnCachedWrites(cached_writes);
+            VideoCommon::ListDiag::State().EndApply();
+            VideoCommon::ListDiag::DrainLog();
+            return;
         }
         renderer->ReadRasterizer()->OnCachedWrites(cached_writes);
     }
@@ -226,6 +251,7 @@ struct GPU::Impl {
 
     void NotifyShutdown() {
         gpu_thread.NotifyShutdown();
+        VideoCommon::ListDiag::LogSummary();
         std::unique_lock lk{sync_mutex};
         shutting_down.store(true, std::memory_order::relaxed);
         sync_cv.notify_all();

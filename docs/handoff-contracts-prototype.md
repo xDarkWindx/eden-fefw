@@ -199,8 +199,13 @@ integrar.
 
 ### T3 — Build de diagnóstico de listas (código real, **desligado por padrão**)
 
-**Estado:** harness feito; **desenho proposto (revisão 2, seção 11 do doc) e aguardando aprovação** (`docs/list-diag-design.md`,
-decisões na seção 10). Não escreva código do emulador antes dela. Fases propostas: T3a (`pop` e `blk`) e T3b (`list`).
+**Estado (sessão do T3a):** o **T3a está implementado** (partes `pop` e `blk` do diagnóstico, desligado por padrão) e
+aguarda as medições do usuário no FE e no Bananza (instruções em `docs/list-diag-design.md`, 8.3). **T3b** (`list`) só
+depois do custo do T3a medido; **T3c** (produtores fora do `MarkWrittenBuffer`) depois. O código: `src/video_core/list_diag/*.h`
+(protocolo único, header-only), `src/video_core/list_diag.h/.cpp` (chave e ganchos), as variantes `Diag` do
+`core/gpu_dirty_memory_manager.h` e cinco pontos de gancho (`core/memory.cpp`, `video_core/gpu.cpp`,
+`video_core/buffer_cache/buffer_cache.h` duas vezes, `video_core/back_thread_stats.cpp`). Testes: `src/tests/video_core/list_diag.cpp`
+(Catch2, o mesmo arquivo que `tools/list-diag-harness/run.sh` roda com TSan e ASan). A correção (T4) segue em aberto.
 
 Escopo que o revisor pediu: **pequeno, opt-in, com testes de integração, sem habilitar nada por padrão.**
 Não comece sem ler a seção 5 acima e `docs/gpu-produced-data-plan.md`, 4.1.2.

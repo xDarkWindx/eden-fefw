@@ -8,6 +8,7 @@
 
 #include "common/logging.h"
 #include "video_core/back_thread_stats.h"
+#include "video_core/list_diag.h"
 
 namespace VideoCommon::BackStats {
 
@@ -332,6 +333,10 @@ void Report() {
              "without asking (EDEN_CPU_WRITE_PAGES) {:.0f}/s",
              per_s(unregistered), per_s(held), per_s(written), per_s(Take(shared.cpu_write_would_hit)),
              per_s(Take(shared.cpu_write_skipped)));
+    // EDEN_LIST_DIAG (parts pop, blk): totals and rate of its counters, empty when it is off.
+    for (const std::string& line : ListDiag::ReportLines(seconds)) {
+        LOG_INFO(Render_Vulkan, "{}", line);
+    }
     LOG_INFO(Render_Vulkan,
              "Cache locks: {}; {}; {}; {}. Split front: {:.0f} drains/s waiting {:.0f} us/s, ring "
              "space {:.0f} us/s",

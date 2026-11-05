@@ -32,6 +32,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "video_core/back_thread_stats.h"
+#include "video_core/list_diag.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -762,7 +763,10 @@ struct Memory::Impl {
                     }
                 }
             }
-            gpu_dirty_managers[core].Collect(address, size);
+            // EDEN_LIST_DIAG (parts pop, blk): the same Collect, with the lot of the notice observed
+            // (video_core/list_diag.h). Off: the flag is read and the Collect is the one of always.
+            VideoCommon::ListDiag::CollectNotice(gpu_dirty_managers[core], static_cast<unsigned>(core),
+                                                 address, size);
         });
     }
 
