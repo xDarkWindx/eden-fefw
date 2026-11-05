@@ -127,7 +127,7 @@ declaração é o que torna esse custo visível antes de entrar.
 
 ## 3. Camadas
 
-### 3.1 L0 — ISA (a única que cresce por jogo)
+### 3.1 L0 — ISA (a que mais cresce por jogo)
 
 - **Hoje:** decodificação Ampere → lowering para Maxwell → IR → SPIR-V. Rejeições contadas, com dumps
   (0b08912). `src/tests/video_core/native_shader.cpp` tem 292 declarações `TEST_CASE` (não é medida de
@@ -245,8 +245,10 @@ Uma tabela única (`video_core/policy.h`), lida uma vez no início, com sintaxe 
 2. Rejeições de shader → L0: implementar, fixture, sweep.
 3. Imagem errada sem rejeição → diagnóstico do consumidor suspeito (o build de diagnóstico de listas é o
    modelo), e depois políticas em modo exato, uma por vez, com o resto constante.
-4. Se nenhuma política consertar, há um buraco de arquitetura: vira um consumidor novo do filtro e das
-   transferências, ou uma política nova, não um mecanismo novo.
+4. Se nenhuma política consertar, o jogo revelou uma regra do hardware que os contratos ainda não cobrem:
+   ela entra como regra nova no contrato responsável (seção 2.2), com teste que reproduz o problema e a
+   declaração de esperas, recursos retidos e custo sem uso. Se a regra não couber em nenhum contrato sem
+   mudanças espalhadas, o contrato é que muda, explicitamente.
 5. Algo que só o jogo faz e que não vale emular → plugin.
 
 ## 5. Ordem de implementação (revisada)
@@ -299,7 +301,7 @@ o padrão antes de medir.
 5. O replay deve começar pela captura no nível do GPFIFO com estado inicial coerente, ou por um subconjunto
    (um único draw com seus recursos)?
 
-## 10. Revisão 1: o que mudou e por quê
+## 10. Revisões: o que mudou e por quê
 
 | Ponto da revisão | Mudança |
 | --- | --- |
