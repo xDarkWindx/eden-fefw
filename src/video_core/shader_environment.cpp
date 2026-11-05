@@ -593,7 +593,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
                         native_program_key, reject_index * sizeof(Instruction), reject);
         }
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true);
+    // Geometry programs accept their own instructions (OUT, LEPC, the exit stub, ISBERD).
+    const bool geometry = stage == Shader::Stage::Geometry;
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, verified_traps, true, geometry,
+                                                  program_base + native_header_size);
     if (!lowered) {
         // A rejected program never reaches the Maxwell dump, so keep its native code: the
         // rejected instruction alone rarely shows which pattern the lowering needs to accept.
@@ -659,10 +662,15 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel) {
+        // Geometry programs too (Donkey Kong Bananza's destructible terrain is drawn through one),
+        // from Eglantine.
+        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
+            program != Maxwell::ShaderType::Geometry) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
-        stage = program == Maxwell::ShaderType::VertexB ? Shader::Stage::VertexB : Shader::Stage::Fragment;
+        stage = program == Maxwell::ShaderType::VertexB ? Shader::Stage::VertexB
+              : program == Maxwell::ShaderType::Geometry ? Shader::Stage::Geometry
+                                                         : Shader::Stage::Fragment;
         // The capture reads constant-buffer tables through ReadCbufValue, which indexes the stage's buffers.
         switch (program) {
         case Maxwell::ShaderType::TessellationInit:

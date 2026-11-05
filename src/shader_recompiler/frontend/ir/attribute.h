@@ -238,7 +238,8 @@ constexpr size_t NUM_GENERICS = 32;
 constexpr size_t NUM_FIXEDFNCTEXTURE = 10;
 
 [[nodiscard]] inline bool IsGeneric(Attribute attribute) noexcept {
-    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31X;
+    // Up to Generic31W: Generic31Y-W are generics too (from Eglantine 45bd8157e4).
+    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31W;
 }
 
 [[nodiscard]] inline bool IsLegacyAttribute(Attribute attribute) noexcept {

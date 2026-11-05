@@ -7173,6 +7173,73 @@ TEST_CASE("Native float set combines the comparison with an input predicate", "[
     }
 }
 
+TEST_CASE("Native geometry program counter loads the native instruction address", "[native-shader]") {
+    // From Eglantine's ampere_geometry tests: LEPC R20 at the second instruction.
+    const Native nop{{0x00007918, 0, 0, 0}};
+    const Native lepc{{0x0014734e, 0, 0, 0}};
+    const std::array code{nop, lepc, VertexTransform.back()};
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(code));
+    const auto result = Shader::Ampere::LowerToMaxwell(code, {}, false, true, 0x00000012fffffff0ULL);
+    INFO("offset=" << result.error_offset << " error=" << result.error);
+    REQUIRE(result);
+    REQUIRE(result.instructions.size() == 4);
+    REQUIRE((result.instructions[1] & 0xff) == 20);
+    REQUIRE(((result.instructions[1] >> 20) & 0xffffffffULL) == 0);
+    REQUIRE((result.instructions[2] & 0xff) == 21);
+    REQUIRE(((result.instructions[2] >> 20) & 0xffffffffULL) == 0x13);
+    Native unsupported = lepc;
+    unsupported.words[1] = 1;
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(std::array{unsupported, VertexTransform.back()}, {}, false, true));
+}
+
+TEST_CASE("Native geometry stage map and exit setup are geometry only", "[native-shader]") {
+    const Native map_read{{0x05127923, 0, 0, 0}};   // ISBERD R18, [R5]
+    const Native exit_setup{{0x03007357, 0, 0, 0}};
+    const std::array code{map_read, exit_setup, VertexTransform.back()};
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(code));
+    const auto result = Shader::Ampere::LowerToMaxwell(code, {}, false, true);
+    INFO("offset=" << result.error_offset << " error=" << result.error);
+    REQUIRE(result);
+    REQUIRE(result.instructions.size() == 2);
+    REQUIRE((result.instructions[0] & 0xff) == 18);
+    REQUIRE(((result.instructions[0] >> 20) & 0xff) == 5);
+    Native unsupported = exit_setup;
+    unsupported.words[1] = 1;
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(std::array{unsupported, VertexTransform.back()}, {}, false, true));
+}
+
+TEST_CASE("Native geometry programs lower their output instructions", "[native-shader]") {
+    const std::array<Native, 5> program{{
+        {{0x0004734e, 0, 0, 0}},         // LEPC R4
+        {{0x00017923, 0, 0, 0}},         // ISBERD R1, [R0]
+        {{0x00027324, 0xff, 0x4000, 0}}, // OUT.EMIT R2, R0, RZ
+        {{0x02037924, 0, 0x8000, 0}},    // OUT.CUT R3, R2, 0
+        VertexTransform.back(),
+    }};
+    const auto outside = Shader::Ampere::LowerToMaxwell(program);
+    REQUIRE_FALSE(outside);
+    REQUIRE(outside.error == "unsupported native opcode");
+    const auto lowered = Shader::Ampere::LowerToMaxwell(program, {}, false, true);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    using Shader::Maxwell::Opcode;
+    std::vector<u64> outputs;
+    for (const u64 word : lowered.instructions) {
+        const auto opcode = Shader::Maxwell::Decode(word);
+        if (opcode == Opcode::OUT_reg || opcode == Opcode::OUT_imm) outputs.push_back(word);
+    }
+    REQUIRE(outputs.size() == 2);
+    REQUIRE(Shader::Maxwell::Decode(outputs[0]) == Opcode::OUT_reg);
+    REQUIRE((outputs[0] & 0xff) == 2);              // Rd
+    REQUIRE(((outputs[0] >> 8) & 0xff) == 0);       // Ra
+    REQUIRE(((outputs[0] >> 20) & 0xff) == 255);    // stream RZ
+    REQUIRE(((outputs[0] >> 39) & 3) == 1);         // emit
+    REQUIRE(Shader::Maxwell::Decode(outputs[1]) == Opcode::OUT_imm);
+    REQUIRE((outputs[1] & 0xff) == 3);
+    REQUIRE(((outputs[1] >> 8) & 0xff) == 2);
+    REQUIRE(((outputs[1] >> 39) & 3) == 2);         // cut
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);

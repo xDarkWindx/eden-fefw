@@ -33,8 +33,11 @@ struct LoweredProgram {
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
+// geometry: the program is a geometry shader (OUT, LEPC, the exit stub and ISBERD are accepted);
+// native_code_address is the GPU address of its first instruction, for LEPC.
 inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
-                                     std::span<const u32> verified_traps = {}, bool allow_register_spills = false) {
+                                     std::span<const u32> verified_traps = {}, bool allow_register_spills = false,
+                                     bool geometry = false, u64 native_code_address = 0) {
     LoweredProgram result;
     struct Relocation { u32 output_index; s64 target; bool call = false; u32 output_target = ~0U; };
     std::vector<Relocation> relocations;
@@ -1757,6 +1760,58 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             }
             break;
         }
+        // Geometry shader instructions, from Eglantine (c31a22ebe6, 45bd8157e4).
+        case 0x324: case 0x924: { // OUT: geometry output (register or immediate stream).
+            if (!geometry) return fail(index, "unsupported native opcode");
+            // Ampere: Rd 16-23 (the new output handle), Ra 24-31 (the old one), the stream in Rb
+            // 32-39 or the immediate 32-63; 78-79 emit (1), cut (2) or both, 0 is OUTFINAL.
+            // Maxwell OUT: Rd 0-7, Ra 8-15, stream Rb 20-27 or imm20 20-38, emit 39, cut 40. The
+            // host keeps no output handle, so OUTFINAL only passes the handle through.
+            const u32 type = insn.Bits(78, 2);
+            if (insn.Bits(80, 12) || insn.Bits(64, 14)) return fail(index, "native OUT mode");
+            const u32 a = insn.Bits(24, 8);
+            if (type == 0) {
+                if (dest != 255) emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{a} << 20));
+                break;
+            }
+            if (opcode == 0x324) {
+                emit(base(0xfbe0000000000000ULL) | (u64{a} << 8) | (u64{insn.Bits(32, 8)} << 20) |
+                     (u64{type} << 39));
+            } else {
+                if (insn.words[1] >= (1U << 19)) return fail(index, "native OUT stream immediate");
+                emit(base(0xf6e0000000000000ULL) | (u64{a} << 8) | (u64{insn.words[1]} << 20) |
+                     (u64{type} << 39));
+            }
+            break;
+        }
+        case 0x34e: { // LEPC: load this native instruction's address as a register pair.
+            if (!geometry) return fail(index, "unsupported native opcode");
+            if (insn.Bits(24, 8) || insn.words[1] || insn.words[2] || dest == 254 ||
+                native_predicate != 7)
+                return fail(index, "native program counter load mode");
+            if (dest == 255) break;
+            const u64 address = native_code_address + u64{index} * sizeof(Instruction);
+            mov_imm(static_cast<u32>(dest), static_cast<u32>(address));
+            mov_imm(static_cast<u32>(dest) + 1, static_cast<u32>(address >> 32));
+            break;
+        }
+        case 0x357: // Set the native geometry exit stub; host geometry invocations need no stub.
+            if (!geometry) return fail(index, "unsupported native opcode");
+            if (insn.Bits(16, 8) || insn.words[1] || insn.words[2] || native_predicate != 7)
+                return fail(index, "native geometry exit setup mode");
+            break;
+        case 0x957: // Finish the geometry exit stub; the shader's own EXIT follows.
+            if (!geometry) return fail(index, "unsupported native opcode");
+            emit(0x50b0000000000f00ULL | predicate); // NOP
+            break;
+        case 0x923: // ISBERD: a vertex's stage buffer entry, which only ALD reads.
+            // Ra passes through, as Maxwell's ISBERD does (task and mesh forms are not lowered).
+            if (!geometry || insn.Bits(75, 5) || insn.Bits(40, 24))
+                return fail(index, "native geometry ISBERD mode");
+            if (dest != 255) {
+                emit(base(0x5c98000000000000ULL) | (u64{15} << 39) | (u64{insn.Bits(24, 8)} << 20));
+            }
+            break;
         case 0x95b: // Fragment discard; execution predicate is preserved.
             if (insn.words[1] || insn.words[2] != 0x03800000)
                 return fail(index, "native fragment discard mode");
