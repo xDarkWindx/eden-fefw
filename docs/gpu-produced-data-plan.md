@@ -32,6 +32,11 @@ Documento para revisão crítica. As perguntas abertas estão na seção 7.
 
 - **O FE não pode piorar.** A praça está em ~20 FPS porque a thread de trás trabalha ~43 ms por frame
   (`docs/back-thread-split-plan.md`, 3.14). O modo 2 do split existe para tirar as macros dela.
+- **No FE, este fork é bem mais rápido que os forks de origem.** O usuário baixou e testou o Eglantine e o
+  Lichii: no pior ponto da praça, ~14 FPS lá contra ~21 aqui (2026-11-05; versões e configurações dos
+  builds não registradas). Por isso os forks servem de referência de **correção** (o que o Bananza precisa),
+  não de desempenho. Nenhum mecanismo deles entra no caminho do FE sem A/B aqui, e as diferenças de
+  desenho que custam tempo na thread de trás (esperas por entrada, flushes) são as primeiras suspeitas.
 - Nada ligado por título. Cada correção é disparada pelo padrão que ela trata, e o caminho do FE só muda se
   o padrão aparecer nele.
 - Toda mudança nova traz contador no `EDEN_BACK_THREAD_STATS`, variável para desligar (A/B no mesmo build) e
@@ -53,6 +58,10 @@ Consequência (**hipótese**, a ser confirmada no teste 4.1.1): uma command list
 executada com as palavras de antes do compute, exceto os parâmetros de macro que a releitura conserta.
 
 ## 3. O que os forks têm e serve aqui
+
+Lembrete da seção 1: os forks são ~14 FPS contra ~21 daqui na praça do FE. O que vem deles é tratado como
+"o que precisa ser verdade para o Bananza ficar certo", e o desenho é refeito sobre o deste fork com o custo
+medido no FE.
 
 ### 3.1 Command lists escritas pela GPU (Eglantine e Lichii) — central
 
@@ -175,7 +184,9 @@ de trás, justamente a que limita. Duas opções, decididas pela medição:
   Zero espera no FE se ele nunca ler listas escritas pela GPU.
 
 Recomendação: implementar as duas atrás da chave (`=1` A, `=2` B), medir esperas por segundo no FE e no
-Bananza e escolher o padrão pelos números.
+Bananza e escolher o padrão pelos números. Ponto de partida: **B como padrão**. A é o desenho de forks que
+rodam o FE a ~14 FPS contra ~21 aqui. Isso não prova que a espera por entrada é a causa da diferença, mas
+basta para não adotá-la sem número. A só vira padrão se custar ~0 no FE.
 
 **Riscos:** bitmap "para sempre" faz páginas reaproveitadas pelo jogo para outra coisa pagarem o caminho
 lento (o Lichii trata isso relendo da memória enquanto nenhuma escrita nova acontecer). O flush roda na
@@ -185,7 +196,8 @@ trás drenada). Há interação com entradas retomadas depois de um acquire (`co
 ### 4.2 Fase B: correções pequenas
 
 - 15126fb (faixas por download), seção 3.2.
-- #256 (arrays de ids), seção 3.3, só se as estatísticas mostrarem consultas restantes.
+- #256 (arrays de ids), seção 3.3, só se as estatísticas mostrarem consultas restantes. Prioridade baixa:
+  os forks têm o #256 e são mais lentos no FE; o reaproveitamento de bancos daqui já cobre o grosso.
 
 ### 4.3 Fase C: medir a rede DLSS do FE
 
@@ -241,6 +253,9 @@ pela CPU. Só vale se os contadores da fase A mostrarem muitas esperas no Bananz
    volume que torne isso caro?
 5. O `RefreshParametersImpl` deve voltar ao estado de antes do 6d3dd9a (só com Accurate ou bit 1), ou ficar
    ligado para nativos como rede de segurança até a fase A provar que cobre tudo?
+6. Os forks rodam o Bananza com o chão certo em Fast? Se sim, é evidência a favor da hipótese (eles têm o
+   mecanismo de listas escritas pela GPU e não têm a releitura de macro fora do Accurate). O usuário pode
+   conferir com os builds que já baixou.
 
 ## 8. Referências
 
