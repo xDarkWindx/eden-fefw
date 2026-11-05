@@ -29,7 +29,6 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
-#include "core/hle/service/service.h"
 #include "core/memory.h"
 
 namespace Service {
@@ -577,14 +576,23 @@ std::string HLERequestContext::Description() const {
 
 namespace IPC {
 
+namespace {
+// The service handling a request on this thread. Looking the handler up through the context's
+// session manager was not safe: on a Donkey Kong Bananza video session it led a dynamic_cast to
+// an object without type information (std::__non_rtti_object) and closed the emulator.
+thread_local std::string_view current_service_name;
+} // Anonymous namespace
+
+ScopedServiceName::ScopedServiceName(std::string_view name)
+    : previous{std::exchange(current_service_name, name)} {}
+
+ScopedServiceName::~ScopedServiceName() {
+    current_service_name = previous;
+}
+
 void ReportNotImplementedReply(Service::HLERequestContext& ctx) {
-    std::string service{"unknown service"};
-    if (const auto manager = ctx.GetManager(); manager && manager->HasSessionHandler()) {
-        if (const auto* framework =
-                dynamic_cast<const Service::ServiceFrameworkBase*>(&manager->SessionHandler())) {
-            service = std::string{framework->GetServiceName()};
-        }
-    }
+    const std::string service{current_service_name.empty() ? std::string_view{"unknown service"}
+                                                           : current_service_name};
     const u32 command = ctx.GetCommand();
     static std::mutex mutex;
     static std::set<std::pair<std::string, u32>> reported;

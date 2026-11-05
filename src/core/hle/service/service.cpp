@@ -139,6 +139,7 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
     const auto guard = LockService();
+    const IPC::ScopedServiceName scoped_name{GetServiceName()};
 
     Result result = ResultSuccess;
 

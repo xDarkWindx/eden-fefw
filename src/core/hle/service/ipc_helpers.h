@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <memory>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include "common/assert.h"
@@ -27,6 +28,17 @@ constexpr Result ResultSessionClosed{ErrorModule::HIPC, 301};
 
 /// Logs, once per service and command, a reply carrying kernel ResultNotImplemented (2001-0033).
 void ReportNotImplementedReply(Service::HLERequestContext& ctx);
+
+/// Names the service whose request handler runs on this thread, for ReportNotImplementedReply.
+struct ScopedServiceName {
+    explicit ScopedServiceName(std::string_view name);
+    ~ScopedServiceName();
+    ScopedServiceName(const ScopedServiceName&) = delete;
+    ScopedServiceName& operator=(const ScopedServiceName&) = delete;
+
+private:
+    std::string_view previous;
+};
 
 struct ResponseBuilder {
     /// Flags used for customizing the behavior of ResponseBuilder
