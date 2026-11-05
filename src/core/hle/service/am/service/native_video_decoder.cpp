@@ -2,6 +2,7 @@
 
 #include "core/core.h"
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -593,6 +594,26 @@ private:
         for (u32 word : properties) rb.Push(word);
     }
 
+    void WaitForReleaseFence(u32 syncpoint, u32 value) {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        constexpr u32 SyncpointCount = 192; // Host1x::SyncpointManager's table size
+        if (syncpoint >= SyncpointCount) {
+            return;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
+        while (!syncpoints.IsReadyGuest(syncpoint, value)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                static std::atomic<u32> late{};
+                if (late.fetch_add(1) < 16) {
+                    LOG_WARNING(Service_AM, "native video release fence ({}, {}) not reached after 100 ms; writing the image anyway",
+                                syncpoint, value);
+                }
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
     void ReleaseImage(HLERequestContext& ctx) {
         const auto* packet = ctx.CommandBuffer();
         Result result = Kernel::ResultInvalidCombination;
@@ -603,8 +624,22 @@ private:
                 const auto image = std::ranges::find(registered_images, packet[2], &RegisteredImage::id);
                 result = Kernel::ResultNotFound;
                 if (image != registered_images.end()) {
-                    result = Kernel::ResultNotImplemented;
-                    if (!(packet[4] || packet[5] || packet[6] || packet[7])) {
+                    // Words 4-7 are the client's release fence, a NativeSyncHandle {~syncpoint,
+                    // mode, u64 value}: the image may be rewritten once its reads have passed it.
+                    // Donkey Kong Bananza's movie player releases with one, and aborted on the
+                    // 2001-0033 this returned. The next frame is written into the image within
+                    // this call, so wait for the fence first, up to 100 ms as Eglantine does:
+                    // past that, write anyway, as a late fence costs a torn video frame at worst.
+                    // Like Eglantine, wait on the low value word whatever the mode; an unusual
+                    // mode or high word is logged once.
+                    if (packet[4] || packet[5] || packet[6] || packet[7]) {
+                        if ((packet[5] || packet[7]) && !std::exchange(logged_unusual_release_fence, true)) {
+                            LOG_WARNING(Service_AM, "native video release fence with mode {:#x}, high value {:#x}",
+                                        packet[5], packet[7]);
+                        }
+                        WaitForReleaseFence(~packet[4], packet[6]);
+                    }
+                    { // Hand the image back to the decoder.
                         result = Kernel::ResultInvalidState;
                         if (!image->available) {
                             completion_value = ++next_completion_value;
@@ -630,11 +665,6 @@ private:
                     }
                 }
             }
-        }
-        if (result == Kernel::ResultNotImplemented) {
-            // A release that waits on a fence is not handled; make it visible, the game aborts on it.
-            LOG_WARNING(Service_AM, "native video release image={} with a fence is unsupported: {:#x} {:#x} {:#x} {:#x}",
-                        packet[2], packet[4], packet[5], packet[6], packet[7]);
         }
         LOG_DEBUG(Service_AM, "native video release image={}, threshold={}, result={:#x}", packet[2], completion_value, result.raw);
         IPC::ResponseBuilder rb{ctx, 10};
@@ -976,6 +1006,7 @@ private:
         std::chrono::steady_clock::duration decode{}, convert{}, write{};
         u32 frames{};
     } timing;
+    bool logged_unusual_release_fence{};
     std::vector<u8> rgba_buffer; // Reused between frames, see PumpOutput.
     std::vector<u8> tiled_buffer;
     std::array<u32, 3> rgba_buffer_shape{};
