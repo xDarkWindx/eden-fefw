@@ -9,6 +9,9 @@ dos commits ou docs dos forks, não reproduzido aqui) ou **hipótese**.
 
 Documento para revisão crítica. As perguntas abertas estão na seção 7.
 
+Este plano é o primeiro caso concreto de `docs/architecture-plan.md` (passo 2: tabela de estado de página
+com o consumidor "busca de command list"). O desenho daqui deve seguir aquele, não o contrário.
+
 ## 0. Resumo
 
 1. **Problema do Bananza:** o terreno destrutível some em Fast. Com a releitura dos parâmetros de macro
