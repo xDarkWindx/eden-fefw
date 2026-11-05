@@ -86,9 +86,11 @@ inline bool Holds(const Condition& c, std::uint32_t current) {
 // Memory contract
 // ---------------------------------------------------------------------------
 
-// A transfer stops being valid when a later producer or the guest CPU writes the
-// requested ranges, or when the GPU address space is remapped. The consumer does not
-// need to know which one happened.
+// A transfer stops being valid when a producer is recorded or the guest CPU writes any
+// page of the region it covers, or when the GPU address space is remapped. The consumer
+// does not need to know which one happened. The region is the whole one the entry asked
+// about, not only what was copied: "the GPU wrote nothing here" is information too, and
+// goes stale the same way.
 struct ValidUntil {
     std::uint64_t map_epoch = 0;
     std::uint64_t range_epoch = 0;
@@ -99,7 +101,11 @@ struct Fence {
 };
 
 struct Transfer {
-    // What the consumer asked for (pages the filter says a producer may have written).
+    // Whole region the entry consulted (every physical word it had at fetch time). The
+    // validity protects all of it, including pages the filter discarded.
+    std::vector<PhysRange> covered;
+    // Part of `covered` that was actually sent for copying (pages the filter says a
+    // producer may have written). Empty when the filter found nothing.
     std::vector<PhysRange> requested;
     // Filled by the owner (back thread) when the copy is recorded: the exact GPU written
     // sub-ranges, their words and the producers they came from. Read only after
@@ -115,9 +121,12 @@ struct Transfer {
 class MemoryContract {
 public:
     virtual ~MemoryContract() = default;
-    // Transfer of the GPU produced words in `ranges`, ordered at the caller's current
+    // Transfer of the GPU produced words in `covered`, ordered at the caller's current
     // stream position: it includes every producer pushed before and none pushed after.
-    virtual std::shared_ptr<Transfer> Request(const std::vector<PhysRange>& ranges) = 0;
+    // The contract applies its own page filter to decide what to copy, and captures the
+    // validity of the whole of `covered` before reading the filter, so a producer recorded
+    // in between makes the transfer invalid rather than silently missing.
+    virtual std::shared_ptr<Transfer> Request(const std::vector<PhysRange>& covered) = 0;
     virtual void Wait(const Transfer& transfer) = 0;
     virtual bool IsValid(const Transfer& transfer) const = 0;
 };
@@ -220,11 +229,9 @@ public:
         : rule_{rule}, memory_{memory}, back_{back}, honor_valid_until_{honor_valid_until} {}
 
     // `snapshot` holds the words captured at submission, `phys` the physical address each
-    // of them has now (translated at fetch time). `filter` says which of those pages a
-    // producer may have written; only those are requested.
-    template <typename PageFilter>
+    // of them has now (translated at fetch time).
     EntryWords Fetch(const FetchContext& ctx, std::uint32_t va, const std::vector<Word>& snapshot,
-                     const std::vector<std::uint32_t>& phys, PageFilter&& filter) {
+                     const std::vector<std::uint32_t>& phys) {
         EntryWords out;
         out.plan = rule_.BeforeFetch(ctx);
         if (out.plan.wait_back) {
@@ -243,18 +250,15 @@ public:
             used_phys = &it->second.second;
             out.reused_transfer = true;
         } else {
-            std::vector<PhysRange> wanted;
+            std::vector<PhysRange> covered;
             for (std::uint32_t pa : phys) {
-                if (!filter(pa)) {
-                    continue;
-                }
-                if (!wanted.empty() && wanted.back().end == pa) {
-                    ++wanted.back().end;
+                if (!covered.empty() && covered.back().end == pa) {
+                    ++covered.back().end;
                 } else {
-                    wanted.push_back({pa, pa + 1});
+                    covered.push_back({pa, pa + 1});
                 }
             }
-            auto fresh = memory_.Request(wanted);
+            auto fresh = memory_.Request(covered);
             memory_.Wait(*fresh);
             transfer = fresh;
             cache_[key] = {fresh, phys};

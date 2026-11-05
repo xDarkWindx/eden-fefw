@@ -15,6 +15,11 @@ está na seção 10; as seções 0, 4.1, 4.2, 5, 6 e 7 foram corrigidas no lugar
 dependências de host precisam ser satisfeitas, não só processadas, e o consumidor só vem depois de casos
 dirigidos.
 
+**Revisão 3 (2026-11-05):** incorpora o resultado do harness dos contratos (`tools/gpu-contract-harness/`,
+tarefa T1) e a revisão dele. O que mudou está na seção 11; as seções 4.2, 5 e 7 foram corrigidas no lugar.
+A principal mudança: `exact-drain` passa a ser a regra exata e o padrão do consumidor; a regra "depois de
+dependência satisfeita" vira otimização condicionada, desligada por padrão.
+
 Este plano é o primeiro caso concreto de `docs/architecture-plan.md`. O desenho daqui segue aquele.
 
 ## 0. Resumo
@@ -197,7 +202,8 @@ Só pode ser chamado de exato depois dos casos da 4.1.4.
 **Versão de uma entrada (definição):** o snapshot da submissão com as faixas escritas por todo produtor
 enviado ao ring **antes** da entrada, e só por eles. Produtores enviados entre a espera de host e a entrada
 entram (na ordem do fluxo eles vêm antes); no hardware a visibilidade deles sem espera é indefinida, e
-esta é uma escolha, documentada.
+esta é uma escolha, documentada. **Revisão 3:** com essa definição, a regra do item 2 abaixo não é exata
+(contraexemplo `producer_after_wait_new_page` do harness, seção 11).
 
 **Protocolo:**
 
@@ -236,10 +242,22 @@ esta é uma escolha, documentada.
    essas escritas (o mecanismo de escritas seguradas já existe) até a entrada passar, ou preservar a saída
    do produtor no momento em que ele escreve.
 
-**Sem a regra do item 2:** a única opção exata é esperar a thread de trás chegar à entrada (todo o trabalho
-anterior) em **toda** entrada enquanto houver produtor na fila. Ela é conservadora de verdade e cara no FE.
-Por isso fica só como política opt-in (`list_fetch=exact-drain`), nunca como padrão. Um jogo que precisar
-dela a liga na configuração por jogo, e os outros não pagam.
+**Regra de visibilidade (revisão 3).** O item 2 decide **quando** a frente pode confiar no filtro. Há duas
+implementações, trocáveis num ponto só (`VisibilityRule` em `tools/gpu-contract-harness/contracts.h`):
+
+- **`exact-drain` (regra exata, padrão):** enquanto houver produtor na fila (enviado e ainda não gravado
+  pela thread de trás), a entrada espera a thread de trás chegar até ela; só então consulta o filtro. No
+  harness passa em todos os casos e escalonamentos (**medido no modelo**, seção 11). É cara no FE só quando há
+  produtor na fila no momento do fetch; esse custo ainda **não foi medido** no jogo e entra no orçamento de
+  `docs/architecture-plan.md` 12.1.
+- **`after-satisfied-dependency` (otimização, desligada por padrão):** espera a dependência nova ser
+  satisfeita e a thread de trás passar dela, e depois confia no filtro. Só é exata com uma **garantia
+  adicional sobre os produtores**: todo produtor que uma entrada consome passou por uma dependência
+  satisfeita **e** não há produtor numa página ainda não marcada entre essa dependência e o fetch. O harness
+  tem dois contraexemplos (seção 11): `no_dependency` (nada entre produtor e fetch) e
+  `producer_after_wait_new_page` (produtor depois da espera, em página nova, que a definição de versão
+  inclui). Só pode ser ligada por escolha explícita, se o diagnóstico (4.1.2, escritas perdidas) e mais
+  jogos mostrarem que a garantia vale, e mesmo assim com o verificador por amostragem.
 
 **Riscos:** produtores fora do buffer cache não marcam o bitmap (inventário da seção 7, item 3). Bits nunca
 limpos geram falsos positivos; medir contra entradas com bytes realmente diferentes. A espera real do
@@ -247,8 +265,9 @@ acquire de syncpoint muda o comportamento de todos os jogos que usam syncpoint, 
 chave própria, com A/B no FE.
 
 **Chave e padrão:** `EDEN_GPU_LISTS=0/1`, padrão 0 até passar nos casos dirigidos e no Bananza. Depois
-disso, o padrão segue `docs/architecture-plan.md`, seção 12.3: o modo exato mais barato que couber no
-orçamento, mesmo com um custo pequeno no FE.
+disso, o padrão é `exact-drain` se couber no orçamento (`docs/architecture-plan.md` 12.1), mesmo com um custo
+pequeno no FE; `after-satisfied-dependency` não é candidata a padrão enquanto a garantia acima não estiver
+demonstrada.
 
 ### 4.3 Releitura de macro
 
@@ -270,7 +289,8 @@ Seção 3.4.
 1. Matriz 4.1.1 (usuário) e, no mesmo build, FE na praça com `EDEN_NX2_MACRO_REFRESH=0` e `=1`.
 2. Build de diagnóstico 4.1.2 (código), no Bananza e no FE.
 3. Teste e port do 15126fb (independente).
-4. Harness com os casos dirigidos da 4.1.4.
+4. Harness com os casos dirigidos da 4.1.4. **Feito no modelo** (`tools/gpu-contract-harness/`, seção 11);
+   ainda falta o harness com `DmaPusher` e puller reais.
 5. Espera real do acquire de syncpoint, atrás de chave, com A/B no FE.
 6. Consumidor 4.2, opt-in. Aceite: casos dirigidos passando; chão certo no Bananza em Fast; no FE, draws/s
    da praça e do palácio ≥ os de antes do 6d3dd9a, e o custo fixo medido (marcações, consultas, esperas).
@@ -293,6 +313,9 @@ Seção 3.4.
    parte; o resto depende de mais jogos.
 2. Para o reuso pela CPU (4.2, item 6): segurar as escritas da CPU ou preservar a saída do produtor? A
    primeira reaproveita um mecanismo existente; a segunda custa uma cópia por produtor em página candidata.
+   **Revisão 3:** no modelo, segurar o upload das escritas sobre entradas submetidas e não buscadas basta
+   (`cpu_reuse`), e sem isso o caso falha (`cpu_reuse_no_hold`). Falta conferir o mecanismo real de escritas
+   seguradas (junção por página, limites) contra isso.
 3. Inventário de produtores: storage buffers de draws e compute, imagens, storage images e render targets
    com alias, queries, escritas de CPU e HLE, cópias, mudanças de mapeamento. Quais podem produzir comandos?
 4. O caminho de entradas retomadas (`UnsafeRead`) já causa problemas hoje? O diagnóstico conta.
@@ -339,3 +362,20 @@ Seção 3.4.
 | 3 | `gpu_modified_ranges` não guarda versões; a cópia pode pegar uma versão posterior; reuso pela CPU não é necessariamente corrida do jogo | Sim; o reuso legal vem das conclusões sinalizadas antes da hora (`fence_manager.h:80-96`) | Versão definida pela posição da entrada no ring, com a cópia ordenada ali (item 3); reuso pela CPU como item 6, com duas saídas a decidir |
 | 4 | O diagnóstico tem pontos cegos e não pode confirmar o que a 4.1.3 prometia | Sim | Diagnóstico cobre entradas retomadas, conta escritas perdidas e declara o que não cobre; 4.1.3 rebaixada; casos dirigidos (4.1.4) |
 | 5 | "~0 entradas filtradas ⇒ grátis no FE" | Sim | Frase trocada pela da revisão |
+
+## 11. Revisão 3: harness dos contratos (T1) e revisão dele
+
+Fonte: `tools/gpu-contract-harness/` (modelo com frente, trás e GPU falsos; `run.sh` com `-O2`, TSan e
+ASan+UBSan). Tudo aqui é **medido no modelo**, não no emulador; o que o modelo não cobre está no `README.md`
+dele.
+
+| # | Ponto | Conferido | Mudança |
+| --- | --- | --- | --- |
+| 1 | A regra "produtor visível só depois de dependência satisfeita" é exata? | Não. `no_dependency` e `producer_after_wait_new_page` falham com ela (`WordMismatch`, no aleatório e em todos os forçados menos o `eager`, onde não há janela). O segundo mostra que a regra contradiz a própria definição de versão: um produtor entre a espera e o fetch, em página nova, entra na definição e fica fora do filtro | 4.2: `exact-drain` é a regra exata e o padrão; `after-satisfied-dependency` vira otimização condicionada a uma garantia adicional sobre os produtores, desligada por padrão |
+| 2 | Segurar escritas da CPU sobre entradas submetidas e não buscadas | Necessário: `cpu_reuse_no_hold` falha (`WordMismatch`) no aleatório, `gpu-lags` e `eager`, e **passa** em `back-lags` (o upload vem antes do produtor, que escreve por cima). Um escalonamento só não basta para pegar | Pergunta 7.2 respondida no modelo; o mecanismo real precisa ser conferido |
+| 3 | Upload das escritas da CPU por palavra (faixas exatas), não por página | Necessário: `partial_page_write_page_upload` falha sempre (`WordMismatch`); o upload da página inteira apaga as palavras da GPU (o caso do Lichii b13c4c1) | Requisito do consumidor e do mecanismo de upload |
+| 4 | `valid_until` conferido antes de reaproveitar uma transferência (inclui época do mapeamento) | Necessário: `remap_ignore_valid_until` falha sempre (`WordMismatch`) | Requisito do consumidor |
+| 5 | Acquire de syncpoint satisfeito pelo valor do host (`IncrementHost`), não pelo do guest | Necessário: `other_channel_guest_value` falha (`DependencyViolated`) em todos os escalonamentos menos `eager`: a entrada começa antes de a GPU concluir. As palavras ainda saem certas, porque a cópia é ordenada; o que se viola é a dependência | Reforça 4.2, item 2, e o passo 5.5 |
+| 6 | Bug do cache (revisão do T1): a validade cobria só as faixas copiadas | Sim. Uma transferência vazia (o filtro não achou nada) ficava válida para sempre, e uma entrada em duas páginas não perdia a validade quando um produtor escrevia na página que o filtro tinha descartado. Com `exact-drain`, `stale_empty_transfer` e `stale_two_pages` falhavam (20/20 no `eager`, 28–37% no aleatório) | `Transfer` separa `requested` (o que foi copiado) de `covered` (a região inteira da entrada no fetch); `valid_until` cobre `covered`, e o contrato lê a validade antes do filtro. Os dois casos passam em todos os escalonamentos |
+| 7 | Negativos só diziam "falhou", sem dizer por quê | Sim | Negativos tipados: cada um declara o tipo de falha (`WordMismatch`, `DependencyViolated`...), e qualquer outro tipo reprova o teste |
+

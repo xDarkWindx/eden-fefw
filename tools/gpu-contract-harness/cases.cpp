@@ -147,7 +147,7 @@ std::vector<Case> BuildCases() {
         c.entries[1] = {Page(4), 64};
         c.channels = {{Produce(1, Page(4) + 16, 32), Submit(1),
                        Fetch(1, 0, Expected(Page(4), 64).Put(16, ProducerValues(1, 32)))}};
-        c.after_satisfied = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     { // Producer in channel 1, consumer in channel 0 after a syncpoint acquire. Channel 0
@@ -182,7 +182,7 @@ std::vector<Case> BuildCases() {
         c.name = "cpu_reuse_no_hold";
         c.title = "reuso pela CPU sem segurar escritas (negativo do mecanismo)";
         c.knobs.hold_cpu_writes = false;
-        c.after_satisfied = c.exact_drain = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     { // Two producers on the same range, the second one after the wait: the later wins.
@@ -204,7 +204,7 @@ std::vector<Case> BuildCases() {
                              Expected(va, 64)
                                  .Put(0, ProducerValues(1, 32))
                                  .Put(32, ProducerValues(2, 32)))}};
-        c.after_satisfied = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     { // Hyrule Warriors (Lichii 9e33027): compute writes 4 argument words to a page the
@@ -230,7 +230,7 @@ std::vector<Case> BuildCases() {
         c.name = "partial_page_write_page_upload";
         c.title = "escrita parcial com upload por pagina (negativo do mecanismo)";
         c.knobs.page_granular_upload = true;
-        c.after_satisfied = c.exact_drain = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     { // The GPU address space is remapped between the producer and a later consumer of
@@ -245,7 +245,7 @@ std::vector<Case> BuildCases() {
         c.name = "remap_ignore_valid_until";
         c.title = "remapeamento ignorando valid_until (negativo do mecanismo)";
         c.knobs.honor_valid_until = false;
-        c.after_satisfied = c.exact_drain = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     { // The syncpoint the consumer waits on is only satisfied at GPU completion; the
@@ -254,7 +254,7 @@ std::vector<Case> BuildCases() {
         c.name = "other_channel_guest_value";
         c.title = "acquire de syncpoint pelo valor do guest (negativo do mecanismo)";
         c.knobs.acquire_uses_guest_value = true;
-        c.after_satisfied = c.exact_drain = Expect::FailInSomeForcedSchedule;
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::DependencyViolated);
         cases.push_back(c);
     }
     { // A value that never arrives: channel 0 ends suspended with a diagnostic and its
@@ -279,6 +279,29 @@ std::vector<Case> BuildCases() {
         c.expect_continued = {0};
         cases.push_back(c);
     }
+    { // A transfer that found no GPU data is information too: once a producer writes the
+      // page, a cached empty transfer must stop being valid.
+        Case c{"stale_empty_transfer", "transferencia vazia em cache, produtor depois"};
+        c.entries[1] = {Page(0), 64};
+        c.channels = {{Submit(1), Fetch(1, 0, Expected(Page(0), 64)), Produce(1, Page(0), 32),
+                       Simple(OpKind::Wfi),
+                       Fetch(1, 0, Expected(Page(0), 64).Put(0, ProducerValues(1, 32)))}};
+        cases.push_back(c);
+    }
+    { // The entry spans two pages; the first fetch copies only the marked one. A later
+      // producer on the other page must invalidate the cached transfer.
+        Case c{"stale_two_pages", "transferencia em cache, produtor na pagina que o filtro descartou"};
+        const std::uint32_t va = Page(1) + 1000;
+        c.entries[1] = {va, 48};
+        c.channels = {{Produce(1, va, 8), Simple(OpKind::Wfi), Submit(1),
+                       Fetch(1, 0, Expected(va, 48).Put(0, ProducerValues(1, 8))),
+                       Produce(2, Page(2), 16), Simple(OpKind::Wfi),
+                       Fetch(1, 0,
+                             Expected(va, 48)
+                                 .Put(0, ProducerValues(1, 8))
+                                 .Put(24, ProducerValues(2, 16)))}};
+        cases.push_back(c);
+    }
     return cases;
 }
 
@@ -287,17 +310,18 @@ struct Tally {
     std::uint64_t failures = 0;
     std::uint64_t missed = 0;
     std::uint64_t early = 0;
+    std::uint32_t kinds = 0;
     std::string first_failure;
     std::string diagnostic;
 };
 
-const char* ExpectName(Expect e) {
-    switch (e) {
-    case Expect::Pass:
+std::string ExpectName(const Expect& e) {
+    switch (e.mode) {
+    case Expect::Mode::Pass:
         return "pass";
-    case Expect::FailInSomeForcedSchedule:
-        return "must fail";
-    case Expect::Info:
+    case Expect::Mode::Fail:
+        return std::string("fail:") + FailureKindName(e.kind);
+    case Expect::Mode::Info:
         return "info";
     }
     return "?";
@@ -341,7 +365,7 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(random_runs),
                 static_cast<unsigned long long>(forced_runs),
                 static_cast<unsigned long long>(seed));
-    std::printf("%-30s %-28s %-9s | %-11s %-11s %-11s %-11s %-11s | %s\n", "case", "rule",
+    std::printf("%-30s %-28s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n", "case", "rule",
                 "expect", "random", "back-lags", "gpu-lags", "both-lag", "eager", "verdict");
 
     bool all_ok = true;
@@ -353,7 +377,7 @@ int main(int argc, char** argv) {
         for (const contracts::VisibilityRule* rule : rules) {
             const Expect expect = rule == &after_satisfied ? c.after_satisfied
                                   : rule == &exact_drain   ? c.exact_drain
-                                                           : Expect::Info;
+                                                           : Expect::Informative();
             Tally tallies[5];
             for (int s = 0; s < 5; ++s) {
                 const std::uint64_t n = s == 0 ? random_runs : forced_runs;
@@ -364,6 +388,7 @@ int main(int argc, char** argv) {
                     t.missed += r.missed_writes;
                     t.early += r.early_completion_observed ? 1 : 0;
                     if (!r.ok) {
+                        t.kinds |= r.failure_kinds;
                         if (t.failures++ == 0) {
                             t.first_failure = r.failure;
                         }
@@ -378,17 +403,31 @@ int main(int argc, char** argv) {
             }
             std::uint64_t total_failures = 0;
             std::uint64_t forced_failures = 0;
+            std::uint32_t kinds = 0;
             for (int s = 0; s < 5; ++s) {
                 total_failures += tallies[s].failures;
                 forced_failures += s == 0 ? 0 : tallies[s].failures;
+                kinds |= tallies[s].kinds;
             }
-            const char* verdict = "info";
-            if (expect == Expect::Pass) {
-                verdict = total_failures == 0 ? "OK" : "UNEXPECTED FAIL";
-            } else if (expect == Expect::FailInSomeForcedSchedule) {
-                verdict = forced_failures > 0 ? "OK (caught)" : "NOT CAUGHT";
+            const std::string found = FailureKindsName(kinds);
+            std::string verdict = "info (" + found + ")";
+            bool ok = true;
+            if (expect.mode == Expect::Mode::Pass) {
+                ok = total_failures == 0;
+                verdict = ok ? "OK" : "UNEXPECTED FAIL (" + found + ")";
+            } else if (expect.mode == Expect::Mode::Fail) {
+                // Caught in a forced schedule, and never failing for another reason.
+                const std::uint32_t want = static_cast<std::uint32_t>(expect.kind);
+                if (forced_failures == 0) {
+                    ok = false;
+                    verdict = "NOT CAUGHT (" + found + ")";
+                } else if (kinds != want) {
+                    ok = false;
+                    verdict = "WRONG KIND (" + found + ")";
+                } else {
+                    verdict = "OK (" + found + ")";
+                }
             }
-            const bool ok = expect == Expect::Info || verdict[0] == 'O';
             all_ok = all_ok && ok;
             char cells[5][16];
             for (int s = 0; s < 5; ++s) {
@@ -396,9 +435,9 @@ int main(int argc, char** argv) {
                               static_cast<unsigned long long>(tallies[s].failures),
                               static_cast<unsigned long long>(tallies[s].runs));
             }
-            std::printf("%-30s %-28s %-9s | %-11s %-11s %-11s %-11s %-11s | %s\n", c.name.c_str(),
-                        rule->Name(), ExpectName(expect), cells[0], cells[1], cells[2], cells[3],
-                        cells[4], verdict);
+            std::printf("%-30s %-28s %-24s | %-11s %-11s %-11s %-11s %-11s | %s\n", c.name.c_str(),
+                        rule->Name(), ExpectName(expect).c_str(), cells[0], cells[1], cells[2],
+                        cells[3], cells[4], verdict.c_str());
             if (verbose || !ok || (total_failures > 0 && rule != &never_wait)) {
                 for (int s = 0; s < 5; ++s) {
                     if (!tallies[s].first_failure.empty()) {

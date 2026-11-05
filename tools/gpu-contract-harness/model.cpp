@@ -37,6 +37,39 @@ const char* ScheduleName(Schedule s) {
     return "?";
 }
 
+const char* FailureKindName(FailureKind kind) {
+    switch (kind) {
+    case FailureKind::WordMismatch:
+        return "WordMismatch";
+    case FailureKind::DependencyViolated:
+        return "DependencyViolated";
+    case FailureKind::UnexpectedSuspend:
+        return "UnexpectedSuspend";
+    case FailureKind::MissingSuspend:
+        return "MissingSuspend";
+    case FailureKind::ContinueMismatch:
+        return "ContinueMismatch";
+    case FailureKind::Timeout:
+        return "Timeout";
+    case FailureKind::Hang:
+        return "Hang";
+    case FailureKind::CaseError:
+        return "CaseError";
+    }
+    return "?";
+}
+
+std::string FailureKindsName(std::uint32_t kinds) {
+    std::string out;
+    for (std::uint32_t bit = 1; bit != 0 && bit <= kinds; bit <<= 1) {
+        if (kinds & bit) {
+            out += (out.empty() ? "" : "+");
+            out += FailureKindName(static_cast<FailureKind>(bit));
+        }
+    }
+    return out.empty() ? "-" : out;
+}
+
 namespace {
 
 constexpr Seq kUnlimited = std::numeric_limits<Seq>::max();
@@ -272,7 +305,7 @@ public:
         }
         if (Clock::now() > deadline_) {
             aborted_.store(true, std::memory_order_release);
-            Fail("harness hang: watchdog expired");
+            Fail(FailureKind::Hang, "harness hang: watchdog expired");
             return true;
         }
         return false;
@@ -285,12 +318,29 @@ public:
         }
     }
 
-    std::shared_ptr<Transfer> Request(const std::vector<PhysRange>& ranges) {
+    std::shared_ptr<Transfer> Request(const std::vector<PhysRange>& covered) {
         auto transfer = std::make_shared<Transfer>();
-        transfer->requested = ranges;
+        transfer->covered = covered;
         transfer->completion_fence = std::make_shared<contracts::Fence>();
-        transfer->valid_until = CurrentValidity(ranges);
-        if (ranges.empty()) {
+        // Validity first, filter second. The back thread sets a page's filter bit before
+        // it bumps the page epoch, so either this read sees the new epoch (and then the
+        // filter read below sees the bit), or the epoch moves later and the transfer is
+        // invalid at its next use.
+        transfer->valid_until = CurrentValidity(covered);
+        for (const PhysRange& r : covered) {
+            for (std::uint32_t pa = r.begin; pa < r.end; ++pa) {
+                if (gpu_written_[pa / kPageWords].load(std::memory_order_acquire) == 0) {
+                    continue;
+                }
+                auto& req = transfer->requested;
+                if (!req.empty() && req.back().end == pa) {
+                    ++req.back().end;
+                } else {
+                    req.push_back({pa, pa + 1});
+                }
+            }
+        }
+        if (transfer->requested.empty()) {
             transfer->version = tail_seq_;
             transfer->completion_fence->signaled.store(true, std::memory_order_release);
             return transfer;
@@ -311,7 +361,7 @@ public:
     }
 
     bool IsValid(const Transfer& transfer) const {
-        const contracts::ValidUntil now = CurrentValidity(transfer.requested);
+        const contracts::ValidUntil now = CurrentValidity(transfer.covered);
         return now.map_epoch == transfer.valid_until.map_epoch &&
                now.range_epoch == transfer.valid_until.range_epoch;
     }
@@ -334,8 +384,9 @@ private:
         return v;
     }
 
-    void Fail(const std::string& why) {
+    void Fail(FailureKind kind, const std::string& why) {
         std::lock_guard lock{result_mutex_};
+        result_.failure_kinds |= static_cast<std::uint32_t>(kind);
         if (result_.ok) {
             result_.ok = false;
             result_.failure = why;
@@ -514,7 +565,7 @@ private:
                     PassDependency(ch, op);
                     return true;
                 case OnTimeout::Abort:
-                    Fail("aborted: " + diag.str());
+                    Fail(FailureKind::Timeout, "aborted: " + diag.str());
                     aborted_.store(true, std::memory_order_release);
                     break;
                 }
@@ -560,7 +611,7 @@ private:
             const std::uint32_t guest = guest_syncpoint_[op.index].load(std::memory_order_acquire);
             const std::uint32_t host = host_syncpoint_[op.index].load(std::memory_order_acquire);
             if (guest < op.value) {
-                Fail("case error: the guest cannot observe syncpoint " + std::to_string(op.index));
+                Fail(FailureKind::CaseError, "case error: the guest cannot observe syncpoint " + std::to_string(op.index));
             }
             if (host < op.value) {
                 result_.early_completion_observed = true;
@@ -596,7 +647,7 @@ private:
         if (op.require_host_syncpoint) {
             const std::uint32_t host = host_syncpoint_[op.index].load(std::memory_order_acquire);
             if (host < op.value) {
-                Fail("entry " + std::to_string(op.id) + " started before its dependency held: "
+                Fail(FailureKind::DependencyViolated, "entry " + std::to_string(op.id) + " started before its dependency held: "
                      "host syncpoint[" + std::to_string(op.index) + "] = " + std::to_string(host) +
                      " < " + std::to_string(op.value));
             }
@@ -611,9 +662,7 @@ private:
         ctx.producers_pushed = producers_pushed_;
         ctx.producers_recorded = producers_recorded_.load(std::memory_order_acquire);
         ctx.ring_tail = tail_seq_;
-        auto words = consumer_.Fetch(ctx, va, snapshot, phys, [this](std::uint32_t pa) {
-            return gpu_written_[pa / kPageWords].load(std::memory_order_acquire) != 0;
-        });
+        auto words = consumer_.Fetch(ctx, va, snapshot, phys);
         ch.new_dependencies.clear();
 
         // Diagnostic of the first-write blind spot: at the fetch position the back thread
@@ -636,7 +685,7 @@ private:
                     s << ' ' << p;
                 }
                 s << " }" << (words.reused_transfer ? ", reused cached transfer" : "") << ")";
-                Fail(s.str());
+                Fail(FailureKind::WordMismatch, s.str());
                 break;
             }
         }
@@ -929,20 +978,20 @@ private:
             const ChannelState& ch = channels_[c];
             const bool want_suspended = contains(case_.expect_suspended, c);
             if (want_suspended && !(ch.suspended && !ch.done)) {
-                Fail("channel " + std::to_string(c) + " should have been left suspended");
+                Fail(FailureKind::MissingSuspend, "channel " + std::to_string(c) + " should have been left suspended");
             }
             if (!want_suspended && !ch.done) {
-                Fail("channel " + std::to_string(c) + " did not finish: " +
+                Fail(FailureKind::UnexpectedSuspend, "channel " + std::to_string(c) + " did not finish: " +
                      result_.suspend_diagnostic);
             }
             if (contains(case_.expect_continued, c) != ch.continued) {
-                Fail("channel " + std::to_string(c) + (ch.continued ? " continued" : " did not continue") +
+                Fail(FailureKind::ContinueMismatch, "channel " + std::to_string(c) + (ch.continued ? " continued" : " did not continue") +
                      " after the timeout, contrary to the case");
             }
         }
         for (const auto& [id, state] : entries_) {
             if (contains(case_.expect_not_fetched, id) && state.fetched) {
-                Fail("entry " + std::to_string(id) + " was executed without its dependency");
+                Fail(FailureKind::DependencyViolated, "entry " + std::to_string(id) + " was executed without its dependency");
             }
         }
     }

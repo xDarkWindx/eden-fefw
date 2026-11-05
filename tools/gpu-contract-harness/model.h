@@ -93,7 +93,36 @@ struct Entry {
     std::uint32_t len;
 };
 
-enum class Expect { Pass, FailInSomeForcedSchedule, Info };
+// Kind of a failed run. A negative case declares the one kind it must produce; any
+// other kind showing up means the case broke for a different reason and fails the test.
+enum class FailureKind : std::uint32_t {
+    WordMismatch = 1u << 0,       // a fetch saw words other than the expected version
+    DependencyViolated = 1u << 1, // an entry ran before its dependency held
+    UnexpectedSuspend = 1u << 2,  // a channel did not finish (left suspended or stuck)
+    MissingSuspend = 1u << 3,     // a channel that had to end suspended did not
+    ContinueMismatch = 1u << 4,   // on_timeout=Continue taken or not, contrary to the case
+    Timeout = 1u << 5,            // a dependency hit its limit with on_timeout=Abort
+    Hang = 1u << 6,               // watchdog: the run did not finish
+    CaseError = 1u << 7,          // the script itself is inconsistent
+};
+const char* FailureKindName(FailureKind kind);
+std::string FailureKindsName(std::uint32_t kinds);
+
+struct Expect {
+    enum class Mode { Pass, Fail, Info } mode = Mode::Pass;
+    FailureKind kind = FailureKind::WordMismatch; // Fail: the only kind allowed
+
+    static Expect MustPass() {
+        return {};
+    }
+    // Must fail in at least one forced schedule, and only with `k`, in every schedule.
+    static Expect MustFail(FailureKind k) {
+        return {Mode::Fail, k};
+    }
+    static Expect Informative() {
+        return {Mode::Info, FailureKind::WordMismatch};
+    }
+};
 
 struct Case {
     std::string name;
@@ -101,8 +130,8 @@ struct Case {
     std::vector<std::vector<Op>> channels;
     std::map<std::uint32_t, Entry> entries;
     ModelKnobs knobs{};
-    Expect after_satisfied = Expect::Pass;
-    Expect exact_drain = Expect::Pass;
+    Expect after_satisfied = Expect::MustPass();
+    Expect exact_drain = Expect::MustPass();
     std::vector<std::uint32_t> expect_suspended;   // channels left suspended
     std::vector<std::uint32_t> expect_continued;   // channels that continued after timeout
     std::vector<std::uint32_t> expect_not_fetched; // entries never fetched
@@ -110,7 +139,8 @@ struct Case {
 
 struct RunResult {
     bool ok = true;
-    std::string failure;
+    std::uint32_t failure_kinds = 0; // FailureKind bits of every failure in the run
+    std::string failure;             // message of the first one
     std::uint64_t missed_writes = 0;
     std::string missed_diagnostic;
     bool suspended = false;

@@ -37,12 +37,17 @@ diagnósticos de suspensão e as escritas perdidas).
   `SignalFenceCoalesced` em Fast) e o do host só quando a GPU executa (`IncrementHost`).
 - **Filtro:** 1 bit por página de 4 KiB, ligado pela thread de trás quando grava um produtor. O dono (thread
   de trás) guarda as faixas exatas escritas pela GPU e decide as faixas da transferência.
-- **Transferência:** a frente pede as faixas da entrada nas páginas marcadas; o pedido entra no ring na
-  posição da entrada; a thread de trás sobe antes as escritas da CPU pendentes nessas faixas (palavra a
+- **Transferência:** a frente passa ao contrato de memória a região inteira da entrada (`covered`, todas as
+  palavras físicas no momento da busca); o contrato aplica o filtro e manda copiar só as páginas marcadas
+  (`requested`); o pedido entra no ring na posição da entrada; a thread de trás sobe antes as escritas da CPU pendentes nessas faixas (palavra a
   palavra) e grava a cópia; a GPU copia e sinaliza a fence; a frente sobrepõe ao snapshot.
-- **Validade:** `valid_until` guarda a época do mapeamento e a soma das épocas das páginas pedidas (sobem
-  com produtor gravado e escrita da CPU). O consumidor só reaproveita uma transferência em cache se a regra
-  não mandou esperar e ela ainda vale.
+- **Validade:** `valid_until` guarda a época do mapeamento e a soma das épocas de **todas** as páginas de
+  `covered`, inclusive as que o filtro descartou (sobem com produtor gravado e escrita da CPU). "A GPU não
+  escreveu nada aqui" também é informação e envelhece do mesmo jeito. A validade é lida antes do filtro, e
+  a thread de trás liga o bit do filtro antes de subir a época, então um produtor gravado no meio deixa a
+  transferência inválida em vez de sumir. O consumidor só reaproveita uma transferência em cache se a regra
+  não mandou esperar e ela ainda vale. Produtores enviados e ainda não gravados não mexem na época: cobri-los
+  é papel da regra de visibilidade.
 - **Escritas da CPU seguradas:** uma escrita sobre uma entrada submetida e ainda não buscada vai para a
   memória do jogo, mas o upload dela para o host fica segurado até a última busca dessa entrada.
 - **Dependências:** acquires de semáforo e de syncpoint estacionam o canal (a frente continua os outros) até
@@ -66,8 +71,21 @@ verificador compara palavra a palavra.
 | `both-lag` | Os dois. |
 | `eager` | Depois de cada envio a frente espera trás e GPU esvaziarem (nenhuma janela). Mostra o que um escalonamento "bonzinho" esconde. |
 
-Um caso "pass" não pode falhar em nenhum escalonamento. Um caso "must fail" tem de falhar em pelo menos um
-escalonamento forçado (aleatório pode não falhar).
+Um caso "pass" não pode falhar em nenhum escalonamento. Um negativo declara o **tipo** de falha esperado
+(`fail:WordMismatch`, `fail:DependencyViolated`...): tem de falhar em pelo menos um escalonamento forçado
+(aleatório pode não falhar), e qualquer falha de outro tipo, em qualquer escalonamento, reprova o teste
+("WRONG KIND"). A coluna de veredito mostra os tipos encontrados.
+
+| Tipo | Quando |
+| --- | --- |
+| `WordMismatch` | uma busca viu palavras diferentes da versão esperada |
+| `DependencyViolated` | uma entrada começou antes de a dependência valer, ou executou sem ela |
+| `UnexpectedSuspend` | um canal não terminou (ficou suspenso ou parado) sem o caso pedir |
+| `MissingSuspend` | um canal que tinha de terminar suspenso não terminou assim |
+| `ContinueMismatch` | `on_timeout=Continue` tomado ou não, ao contrário do caso |
+| `Timeout` | dependência estourou o limite com `on_timeout=Abort` |
+| `Hang` | o watchdog de 20 s expirou |
+| `CaseError` | o roteiro é inconsistente |
 
 ## Casos e o que cada um prova
 
@@ -85,15 +103,21 @@ escalonamento forçado (aleatório pode não falhar).
 | `remap` | produtor no VA X → página 12; busca; remapeia X → página 13; nova busca em X | a segunda busca vê só a página 13; a transferência em cache deixa de valer |
 | `never_arrives` | canal 0 espera syncpoint que nunca chega (limite 2 ms); canal 1 trabalha | canal 0 termina suspenso, com diagnóstico, sem executar a entrada; o canal 1 termina certo |
 | `never_arrives_continue` | igual, com `on_timeout = Continue` | a opção de compatibilidade segue sem a dependência e diz isso |
+| `stale_empty_transfer` | busca sem dados da GPU (transferência vazia em cache), produtor na mesma página, WFI, nova busca | a ausência de dados também perde a validade |
+| `stale_two_pages` | entrada em duas páginas, só uma marcada na primeira busca; produtor na outra, WFI, nova busca | a validade cobre a página que o filtro descartou |
+
+Os dois últimos reproduzem um bug da primeira versão do harness, em que a validade cobria só as faixas
+copiadas: com `exact-drain` eles falhavam (20/20 no `eager`, 28–37% no aleatório), porque a regra não manda
+esperar quando não há produtor na fila e o consumidor reaproveitava a transferência velha.
 
 Negativos dos mecanismos (cada um desliga uma peça e tem de falhar com as duas regras):
 
-| Caso | Peça desligada | Onde falha |
+| Caso | Peça desligada | Onde falha (tipo esperado) |
 | --- | --- | --- |
-| `cpu_reuse_no_hold` | segurar escritas da CPU | `gpu-lags`, `eager` e aleatório; **não** em `back-lags` (o upload acontece antes do produtor, que escreve por cima) |
-| `partial_page_write_page_upload` | upload por palavra (sobe a página inteira) | sempre |
-| `remap_ignore_valid_until` | conferir `valid_until` | sempre |
-| `other_channel_guest_value` | acquire de syncpoint pelo valor do host (usa o do guest) | em todos menos `eager` |
+| `cpu_reuse_no_hold` | segurar escritas da CPU | `gpu-lags`, `eager` e aleatório; **não** em `back-lags` (o upload acontece antes do produtor, que escreve por cima) — `WordMismatch` |
+| `partial_page_write_page_upload` | upload por palavra (sobe a página inteira) | sempre — `WordMismatch` |
+| `remap_ignore_valid_until` | conferir `valid_until` | sempre — `WordMismatch` |
+| `other_channel_guest_value` | acquire de syncpoint pelo valor do host (usa o do guest) | em todos menos `eager` — `DependencyViolated` |
 
 `NeverWait` é um controle do harness, não o comportamento atual do emulador: mostra quais casos dependem
 de alguma espera da regra.
