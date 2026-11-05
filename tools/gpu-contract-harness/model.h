@@ -96,6 +96,8 @@ enum class OpKind {
     CheckHost,     // host buffer [pa, ...) must equal `expected` once everything is drained
     CpuWriteHeld,  // (i) CPU write to a GPU-modified page: bytes into guest memory now, the
                    //     notice to the caches held until ApplyHeld (HandleRasterizerWrite)
+    CpuWriteHeldNotice, // (i-a, i-b) only: decide and register the notice; the bytes come later
+    CpuWriteHeldBytes,  // (i-c) only: the memcpy of a write whose notice was registered
     ApplyHeld,     // (iii) InvalidateGPUCache: apply the held notices (CachedWriteMemory)
 };
 

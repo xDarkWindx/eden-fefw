@@ -403,6 +403,48 @@ CPU leu (`buffer_cache_base.h:541-562`), então os vizinhos que a CPU nunca leu 
 bloco os troca pelos bytes antigos do guest e a subtração em `gpu_modified_ranges` impede que alguma coisa os
 devolva.
 
+### 7.3 Chamadores de `InvalidateGPUCache` e `Gather`: exclusão entre `Gather` do mesmo gerenciador
+
+Pedido pela revisão do desenho do T3 (`docs/list-diag-design.md`, 3.3). **Fato do código (verificado):** o `guard`
+do `GPUDirtyMemoryManager::Gather` protege só a troca dos buffers (`core/gpu_dirty_memory_manager.h:59-64`); a
+iteração e o `clear()` do `front_buffer` ficam **fora** dele (`:66-81`). Dois `Gather` concorrentes no mesmo
+gerenciador seriam uma corrida sobre o `front_buffer`, **preexistente** e independente do livro-razão do T3. O
+único chamador de `System::GatherGPUDirtyMemory` é `gpu.cpp:134`, dentro de `InvalidateGPUCache`
+(`grep` em `src/`); o único chamador de `OnCachedWrites` é `gpu.cpp:162`.
+
+| # | Chamador | Thread com split | Thread sem split | Como confirmei |
+| --- | --- | --- | --- | --- |
+| 1 | `gpu_thread.cpp:79`, `Defer(InvalidateGPUCache)` no `SubmitList` | trás | (item 2) | lido |
+| 2 | `gpu_thread.cpp:106` | n/a | thread única | lido |
+| 3 | `gpu_thread.cpp:82`, `Defer(TickWork)` (a leitura do planejador dizia `:81`), que roda os pedidos síncronos (`gpu.cpp:197-208`), entre eles o do `OnCPURead` (`gpu.cpp:264-266`: `InvalidateGPUCache` e `FlushRegion`) | trás | `gpu_thread.cpp:109`, thread única | lido |
+| 4 | `TickWork` no fim de `PrepareDraw` (`vk_rasterizer.cpp:348`) e de `DrawTexture` (`:505`) | thread que prepara os draws (trás) | única | lido o trecho; que a frente não chama o rasterizador sem `Drain` é do plano (`docs/architecture-plan.md`, 3.3), não reaberto |
+| 5 | `fence_manager.h:139`, fim de `SignalFence`: roda na thread de **quem chama** `SignalFence`. Chamadores: `SignalSyncPoint` por `puller.cpp:133-138` (`OnBack`) e `maxwell_3d.cpp:682`; `SignalReference` por `puller.cpp:317` (`OnBack`); `WaitPendingFences` e `FlushCoalesced` por `ReleaseFences` via `OnBack` (`puller.cpp:131`), `OnCommandListEnd` (`dma_pusher.cpp:45-52`, `Defer`) e `OnGpuThreadIdle` (`gpu_thread.cpp:58`, `Defer`); `SignalFenceCoalesced` adiado (`kepler_compute.cpp:171`, `query_cache.h:296`) só com fences adiadas | trás | única | lido. `query_cache.h:586` (`RequestGuestHostSync` chama `ReleaseFences`): thread de quem chama o query cache; **não abri o chamador** |
+| 6a | **Frente, depois de `Drain`:** `dma_pusher.cpp:176-183`, `Drain` e `rasterizer->SignalFence` (só com "Sync Memory Operations") | **frente** | n/a | lido (a leitura do planejador já a tinha) |
+| 6b | **Frente, depois de `DrainBack`:** `puller.cpp:225` (`ReleaseFences(true)`), `:252`, `:259`, `:264` (`ReleaseFences()`, cujo padrão é `force = true`, `rasterizer_interface.h:104`), depois do `DrainBack` de `:186`; e `:291`, depois do de `:285`. `ReleaseFences` chama `WaitPendingFences(force)` (`vk_rasterizer.cpp:1113-1114`), que com `force` faz `SignalFence` (`fence_manager.h:148-172`) e portanto `InvalidateGPUCache` **na frente** | **frente** | n/a | lido. **Estes cinco não estavam na leitura do planejador** |
+| 7 | `puller.cpp:339` (`MemOpB`, `OnBack`) e `maxwell_3d.cpp:435` (`invalidate_texture_data_cache`, método do engine) | trás | única | lido o ponto de chamada; que o método do engine roda na trás (inclusive com as macros na frente, que mandam as escritas por `MacroWrite`, `gpu_split.h`) é **hipótese** |
+| 8 | **Thread de fences (`ReleaseThreadFunc`, `fence_manager.h:241-272`)** | **não chama** | n/a | lido: espera a fence, `PopAsyncFlushes` e executa as operações guardadas; nenhum chamador de `SignalFence` acima passa `InvalidateGPUCache` como operação (as que vi: `IncrementHost`, `[]{}`, a do bit de sync, a de espera de `WaitPendingFences`, escritas de query e de release de QMD) |
+| 9 | Threads da CPU do jogo e de HLE | não chamam | n/a | lido: `OnCPURead` só enfileira (`RequestSyncOperation`, `TickGPU`, `WaitForSyncOperation`, `gpu.cpp:261-270`) |
+
+**Por que a exclusão vale nos caminhos lidos, e por que só por convenção:**
+
+- **Com split**, a trás só executa o ring, e as chamadas diretas da frente (6a, 6b) vêm depois de um `Drain`. O
+  `Drain` volta quando `consumed == write_position` (`gpu_split.cpp:243-268`), e a trás grava `consumed` com
+  `seq_cst` **depois** de executar as entradas (`StoreConsumed`, `:211-218`, chamado de `:430` e `:434`); a frente
+  não envia nada entre o `Drain` e a chamada. O comentário de `puller.cpp:178-181` diz isso: "From here on the
+  back is idle, and the front may use the rasterizer until it sends more". Logo, o `InvalidateGPUCache` da frente
+  e o da trás **não se sobrepõem**. **Sem split**, é uma thread só.
+- **Nada impõe isso por trava.** É uma convenção do `Drain`; o `Gather` não a verifica. O `static thread_local`
+  de `gpu.cpp:129` e o comentário "Per thread: fences can also apply them" mostram que **mais de uma thread**
+  chama, não que sejam concorrentes.
+- **Não abri:** `GpuSplit::MaybeStart` e `Stop` (a transição do split no meio da sessão), o chamador de
+  `query_cache.h:586`, quem chama `PrepareDraw` e `DrawTexture`, e o dispatch de `maxwell_3d.cpp:435`. Se algum
+  deles violasse a exclusão, seria uma **possível falha preexistente** (corrida sobre o `front_buffer`), registrada
+  aqui e separada do livro-razão.
+- **Conclusão (leitura, não execução):** nenhuma violação encontrada nos caminhos lidos. Vira **precondição P0**
+  do protocolo do T3 (`docs/list-diag-design.md`, 3.3: um `Gather` por vez por gerenciador, aplicações na ordem
+  das retiradas). O diagnóstico **não** a corrige nem a esconde: conta `gather_overlapped` (`gather_active` não
+  nulo na entrada) e `apply_out_of_order`, e trata como ambíguos os lotes até ali.
+
 ### Pendências de localização
 
 **P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com

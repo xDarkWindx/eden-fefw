@@ -723,7 +723,21 @@ private:
         case OpKind::WaitBack:
             WaitBackPassed(tail_seq_);
             return true;
-        case OpKind::CpuWriteHeld: {
+        case OpKind::CpuWriteHeld:
+        case OpKind::CpuWriteHeldNotice:
+        case OpKind::CpuWriteHeldBytes: {
+            // The combined op does (i-a), (i-b) and (i-c) in a row. The split ops let a case put
+            // another step (the application of the notice) between the notice and the memcpy:
+            // the emulator registers the notice inside GetPointerImpl and the caller does the
+            // memcpy afterwards (core/memory.cpp:587-590, 649-653).
+            const bool do_notice = op.kind != OpKind::CpuWriteHeldBytes;
+            const bool do_bytes = op.kind != OpKind::CpuWriteHeldNotice;
+            if (!do_notice) {
+                // Only the bytes: nothing to do unless the notice op held this write.
+                if (split_pending_.erase(op.pa) == 0) {
+                    return true;
+                }
+            }
             std::vector<std::uint32_t> phys(op.values.size());
             for (std::size_t i = 0; i < phys.size(); ++i) {
                 phys[i] = op.pa + static_cast<std::uint32_t>(i);
@@ -731,8 +745,8 @@ private:
             // Critical section 1: OnCPUWrite under the buffer cache mutex decides whether the
             // page holds GPU data. Nothing else is done there for a held write: no
             // ClearDownload, no gpu_modified_ranges change (buffer_cache.h:169-174).
-            bool held = false;
-            {
+            bool held = !do_notice; // the bytes op only runs for a write that was held
+            if (do_notice) {
                 std::lock_guard dl{dl_mutex_};
                 for (std::uint32_t w : phys) {
                     const std::uint32_t page_begin = w / kPageWords * kPageWords;
@@ -758,19 +772,23 @@ private:
             // Critical section 2: GPUDirtyMemoryManager::Collect (core/memory.cpp:765). The
             // notice is the written words, or the 64-byte blocks that contain them
             // (notice_block_words): the bytes written to guest memory below stay the exact ones.
-            std::vector<std::uint32_t> notice = phys;
-            if (knobs_.notice_block_words != 0) {
-                const std::uint32_t block = knobs_.notice_block_words;
-                const std::uint32_t begin = phys.front() / block * block;
-                const std::uint32_t end = (phys.back() / block + 1) * block;
-                notice.clear();
-                for (std::uint32_t w = begin; w < end; ++w) {
-                    notice.push_back(w);
+            if (do_notice) {
+                std::vector<std::uint32_t> notice = phys;
+                if (knobs_.notice_block_words != 0) {
+                    const std::uint32_t block = knobs_.notice_block_words;
+                    const std::uint32_t begin = phys.front() / block * block;
+                    const std::uint32_t end = (phys.back() / block + 1) * block;
+                    notice.clear();
+                    for (std::uint32_t w = begin; w < end; ++w) {
+                        notice.push_back(w);
+                    }
                 }
-            }
-            {
                 std::lock_guard lock{held_mutex_};
                 held_notices_.push_back(std::move(notice));
+            }
+            if (!do_bytes) {
+                split_pending_.insert(op.pa); // the memcpy comes with a later CpuWriteHeldBytes
+                return true;
             }
             // Critical section 3: the memcpy into guest memory, outside every cache lock.
             {
@@ -1413,6 +1431,7 @@ private:
     // A leaf-most lock: order guest_mutex_, dl_mutex_, then held_mutex_. The front takes it alone.
     std::mutex held_mutex_;
     std::vector<std::vector<std::uint32_t>> held_notices_;
+    std::set<std::uint32_t> split_pending_; // held writes whose memcpy is a separate op (front only)
     std::atomic<std::uint64_t> downloads_queued_{0};
     std::atomic<std::uint64_t> downloads_applied_{0};
 

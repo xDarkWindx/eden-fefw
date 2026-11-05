@@ -196,6 +196,20 @@ identificados por leitura, sem ocorrência medida. O positivo (avisos exatos) mo
 funciona, e **não decide** qual mecanismo integrar (por exemplo, guardar o intervalo exato no `Collect` ou
 subtrair as faixas da GPU do trecho que a aplicação sobe).
 
+### Terceira intercalação: a aplicação antes do `memcpy`
+
+O aviso segurado é registrado **antes** do `memcpy` (`core/memory.cpp:587-590` e `:649-653`: `HandleRasterizerWrite`
+roda dentro de `GetPointerImpl`, e o `memcpy` é do chamador). `CpuWriteHeldNotice` e `CpuWriteHeldBytes` separam os
+dois passos (o `CpuWriteHeld` de antes os faz em sequência), para um caso pôr a aplicação entre eles.
+
+| Caso | Roteiro | Onde falha (tipo esperado) |
+| --- | --- | --- |
+| `held_write_apply_before_memcpy` | **negativo:** a GPU escreve 16 palavras; o aviso é registrado (uma palavra); o `ApplyHeld` lê a palavra **velha** do guest e a sobe; só então o `memcpy` grava a palavra nova. O guest termina certo (`CheckGuest` passa) e o host fica com a velha, sem nenhum aviso novo que a corrija | todas as rodadas de todos os escalonamentos, nos dois modos de host (`WordMismatch`): determinístico |
+
+**Sem positivo:** nenhuma proteção foi modelada, e o diagnóstico do T3 **não** mede essa intercalação (exigiria um
+hook depois do `memcpy` no caminho quente de toda escrita da CPU; `docs/list-diag-design.md`, 3.5). O caso dá chão à
+limitação: o diagnóstico vê **avisos registrados**, não escritas concluídas.
+
 ## Resultado do último `run.sh`
 
 Preenchido ao fim da rodada que acompanha cada commit; o texto abaixo vale para o commit que o contém.

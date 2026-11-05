@@ -1,8 +1,8 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: proposta (revisão 1), aguardando aprovação. Nenhum código do emulador foi escrito.** Só o harness
-(`tools/gpu-contract-harness/`, item 4 do T3) e os planos foram alterados. Escrito em 2026-11-05 sobre `740b932`;
-revisado sobre `0fc35ad` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
+**Estado: proposta (revisão 2), aguardando aprovação. Nenhum código do emulador foi escrito.** Só os harnesses
+(`tools/gpu-contract-harness/` e `tools/list-diag-harness/`) e os planos foram alterados. Escrito em 2026-11-05 sobre `740b932`;
+revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
 Graus de certeza como nos outros docs: **verificado** (aberto e lido, com `arquivo:linha`), **medido** (de
@@ -90,6 +90,30 @@ Por isso há um **livro-razão próprio do diagnóstico** (3.4), com o intervalo
 
 ### 3.3 Vínculo entre aviso e aplicação: o lote
 
+**Precondição P0: um `Gather` por vez por gerenciador, e as aplicações de um gerenciador na ordem das retiradas.**
+O `guard` do `Gather` protege só a troca dos buffers (`core/gpu_dirty_memory_manager.h:59-64`); a iteração e o
+`clear()` do `front_buffer` ficam **fora** dele (`:66-81`, **verificado**). Dois `Gather` concorrentes no mesmo
+gerenciador seriam uma **corrida preexistente** sobre o `front_buffer`, independente do livro-razão. O inventário de
+todos os chamadores, com a thread de cada um, com e sem split, está em `docs/gpu-contract-inventory.md`, 7.3. Resumo,
+**confirmando a leitura do planejador, com uma ampliação**:
+
+- **Com split**, `gpu_thread.cpp:79` (`Defer`), `:82` (`Defer(TickWork)`, que roda o pedido síncrono do `OnCPURead`,
+  `gpu.cpp:264-266`), `fence_manager.h:139` (fim de `SignalFence`, na thread de quem a chama), `puller.cpp:339` e
+  `maxwell_3d.cpp:435` rodam na **trás**; **sem split**, na **thread única**; a **thread de fences não chama**
+  (`ReleaseThreadFunc`, `fence_manager.h:241-272`).
+- **A frente também chama, sempre depois de um `Drain`:** `dma_pusher.cpp:176-183` (a exceção que a revisão apontou) e,
+  **além dela**, `puller.cpp:225`, `:252`, `:259`, `:264` e `:291`, que chamam `ReleaseFences` direto
+  (`WaitPendingFences`, `SignalFence`, `InvalidateGPUCache`), depois do `DrainBack` de `:186` e de `:285`. Depois do
+  `Drain` a trás fica ociosa até a frente enviar mais (`puller.cpp:178-181`), então as chamadas não se sobrepõem.
+- Isso é **convenção do `Drain`, não trava**: nada a verifica. Não abri `GpuSplit::MaybeStart` e `Stop`, o chamador
+  de `query_cache.h:586` nem o dispatch de `maxwell_3d.cpp:435`.
+
+**A precondição vale nos caminhos lidos**, então é escrita como precondição do protocolo, e o harness a respeita (as
+threads "frente" e "trás" se revezam sob um mutex que modela o `Drain`). Se algum caminho a violar, é **possível falha
+preexistente**, registrada em `docs/gpu-contract-inventory.md` (7.3) e **separada do livro-razão**: o diagnóstico **não
+a corrige nem a esconde**. Ele a vigia com `gather_active` (abaixo), conta `gather_overlapped` e `apply_out_of_order`, e
+trata como **ambíguos** os lotes até ali (`violation_floor`).
+
 **Por que endereço e sobreposição não bastam (contraexemplo da revisão, confirmado no código).** O `Gather` retira
 o lote A de um gerenciador; a CPU registra o aviso B no mesmo bloco de 64 bytes; a aplicação de A encontra B no
 livro-razão por sobreposição e o aposentaria, embora B ainda esteja no manager, e seria dado como "aplicado" um
@@ -105,6 +129,11 @@ núcleo), só do diagnóstico, em `core/gpu_dirty_memory_manager.h`:
   concorrentes podem tomar o `guard` na ordem inversa dos incrementos; numerar pelo incremento daria o número
   errado).
 
+- `gather_active`: incrementado na entrada do `Gather` e decrementado **depois** da iteração e do `clear()` do
+  `front_buffer`. Entrar com `gather_active != 0` é a violação de P0 (`gather_overlapped`); o `lot_done` só diz que a
+  retirada terminou, e a iteração (a parte sem `guard`) vai além dele, então ele sozinho não vê dois `Gather` que se
+  sobrepõem na iteração. A violação sobe o `violation_floor` do gerenciador para o `lot_started` do instante.
+
 **Por que o `gather_epoch` atual não serve (confirmado):** é um `fetch_add` `relaxed` no início do `Gather`
 (`:57`), sem ordem com o `exchange` de `current` (`:60`): o incremento pode ficar visível depois da troca, e não
 diz quando a retirada terminou.
@@ -112,8 +141,8 @@ diz quando a retirada terminou.
 **Ordem de memória escolhida (variante `Diag=true`).** `seq_cst` em: `lot_started` (incremento e leituras),
 `lot_done` (gravação e leituras) e em `current` (o `load`, o `compare_exchange` e o `exchange` do `Collect`/`Gather`).
 O resto (`guard`, `back_buffer`) não muda. A variante `Diag=false` mantém `acquire`/`release`/`relaxed` de hoje.
-Em x86-64 as duas geram as mesmas instruções (leituras `seq_cst` são `mov`; as operações de leitura-modificação-
-escrita já levam `lock`); em ARM a variante do diagnóstico é um pouco mais cara, e só roda ligada.
+O custo da variante `seq_cst` (em x86-64 e em ARM) **não é afirmado aqui**: é **a verificar por inspeção do código
+gerado ou por medição** (seção 7, linha b). Ela só roda com o diagnóstico ligado.
 
 **Protocolo do escritor (`CollectObserved`, em torno do `Collect` real):**
 
@@ -180,11 +209,44 @@ escritas exatas do **mesmo lote**; com lote ambíguo (ou outro lote) dentro da f
 
 **Contagem real das chamadas** (sem presumir uma por lista ou fence): cada `InvalidateGPUCache` chama o `Gather` dos
 6 gerenciadores, vazios inclusive (`core/core.cpp:644-646`). `InvalidateGPUCache` roda no início de cada lista
-(`gpu_thread.cpp:79,106`), no fim de cada `SignalFence` (`fence_manager.h:139`), no `OnCPURead` (`gpu.cpp:266`) e há
-outros chamadores que **não abri** (`engines/maxwell_3d.cpp:435`, `engines/puller.cpp:339`), possivelmente em mais
-de uma thread (`gpu.cpp:128`). O diagnóstico conta: `invalidate_calls`, `invalidate_empty`,
+(`gpu_thread.cpp:79,106`), no fim de cada `SignalFence` (`fence_manager.h:139`), no pedido síncrono do `OnCPURead`
+(`gpu.cpp:266`, via `TickWork`), em `puller.cpp:339` e em `maxwell_3d.cpp:435`, em mais de uma thread **mas nunca ao
+mesmo tempo** (P0; inventário 7.3). O diagnóstico conta: `invalidate_calls`, `invalidate_empty`,
 `gather_calls[núcleo]`, `gather_empty[núcleo]`, `gather_overlapped` (um `Gather` que começou com outro em andamento:
 `lot_started - lot_done > 0` antes do incremento) e `invalidate_thread_switches` (o chamador difere do anterior).
+
+### 3.3.1 Publicação atrasada: aviso publicado depois da aplicação do seu lote
+
+**Contraexemplo (revisão 2).** O `CollectObserved` lê `s2` (lote L inequívoco) → o escritor é pausado → o `Gather`
+retira L → a aplicação de L termina sem achar o registro → o escritor publica o aviso de L como pendente → um pop o
+acha: **janela falsa**. A regra de aposentadoria da 3.3 não basta: a aplicação já passou.
+
+**Proposta da revisão, avaliada e adotada, com um acréscimo (`checked`):**
+
+- Por gerenciador, `apply_started_lot` (atômico, `seq_cst`), gravado por quem aplica **antes** de varrer o livro-razão
+  (no ramo do diagnóstico de `InvalidateGPUCache`, depois do `Gather` e antes de `OnCachedWrites`): "aplicando até o
+  lote L". Só cresce; um lote que não é maior que o gravado é violação de P0 (`apply_out_of_order`, `violation_floor`).
+- O escritor **publica** o registro (`state = publicado`, `seq_cst`) e **só depois** lê `apply_started_lot`
+  (`seq_cst`). Se `apply_started_lot >= L`, o registro é **"publicado tarde"**: ele mesmo o marca `late` e o libera, e
+  **nunca conta como pendente**. Senão, o marca `checked` (pendente confirmado).
+- **Demonstração (Dekker, `seq_cst`).** Escritor: `P` (publicar), depois `R` (ler `apply_started_lot`). Aplicador: `W`
+  (gravar `apply_started_lot = L`), depois a varredura `V` (a leitura `seq_cst` de `state` de cada slot). Na ordem
+  total `S` das operações `seq_cst`: ou `R` precede `W`, e então `P < R < W < V`, e a varredura vê o registro
+  publicado (e o aposenta pela regra da 3.3); ou `W` precede `R`, e então `R` lê `L` ou mais: "publicado tarde". Não
+  há terceira saída. A varredura lê `state` com `seq_cst` (custo a verificar, como em 7).
+- **Acréscimo (`checked`).** Entre `P` e o fim de `R` o registro está publicado e **não confirmado**: um pop que o
+  achasse aí afirmaria uma janela que pode ser falsa (o caso "publicado tarde"). Por isso o pop **só afirma janela**
+  para registro `checked`; para o publicado e não conferido conta `pop_over_unchecked` e **não afirma**. A aplicação,
+  ao contrário, aposenta também o não conferido (é o que a Dekker pede). Cada registro tem **um** fim de vida: `applied`
+  (a varredura) ou `late` (o escritor), decidido por CAS em `marks`.
+- **Um valor monotônico basta** só por P0: sob a precondição, as aplicações de um gerenciador terminam em ordem, então
+  "aplicando até L" implica que todo lote ≤ L já foi (ou está sendo) varrido. Se `gather_overlapped` ou
+  `apply_out_of_order` indicar violação, os registros do intervalo (lote ≤ `violation_floor`) são **ambíguos**: o pop
+  não afirma e a aplicação não aposenta. Um histórico de aplicações não foi preciso e não foi adotado.
+- **Testes determinísticos** (`tools/list-diag-harness`, 8.1.1): pausa entre `s2` e a publicação; pausa entre a
+  publicação e a leitura de `apply_started_lot`; aplicação de L concorrente com cada uma (inclusive pausada entre a
+  gravação de `apply_started_lot` e a varredura); e o mesmo roteiro **sem** a verificação (`naive_no_late_check`), em
+  que a janela falsa **aparece**, para provar que o teste é sensível.
 
 ### 3.4 Protocolo de propriedade e geração dos slots
 
@@ -202,20 +264,26 @@ concorrente, por isso o payload inteiro é atômico):
 | Palavra | Conteúdo |
 | --- | --- |
 | `state` | geração (48 bits) e fase (2 bits): `livre`, `escrevendo`, `publicado` |
-| `marks` | geração (16 bits baixos), `popped`, `applied`, e as larguras `t_pop` e `t_apply` em unidades de 2 µs desde `t_write`, 22 bits cada (saturam em ~8,4 s; a expiração é 5 s). **Uma palavra só**, com a geração |
+| `marks` | geração (16 bits baixos), `popped`, `applied`, `checked`, `late`, e as larguras `t_pop` e `t_apply` em unidades de 2 µs desde `t_write`, 22 bits cada (saturam em ~8,4 s; a expiração é 5 s). **Uma palavra só**, com a geração |
 | `addr`, `meta` (tamanho, núcleo, ambíguo), `lot`, `t_write` | payload escrito só pelo escritor |
 | `pop1`, `pop2` | payload do pop, **cada palavra com a geração (16 bits) junto do dado**: `pop1` = geração, início da amostra e tamanho; `pop2` = geração e hash de 48 bits |
 
 **Escritor** (limitado: examina até 8 slots a partir do cursor):
-1. Acha um slot `livre`, ou `publicado` e **expirado** (`agora - t_write > 5 s`, contado em `notice_expired`).
+1. Acha um slot `livre`, ou `publicado` e **expirado** (`agora - t_write > 5 s`; só conta em `notice_expired` se o
+   registro velho não tinha terminado: passo 3).
 2. `CAS(state: g, fase → g+1, escrevendo)`. Perdeu: tenta o próximo. Sem slot após 8: **descarta** o aviso e conta
    `notice_overflow` (nunca espera).
-3. Grava o payload (`relaxed`), `marks = (g+1, 0, 0, 0, 0)` (`relaxed`), e publica `state = (g+1, publicado)`
-   (`release`).
+3. Grava o payload (`relaxed`), **sela** o `marks` velho por `exchange` para `(g+1, 0, ...)` (`seq_cst`) e publica
+   `state = (g+1, publicado)` (`seq_cst`). O valor que o `exchange` devolve diz se o registro velho já tinha terminado
+   (`applied` ou `late`): **só se não tinha** a reciclagem conta `notice_expired`. Quem marcar depois do selo falha
+   pela geração. **O harness achou aqui uma falha do primeiro desenho** (seção 11, linha 9): contar `expired` só pelo
+   estado `publicado` contava duas vezes um registro já aposentado e ainda não liberado (a conservação "registrados =
+   aplicados + atrasados + expirados + restantes" falhou por 8).
 
 **Leitor** (pop ou aplicação; tentativas limitadas):
-1. `st = state.load(acquire)`; só segue se `publicado` com geração `g`.
-2. Lê o payload (`relaxed`), depois `state.load` de novo (precedido de `fence(acquire)`): se mudou, a leitura é
+1. `st = state.load(seq_cst)` (a varredura da aplicação precisa disso: 3.3.1); só segue se `publicado` com geração `g`.
+2. Lê o payload (`relaxed`), depois `state.load` de novo (precedido de `fence(acquire)`; o TSan não modela cercas, e no harness sob TSan a mesma
+   ordem vem de um RMW `acq_rel` de +0): se mudou, a leitura é
    **descartada** (`observation_lost`).
 3. Marca por **CAS em `marks`** esperando a geração `g` que leu e o bit ainda desligado; **no máximo 2 tentativas**.
    Como `marks` carrega a geração, um slot reciclado (geração nova) faz a CAS falhar: o leitor **nunca marca uma
@@ -259,6 +327,8 @@ Consequências para a interpretação de **tudo** o que o T3a mede:
 | Aviso registrado **não** é escrita concluída (3.5) | contagens de pop são limite superior; amostras confundidas; a terceira intercalação não é vista | (limitação; sem contador) |
 | O registro vem **depois** do `Collect` real: por alguns ns o aviso existe nos caches e não no livro-razão | um pop nesse intervalo não é contado (subconta) | (não observável; **hipótese**: pequeno) |
 | Lote ambíguo (retirada concorrente) | o aviso não é aposentado nem afirmado como janela | `notice_ambiguous`, `pop_over_ambiguous`, `apply_overlap_ambiguous_lot` |
+| Violação de P0 (dois `Gather` ou aplicações fora de ordem) | os lotes até ali viram ambíguos; **a corrida em si não é corrigida nem escondida** | `gather_overlapped`, `apply_out_of_order` |
+| Publicado e não conferido (3.3.1) | o pop não afirma janela sobre o registro | `pop_over_unchecked` |
 | Anel cheio, expiração, reciclagem durante leitura ou marcação | observação perdida | `notice_overflow`, `notice_expired`, `observation_lost` |
 | Hash de 48 bits e amostra de até 64 bytes | `sample_equal` pode ser acidental; a cobertura é parcial quando a interseção passa de 64 bytes | `sample_bytes` e `overlap_bytes` (soma) |
 | Largura em unidades de 2 µs, saturando em 8,4 s | larguras grosseiras, nunca ordem | (soma e máximo, nunca ordem) |
@@ -296,15 +366,17 @@ Todo resultado sai **com o tamanho da amostra e a cobertura** (`sample_bytes` de
 
 | Contador (`Shared.list_diag`, relaxed) | O que conta |
 | --- | --- |
-| `notice_registered`, `notice_applied`, `notice_expired`, `notice_overflow`, `notice_ambiguous` | avisos registrados e seu destino |
+| `notice_registered`, `notice_applied`, `notice_late`, `notice_expired`, `notice_overflow`, `notice_ambiguous` | avisos registrados e seu destino: cada registrado termina em **um**: `notice_applied`, `notice_late`, `notice_expired`, ou continua pendente (ambíguo ou de outro lote) |
 | `pop_ranges` | faixas que o pop gravou no guest (denominador) |
 | `pop_over_notice` | faixas de pop que cruzam ao menos um aviso registrado, não aplicado e de lote inequívoco |
 | `pop_over_notice_bytes`, `pop_over_notice_records` | bytes da interseção; avisos distintos atingidos |
 | `pop_over_ambiguous` | faixas de pop que cruzam só avisos de lote ambíguo (**não afirma janela**) |
+| `pop_over_unchecked` | faixas de pop que cruzam avisos publicados e ainda não conferidos (3.3.1; **não afirma janela**) |
 | `window_sample_equal`, `window_sample_different`, `window_unverified` | resultado na aplicação (acima); `sample_bytes` e `overlap_bytes` (somas) |
 | `notice_to_apply_us` (soma, máx, n) | do registro à aplicação, de **todo** aviso aposentado (dimensiona a exposição mesmo sem ocorrência) |
 | `notice_to_pop_us` (soma, máx, n) | do registro ao pop, nos atingidos |
 | `apply_overlap_other_lot`, `apply_overlap_ambiguous_lot`, `apply_partial`, `apply_unlinked` | regra de aposentadoria (3.3) |
+| `gather_overlapped`, `apply_out_of_order` | violações de P0 (3.3); sobem o `violation_floor` |
 | `observation_lost` | reciclagem ou CAS perdida (3.4) |
 
 **Log** (rótulo `[ListDiag][pop]`), uma linha por aviso atingido, emitida na aplicação (com a tríade completa); um
@@ -413,7 +485,7 @@ Por isso `list` é medida **à parte** de `pop` e `blk`.
 | | Desligado | Ligado |
 | --- | --- | --- |
 | (a) Leitura da flag e desvio | **uma** leitura `relaxed` e um desvio em `System::GatherGPUDirtyMemory`/`InvalidateGPUCache` (por chamada, **não** por gerenciador: o ramo fica fora do laço dos 6) e um em `memory.cpp:765` (só no caminho do aviso segurado), no laço do pop (por faixa), no topo de `CachedWriteMemory` | idem, mais o trabalho abaixo |
-| (b) Contadores `lot_started`/`lot_done` | **não são gravados.** Cada gerenciador ganha **16 bytes** de layout (×6), ao lado de `gather_epoch`; `Collect` e `Gather` de hoje não mudam (`Diag=false`). **Isto é um custo fora do diagnóstico: memória, não instruções**, e nenhuma linha de cache nova em uso (as gravações não existem). Gravar sempre fica como decisão futura, só se simplificar o protocolo ou mostrar vantagem **medida**; "é barato" é hipótese, não justificativa | `std::atomic<u64>` ambos, `seq_cst` (incremento e leituras; gravação de `lot_done`). **Escritores:** `lot_started` por qualquer thread que chame `Gather` (a thread da GPU, a de trás, a de fences, a da CPU no `OnCPURead`); `lot_done` idem, sob o `guard`. **Leitores:** a thread da CPU do jogo (no `CollectObserved`, 2 leituras antes e 1 depois por aviso segurado) e o próprio `Gather` |
+| (b) Contadores `lot_started`/`lot_done` | **não são gravados.** Cada gerenciador ganha **40 bytes** de layout (cinco `std::atomic<u64>`: `lot_started`, `lot_done`, `gather_active`, `apply_started_lot`, `violation_floor`; ×6); `Collect` e `Gather` de hoje não mudam (`Diag=false`). **Isto é um custo fora do diagnóstico, de memória e de layout**: o acréscimo **pode deslocar campos ativos** (`gather_epoch`, `current`, `guard`) e mudar o layout do gerenciador, inclusive entre linhas de cache; **a verificar por `static_assert` de `sizeof` e `offsetof` e por inspeção, ou por medição**. Não afirmo que não ocupa linha de cache nova. Gravar sempre fica como decisão futura, só se simplificar o protocolo ou mostrar vantagem **medida**; "é barato" é hipótese, não justificativa | `std::atomic<u64>` todos, `seq_cst` (incremento e leituras; gravação de `lot_done`; `apply_started_lot` é um `store` por gerenciador a cada `InvalidateGPUCache`; `violation_floor` só em violação). **O custo de um `store` ou `exchange` `seq_cst` frente ao comum, em x86-64 e em ARM, é a verificar por inspeção do código gerado ou por medição**, e não é afirmado. **Escritores:** `lot_started` e `gather_active` por quem chama `Gather`: a trás com split, a thread única sem split e, **depois de `Drain`**, a frente (3.3, P0); a thread de fences e as da CPU do jogo **não** chamam; `lot_done` idem, sob o `guard`. **Leitores:** a thread da CPU do jogo (no `CollectObserved`, 2 leituras antes e 1 depois por aviso segurado) e o próprio `Gather` |
 | (c) Frequência real | `Gather` por **gerenciador** a cada `InvalidateGPUCache`, vazios inclusive (`core/core.cpp:644-646`, **verificado**); `InvalidateGPUCache` roda no início de cada lista, no fim de cada `SignalFence`, no `OnCPURead` e em outros chamadores (3.3), possivelmente em mais de uma thread (`gpu.cpp:128`). **Sem estimativa por lista ou fence:** o diagnóstico **conta** `invalidate_calls`, `invalidate_empty`, `gather_calls[núcleo]`, `gather_empty[núcleo]`, `gather_overlapped`, `invalidate_thread_switches` | os mesmos contadores, no resumo e no `Report()` |
 | (d) Sincronização | nenhuma nova | **as gravações ficam sob o `guard` existente:** o `Gather` do diagnóstico acrescenta, **dentro** da seção do `guard`, uma leitura `seq_cst` e uma gravação `seq_cst` (`lot_done`), sem trava nem espera; o incremento de `lot_started` fica **fora** (antes). Amplia a seção crítica de uma gravação atômica: a ordem de ns, que a medição de 8.3 deve confirmar, **não** a presumo. O `Collect` do diagnóstico não amplia a seção do `guard` (só muda a ordem de memória das operações em `current`) |
 
@@ -433,7 +505,9 @@ runtime falso é grande demais para o T3; as decisões ficam em funções puras 
 | Aviso em bloco de 64 bytes | `Core::GPUDirtyMemoryManager` (`Collect`, `Gather`), `Common::RangeSet` | O `Collect` de 4 bytes volta do `Gather` como **64 bytes alinhados** (hipótese 7.2 contra o código real) e `blk_gpu_bytes_at_risk` = 60 com 64 bytes da GPU no bloco; sem bytes da GPU, 0 |
 | Escrita exata dentro do bloco, junção por página | idem | `at_risk` desconta só as escritas **do mesmo lote**; dois avisos na mesma página depois da junção de `gpu.cpp:138-161`, de **núcleos diferentes**: o conjunto `{(núcleo, lote)}` da faixa final contém os dois |
 | **Contraexemplo dos lotes** | `GPUDirtyMemoryManager` real | `Gather` retira o lote A → a CPU registra B no **mesmo bloco** → a aplicação de A: B **não é aposentado**, `apply_overlap_other_lot` = 1, e um pop sobre B depois conta como janela |
-| Lote nos três caminhos do `Collect` | idem | CAS, `guard` e "já coberto" (`:26-47`): o lote declarado confere com o lote em cujo `Gather` os bytes aparecem de fato (verdade de referência: a saída do `Gather`) |
+| Lote nos três caminhos do `Collect`, **com a identidade de cada aviso** | idem | CAS, `guard` e "já coberto" (`:26-47`). **A referência não é "o endereço aparece no callback"**: com vários avisos no mesmo bloco de 64 bytes, uma ocorrência anterior dos mesmos bytes mascara um lote errado. Os roteiros são **escritos à mão, com a coalescência conhecida** (o mesmo bloco nos lotes 1, 2 e 3 e duas vezes no 4, a segunda "já coberta"), e o lote esperado de cada aviso vem do roteiro (quantos `Gather` vieram antes). Um **mutante** que declara o lote seguinte falha pela identidade em **5 de 5**, e a conferência só por endereço é **enganada 3 vezes** (rodado no harness) |
+| Publicação atrasada (3.3.1) | `GPUDirtyMemoryManager` real, livro-razão | pausa entre `s2` e a publicação; pausa entre a publicação e a leitura de `apply_started_lot`; aplicação de L concorrente com cada uma; o mesmo roteiro sem a verificação mostra a janela falsa |
+| Violação de P0 (3.3) | idem | dois `Gather` no mesmo gerenciador: `gather_overlapped` = 1 e o pop sobre o lote suspeito conta `pop_over_ambiguous`; aplicação fora de ordem: `apply_out_of_order` |
 | Lote ambíguo | idem, com `Gather` parado no meio | `Gather` com `lot_started` incrementado e `lot_done` ainda não: o aviso registrado é ambíguo; nenhuma aposentadoria; o pop sobre ele conta `pop_over_ambiguous` |
 | Equivalência | idem | `Collect` e `Gather` `Diag=false` e `Diag=true` produzem **a mesma saída** para sequências aleatórias (o diagnóstico não muda o que o manager entrega) |
 | Janela do pop, ordem **registro → pop → aplicação** | `Common::OverlapRangeSet` como `async_downloads`, livro-razão | `pop_over_notice` = 1, tríade registrada |
@@ -451,11 +525,30 @@ O `DmaPusher` com rasterizador falso e o `puller` reais para a parte `list` são
 pequena, os casos dirigidos ficam só no harness e o teste de integração cobre `ClassifyWords`, a comparação e a
 tabela por página.
 
+### 8.1.1 O que o harness isolado já cobre (`tools/list-diag-harness/`, feito e rodado)
+
+Modelo do protocolo, **fora do emulador** (o único código de `src/` que ele compila é o `core/gpu_dirty_memory_manager.h`
+real, por um stub mínimo da página). `Manager<false>` é o `Collect`/`Gather` de hoje, e o teste de **equivalência**
+compara a saída dele, a do real e a de `Manager<true>` em 40 000 passos aleatórios (**passa**). Os testes da tabela
+acima que ele cobre já existem lá, deterministas, com pontos de parada (`Gates`) em vez de sorte:
+
+- lote nos três caminhos e identidade (com o mutante), ambiguidade nos quatro pontos de intercalação, o
+  contraexemplo A/B, "entre o `Gather` e a aplicação", a publicação atrasada (a, b, c, d e a variante sem a
+  verificação), a reciclagem (durante a leitura do payload, a CAS de `t_pop`, a de `t_apply`, a escrita atrasada do
+  payload do pop e o payload de outra geração), a violação de P0, a junção entre núcleos, os rótulos de amostra e
+  um **estresse** com threads (escritores por núcleo, um invalidador por vez, uma thread de pop), com verdade de
+  referência vinda do `Gather` (lote de cada bloco único), sem janela falsa e com conservação de fim de vida;
+- o estresse tem também um **mutante** (lote errado), que ele tem de ver;
+- **o que o harness não faz:** não instancia `BufferCache`, não tem o `memcpy` concorrente do guest (as amostras usam um guest
+  de mentira), o `Hooks` do emulador é aqui um ponteiro de `Gates` (a política de modelo é do código real), e o
+  estresse usa blocos únicos por aviso (a repetição de bloco é coberta pelos roteiros, não pelo estresse).
+
 ### 8.2 Verificação na nuvem
 
-`tools/gpu-contract-harness/run.sh` (três builds) e `g++ -std=c++20 -fsyntax-only -Wall` dos arquivos alterados
-(método de `docs/handoff-aggressive.md` e `docs/perf-handoff.md`). O harness do protocolo do livro-razão e do lote
-(sem `src/`, compilado com TSan e ASan) roda na nuvem; a cadeia completa de build do emulador, não.
+`tools/gpu-contract-harness/run.sh` (três builds) e `tools/list-diag-harness/run.sh` (três builds: `-O2`, TSan e
+ASan+UBSan, LeakSanitizer ativo e confirmado com um programa que vaza de propósito) e
+`g++ -std=c++20 -fsyntax-only -Wall` dos arquivos alterados (método de `docs/handoff-aggressive.md` e
+`docs/perf-handoff.md`). A cadeia completa de build do emulador não roda na nuvem.
 
 ### 8.3 Plano de teste no FE (usuário, em casa)
 
@@ -496,19 +589,23 @@ ocorrências dimensiona exposição, e **não decide o mecanismo**.
 
 ## 10. Decisões que preciso de você antes de escrever código no emulador
 
-1. **Fases.** **T3a** (`pop` e `blk`: livro-razão, lote, 4 pontos, contadores, logs, testes) primeiro, porque
-   responde a pergunta que a seção 12 do plano deixou aberta para o T4 sem cópias na GPU; **T3b** (`list`) depois,
-   com o resultado de custo. Aprovado?
+1. **Fases.** **T3a** (`pop` e `blk`: livro-razão, lote, publicação atrasada, 4 pontos, contadores, logs, testes)
+   primeiro, porque responde a pergunta que a seção 12 do plano deixou aberta para o T4 sem cópias na GPU; **T3b**
+   (`list`) depois, com o resultado de custo. Aprovado?
 2. **`Diag` como parâmetro de modelo no `GPUDirtyMemoryManager`** (3.3): a instanciação desligada é o código de
-   hoje, e a ligada usa `seq_cst`. A alternativa é gravar `lot_started`/`lot_done` sempre (simplifica, mas é
-   custo fora do diagnóstico). Recomendo o parâmetro; gravar sempre só com medição que o justifique.
-3. **Hooks de produtores estrangeiros** (seção 6, item 5): os seis dentro de `video_core/` na T3b, ou todos depois?
-4. **Limites:** primeiras 32 ocorrências de cada tipo, depois 1 a cada 64, teto de 512 linhas por sessão; cópias em
+   hoje, e a ligada usa `seq_cst`. A alternativa é gravar os contadores sempre (simplifica, mas é custo fora do
+   diagnóstico). Recomendo o parâmetro; gravar sempre só com medição que o justifique.
+3. **Layout do gerenciador:** o diagnóstico acrescenta 40 bytes (5 atômicos) por gerenciador mesmo desligado
+   (seção 7, b). Aceito, com `static_assert` de `offsetof` dos campos ativos? Ou prefere os contadores num vetor
+   paralelo, fora do gerenciador (o custo é uma indireção só no diagnóstico ligado)?
+4. **P0** (3.3): fica como precondição vigiada pelo diagnóstico (`gather_active`), sem mudar o emulador. Quer, além
+   disso, um `ASSERT` ou contador permanente de sobreposição de `Gather` (mudaria o caminho desligado: não proponho)?
+5. **Hooks de produtores estrangeiros** (seção 6, item 5): os seis dentro de `video_core/` na T3b, ou todos depois?
+6. **Limites:** primeiras 32 ocorrências de cada tipo, depois 1 a cada 64, teto de 512 linhas por sessão; cópias em
    voo até 16 MiB. Servem?
-5. **Caso de harness da terceira intercalação** (`held_write_apply_before_memcpy`, 3.5): implemento já, em paralelo
-   (só harness, sem mudar o emulador), ou espero?
-6. **Harness do protocolo do livro-razão e do lote** (seção 8.2, TSan/ASan, sem `src/`): faço antes de o código
-   entrar no emulador, para provar o protocolo isolado?
+
+**Feitos nesta revisão, sem esperar decisão (só harness):** o caso `held_write_apply_before_memcpy` no harness dos
+contratos (3.5) e o harness isolado do protocolo (8.1.1).
 
 ## 11. Revisões
 
@@ -519,3 +616,8 @@ ocorrências dimensiona exposição, e **não decide o mecanismo**.
 | 3 | O seqlock não basta (expiração de 5 s, leitores marcando): estado atômico com geração e fase, CAS do escritor, payload todo `std::atomic`, `t_pop`/`t_apply` numa palavra com a geração e CAS esperando a geração lida, tentativas limitadas, testes determinísticos com pontos de parada | Sim: eu tinha dito "seqlock" e "slot pendente nunca reaproveitado, exceto por expiração", o que deixa o leitor marcar um slot reciclado. Ajuste: o payload do pop também leva a geração, para a escrita atrasada de um leitor não corromper a geração nova | 3.4 inteira (inclusive a ABA declarada) e os quatro testes de reciclagem em 8.1 |
 | 4 | Resultados `sample_equal`, `sample_different`, `unverified` com tamanho da amostra e cobertura, sem "benigno" nem "perda"; `host_only` vira `not_seen_cpu_read` | Sim | Seções 4 e 5, contadores e logs |
 | Adendo | Gravações de `lot_*` condicionadas ao diagnóstico; declarar (a) a flag, (b) os contadores (atômicos, ordem, leitores), (c) a frequência real **contada**, (d) a sincronização; o lote tem de acompanhar o `Gather` até a aplicação, inclusive com a junção entre núcleos, sem mudar o caminho desligado | Sim. Verifiquei `core.cpp:644-646` (os 6 gerenciadores, vazios inclusive) e `NUM_CPU_CORES = 6` (eu havia escrito 4 no tamanho do anel). `OnCachedWrites` só tem um chamador (`gpu.cpp:162`); `InvalidateGPUCache` tem outros chamadores que não abri | Seção 7 (tabela a a d) e 3.3 (como o lote chega); anel de 384 KiB; contadores reais das chamadas |
+| 5 (revisão 2) | **Exclusão entre `Gather` no mesmo gerenciador:** o `guard` protege só a troca; a iteração e o `clear()` do `front_buffer` ficam fora (`:56-82`); inventário de chamadores e threads, com e sem split; a exclusão vale? escrevê-la como precondição ou registrar a falha preexistente | Sim para o fato do código. O inventário **confirma** a leitura do planejador e a **amplia**: a frente também chama, depois de `Drain`, em `puller.cpp:225,252,259,264,291` (`ReleaseFences` direto), além de `dma_pusher.cpp:176-183`; e o `TickWork` do `Defer` é `gpu_thread.cpp:82`, não `:81`. A thread de fences não chama. A exclusão vale nos caminhos lidos **por convenção do `Drain`, não por trava**; não abri `MaybeStart`/`Stop`, `query_cache.h:586` nem o dispatch de `maxwell_3d.cpp:435` | `docs/gpu-contract-inventory.md`, 7.3 (tabela de chamadores); 3.3: P0 como precondição, `gather_active`, `gather_overlapped`, `apply_out_of_order`, `violation_floor`; o harness respeita P0 e tem um teste que a viola de propósito |
+| 6 (revisão 2) | **Publicação atrasada:** o escritor publica o aviso de L depois da aplicação de L, e um pop o acha (janela falsa). Propôs `apply_started_lot` (`seq_cst`) gravado antes da varredura e lido pelo escritor depois de publicar | Sim: o contraexemplo é real (a regra de aposentadoria da 3.3 só vê o que já está publicado quando a aplicação varre). A Dekker com `seq_cst` fecha: ou a varredura vê o registro, ou o escritor vê o lote. **Acréscimo:** entre a publicação e a leitura o registro existe e não está conferido; sem um estado `checked` o pop o contaria. Um valor monotônico basta só por P0 | 3.3.1; `late`/`checked` em `marks`; `pop_over_unchecked`; `notice_late`; testes determinísticos e a variante sem a verificação, que mostra a janela falsa |
+| 7 (revisão 2) | A referência do teste de lote ("o endereço aparece no callback") não basta quando vários avisos usam o mesmo bloco | Sim, e o harness mostra o tamanho do buraco: com o mutante "lote seguinte", a conferência por identidade falha em 5 de 5 e a por endereço é enganada 3 vezes | 8.1: roteiros escritos à mão, com a coalescência conhecida e o lote esperado vindo do roteiro; o mutante é parte do teste |
+| 8 (revisão 2) | Custo desligado: retirar "nenhuma linha de cache nova em uso" e "mesmas instruções em x86" | Sim: 16 bytes (agora 40) podem deslocar campos ativos; um `store` `seq_cst` pode custar mais que um comum | Seção 7 e 3.3: as duas frases viram "a verificar por inspeção do código gerado ou medição" |
+| 9 (achado do harness) | (não veio da revisão) A conservação de fim de vida dos registros falhou por 8 no estresse | Sim, **falha do meu protocolo**: reciclar um slot `publicado` e expirado contava `notice_expired` mesmo quando o registro velho já estava `applied` e ainda não liberado (contado duas vezes: retirado e reciclado) | 3.4, passo 3: o escritor sela o `marks` velho por `exchange` e conta `expired` só se o selo não traz `applied` nem `late` |

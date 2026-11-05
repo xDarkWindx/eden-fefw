@@ -132,6 +132,18 @@ Op CpuWriteHeld(std::uint32_t pa, std::vector<Word> values) {
     op.values = std::move(values);
     return op;
 }
+Op CpuWriteHeldNotice(std::uint32_t pa, std::vector<Word> values) {
+    Op op{OpKind::CpuWriteHeldNotice};
+    op.pa = pa;
+    op.values = std::move(values);
+    return op;
+}
+Op CpuWriteHeldBytes(std::uint32_t pa, std::vector<Word> values) {
+    Op op{OpKind::CpuWriteHeldBytes};
+    op.pa = pa;
+    op.values = std::move(values);
+    return op;
+}
 Op CheckGuest(std::uint32_t pa, const Expected& e) {
     Op op{OpKind::CheckGuest};
     op.pa = pa;
@@ -458,6 +470,29 @@ std::vector<Case> BuildCases() {
         c.title = "o mesmo roteiro, com avisos exatos (positivo)";
         c.knobs.notice_block_words = 0;
         c.after_satisfied = c.exact_drain = Expect::MustPass();
+        cases.push_back(c);
+    }
+    { // Third interleaving, found by reading and not measured by the T3 diagnostic
+      // (docs/list-diag-design.md, 3.5): the notice is registered inside GetPointerImpl and
+      // the memcpy is done by the caller afterwards (core/memory.cpp:587-590, 649-653). If the
+      // application runs between the two, CachedWriteMemory reads the old guest bytes and
+      // uploads them; the memcpy lands after, and no new notice exists to upload the new
+      // bytes: the guest has the CPU's word and the host keeps the old one. There is no
+      // protection modelled, so no positive.
+        const std::uint32_t b = Page(6);
+        const std::vector<Word> w{0x81};
+        Case c{"held_write_apply_before_memcpy",
+               "aplicacao do aviso antes do memcpy da escrita segurada (negativo, sem protecao modelada)"};
+        c.channels = {{Produce(1, b, 16),
+                       Simple(OpKind::WaitBack),               // the page is GPU-modified
+                       CpuWriteHeldNotice(b + 4, w),           // (i-a, i-b) notice registered, no bytes yet
+                       Simple(OpKind::ApplyHeld),              // (iii) reads the old guest word
+                       Simple(OpKind::WaitBack),
+                       CpuWriteHeldBytes(b + 4, w),            // (i-c) the memcpy lands afterwards
+                       Simple(OpKind::WaitBack),
+                       CheckGuest(b + 4, Expected(b + 4, 1).Put(0, w)),
+                       CheckHost(b, Expected(b, 16).Put(0, ProducerValues(1, 16)).Put(4, w).words)}};
+        c.after_satisfied = c.exact_drain = Expect::MustFail(FailureKind::WordMismatch);
         cases.push_back(c);
     }
     return cases;

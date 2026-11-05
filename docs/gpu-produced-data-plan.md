@@ -443,6 +443,10 @@ do plano de arquitetura:
 | Harness | `held_write_vs_pending_download` (negativo) e `..._protected` (positivo) | `held_write_block_clobbers_gpu_bytes` (negativo) e `held_write_block_exact_notices` (positivo) |
 | Contadores e logs no T3 | próprios (`docs/list-diag-design.md`, 4) | próprios (idem, 5) |
 
+Há uma **terceira intercalação**, lida e não medida pelo diagnóstico: a aplicação do aviso antes do `memcpy` da escrita
+(`core/memory.cpp:587-590`, `:649-653`); no modelo, `held_write_apply_before_memcpy` (negativo, sem proteção
+modelada). O diagnóstico do T3 vê **avisos registrados**, não escritas concluídas (`docs/list-diag-design.md`, 3.5).
+
 Corrigir um não resolve o outro: a direção (2) (aplicar os avisos antes do pop) não muda o tamanho do bloco que a
 aplicação sobe, e avisos exatos não mudam a ordem entre pop e aplicação.
 

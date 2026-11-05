@@ -182,6 +182,14 @@ Valem para tudo o que o T3 escrever. O desenho está em `docs/list-diag-design.m
    janela; **uma intercalação encontrada e reproduzida justifica a correção, a medição dimensiona exposição e
    custo, e uma execução sem ocorrências não a invalida.**
 
+6. **Revisão 2 do desenho (sessão do T3):** (a) **precondição P0**, um `Gather` por vez por gerenciador, que vale nos
+   caminhos lidos **por convenção do `Drain`, não por trava** (inventário em `docs/gpu-contract-inventory.md`, 7.3: a
+   frente também chama `ReleaseFences` direto em `puller.cpp:225,252,259,264,291`, depois de `DrainBack`); (b) **publicação
+   atrasada** tratada com `apply_started_lot` e o estado `checked` (`docs/list-diag-design.md`, 3.3.1); (c) o teste de
+   lote usa a **identidade** de cada aviso, não o endereço no callback; (d) o custo desligado não afirma "mesmas
+   instruções em x86" nem "nenhuma linha de cache nova". **Harness isolado:** `tools/list-diag-harness/`
+   (`run.sh`, três builds); e `held_write_apply_before_memcpy` no harness dos contratos.
+
 **Alcance a manter em todo texto novo:** no harness, as duas perdas de dados foram reproduzidas e as proteções
 modeladas passaram; no emulador, há caminhos plausíveis identificados por leitura, sem ocorrência nem
 frequência medidas; a correção de produção está em aberto, e o positivo do harness não decide qual mecanismo
@@ -191,7 +199,7 @@ integrar.
 
 ### T3 — Build de diagnóstico de listas (código real, **desligado por padrão**)
 
-**Estado:** harness feito; **desenho proposto (revisão 1, seção 11 do doc) e aguardando aprovação** (`docs/list-diag-design.md`,
+**Estado:** harness feito; **desenho proposto (revisão 2, seção 11 do doc) e aguardando aprovação** (`docs/list-diag-design.md`,
 decisões na seção 10). Não escreva código do emulador antes dela. Fases propostas: T3a (`pop` e `blk`) e T3b (`list`).
 
 Escopo que o revisor pediu: **pequeno, opt-in, com testes de integração, sem habilitar nada por padrão.**
