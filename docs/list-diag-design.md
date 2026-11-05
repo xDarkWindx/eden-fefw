@@ -498,31 +498,77 @@ aviso amostrado `n` do núcleo `c` com bytes em `R` e lote retirado `X = lots[c]
 *Premissas:* (π1) o único produtor é `CollectNotice` (`grep` em `src/`, fora de testes: nenhum outro `Collect`,
 **verificado**; os produtores estrangeiros são o T3c); (π2) as faixas finais de um lote são disjuntas (a junção de
 `gpu.cpp:143-161`; com `EDEN_HELD_WRITE_MERGE=0` não vale, e por isso `blk_incomplete_nomerge`); (π3) P0 (se violada,
-`Suspect` e o relatório de violação continuam valendo); (π4) um escritor por núcleo.
+`Suspect` e o relatório de violação continuam valendo); (π4) um escritor por núcleo, **inclusive o núcleo de sistema**: toda thread que não é de CPU do jogo cai em
+`sys_core` (`core/memory.cpp:707-709`; o guard é o de `:709-717` que você citou, hoje `:713-720`), e `HandleRasterizerWrite` toma o `sys_core_guard` (`:713-720`, solto pelo
+`SCOPE_EXIT`) em volta de `ApplyOpOnPointer`, cujo lambda chama `CollectNotice` (`:768`). **Toda** atualização de `open`,
+`incomplete_floor` e dos `WriterCounters` fica dentro desse caminho serializado (inclusive o laço dos pedaços do D1, que está
+dentro de `CollectT`); nenhuma outra thread as escreve.
 
-*Prova.* Seja `n` amostrado, do núcleo `c`, com bytes em `R`, retirado no lote `X`. Como os bytes de `n` estão em `R`,
-`R` foi montada a partir de faixas que o `Gather` de `c` entregou; logo `c` está no `mask` e `X = lots[c]`. A
-retirada `E` que leva `n` é a primeira depois da primeira leitura `seq_cst` de `current` do `Collect` de `n`
-(`L_n`, P3), e `L_n` vem depois de O1 na ordem do programa. A aplicação vem depois da retirada, na mesma thread
-(`GatherAll` e `OnCachedWrites` rodam na mesma chamada de `InvalidateGPUCache`, `gpu.cpp:140` e `:182`). Na ordem
-total `S`: `O1 < L_n < E < ρ`.
+*Caminho efetivo de cada pedaço (revisão do revisor).* Com o D1 (`docs/gpu-contract-inventory.md` 7.4.1) um aviso `n`
+vira um ou mais pedaços `p`, todos dentro de `CollectT<true>`, portanto entre `s` e `s2` e depois de O1 na ordem do
+programa. Para cada pedaço, `A_p` é a operação `seq_cst` que o torna visível ao `Gather`, e **não** a primeira leitura de
+`current`, porque o laço de CAS pode falhar e repetir depois de um `Gather` ter trocado `current`
+(`gpu_dirty_memory_manager.h:67-84`; a repetição relê `current`, e só o desfecho conta):
 
-- **Limite do lote (para o caso ambíguo).** O número da retirada `E` é (retiradas anteriores) + 1 sob o `guard`. As
-  retiradas anteriores a `E` são as anteriores a `L_n` (por definição de "primeira"), cada uma incrementou
-  `lot_started` antes, e `s2` é lido depois de `L_n`: então `X ≤ s2 + 1`. E `X ≥ d + 1` por P1. Logo `X ≤ hi`, nos
-  dois casos (inequívoco: `X = d + 1 = hi`).
+- **CAS:** o `compare_exchange_weak` que **deu certo** (`:84`);
+- **publicação sob o `guard`:** o `exchange` de `current` com o pedaço (`:72-75`; o `emplace_back` no `back_buffer` leva
+  o valor antigo, que é de outro aviso e não importa para `n`);
+- **já coberto:** a carga `seq_cst` de `current` que viu os bits (`:80-81`).
+
+`E_p` é a primeira retirada (o `exchange` de `current` do `Gather`) depois de `A_p` em `S`; no caso "já coberto" os bits
+que a carga viu estão em `current` ou, se um caminho `guard` os moveu, em `back_buffer`, que a mesma retirada leva
+(3.3, P3). A aplicação do lote de `E_p` vem depois dela, na mesma thread (`GatherAll` e `OnCachedWrites` na mesma chamada
+de `InvalidateGPUCache`, `gpu.cpp:140` e `:182`).
+
+*Prova.* **(a)** Para todo pedaço, na ordem total `S`: `O1 < A_p < E_p < ρ` (O1 precede cada `A_p` pela ordem do programa,
+e as retiradas só existem depois de um incremento de `lot_started`). Como `X_p` é o lote de `E_p` e `lots[c]` o do
+`Gather` que entregou a faixa, o pedaço de `n` que está em `R` tem `X_p = lots[c]`.
+
+**(b) Caso inequívoco (`s == d`, `s2 == s`): todos os pedaços são do lote `d + 1`.** Retiradas cujo `exchange` precede
+`A_p` incrementaram `lot_started` antes dele, portanto antes da leitura de `s2` (`A_p` precede `s2`): como `s2 == s == d`,
+não houve incremento entre as leituras, então essas retiradas são as `d` já terminadas (P1). `E_p` é a primeira depois
+de `A_p`, logo o seu número é `d + 1`. O mesmo para cada pedaço; um `Gather` que comece entre dois pedaços incrementa
+`lot_started` e `s2 != s`: o aviso **não** é inequívoco, vai ao caso (c).
+
+**(c) Caso ambíguo: o lote possível de cada pedaço é `≤ s2 + 1`.** As retiradas anteriores a `E_p` são as anteriores a
+`A_p`; cada uma incrementou `lot_started` antes do seu `exchange`, logo antes da leitura de `s2`: são no máximo `s2`.
+Então `X_p ≤ s2 + 1`; e `X_p ≥ d + 1` por P1. Os pedaços de um mesmo aviso podem ficar em lotes diferentes dentro de
+`[d + 1, s2 + 1]`; `hi = s2 + 1` (passo 3) cobre todos, e o piso sobe até `hi`. Nenhum lote é atribuído ao aviso.
+
 - ρ lê `open` depois de O1 em `S`. Como `open` tem um escritor e O1 é `seq_cst`, ρ devolve o valor de O1 ou de uma
   gravação posterior. **(1)** Se devolve 1 (de O1 ou de um O1 de aviso seguinte), a faixa é incompleta
   (`blk_incomplete_open`): **não é "afirmado"**. **(2)** Se devolve 0, a gravação lida é O2 de `n` ou posterior
-  (as de antes de O1 estão excluídas). O2 é `release`, ρ é `acquire`: tudo que o escritor fez antes de O2 acontece
+  (as de antes de O1 estão excluídas). O2 é `release` (**não** `seq_cst`: a prova não precisa), ρ é `acquire`: tudo que o escritor fez antes de O2 acontece
   antes de σ e de φ. Casos do resultado do registro de `n`, todos terminados **antes** de O2:
   - (2a) **estouro**: `RaiseIncomplete(c, hi)` com `hi ≥ X`; φ lê `floor ≥ X` (monotônico): incompleto.
-  - (2b) **registrado, não tardio, inequívoco**: o `state publicado` (`seq_cst`) vem antes de O2; σ lê o `state`
-    depois de ρ e o vê publicado ou **depois**. "Depois" só pode ser a reciclagem (a liberação é da aplicação deste
-    lote, e por π2 nenhuma outra faixa o aposentou): a reciclagem faz `RaiseIncomplete` **antes do CAS**
-    (passo 5), e como a leitura de σ que viu o `state` novo vem depois do CAS em `S`, que vem depois da gravação do
-    piso, φ lê o piso: incompleto. Se σ o vê publicado, o registro tem `lot == X`, `core == c` e está contido na
-    faixa (um registro que só cruza a borda vira `apply_partial`, ambíguo, T3a): entra em `exact`.
+  - (2b) **registrado, não tardio, inequívoco**: o `state publicado` (`seq_cst`, `ledger.h:204`) e depois o `SetLive`
+    (`:205`) vêm antes de O2; ρ (`acquire`) lê o valor de O2 ou posterior, então tudo isso acontece antes de σ. Há
+    **três** formas de σ não enxergar o registro, e as três exigem uma reciclagem do slot, que levanta o piso antes:
+    1. *O `Read` falha.* `Read` faz duas cargas `seq_cst` de `state` (`ledger.h:216` e `:237`, com a cerca entre elas).
+       Se a primeira não vê `publicado` na geração de `n`, ou a segunda difere da primeira (reciclagem **durante** o
+       `Read`: `observation_lost`), o valor lido é o de uma escrita de `state` **posterior** à de `n`. A única escrita
+       posterior possível sem passar por uma aplicação deste lote é a reciclagem por `Register` (passo 5: piso,
+       **depois** o CAS que escreve `state`; as escritas seguintes do escritor, `kWriting` e a nova publicação, são
+       `seq_cst` e vêm depois do piso na ordem do programa dele). Uma carga `seq_cst` que lê essa escrita sincroniza com
+       ela: o piso acontece antes de φ (σ e φ são da mesma thread). A liberação pelo escritor (`protocol.h:151`) só
+       existe para `late`, que é o caso (2c).
+    2. *Rejeição posterior por geração em `marks`.* O `Read` passou, mas a reciclagem veio depois dele: `Marks(slot)`
+       (`protocol.h:281`, `seq_cst`) devolve a etiqueta nova (o `exchange` de `marks`, `ledger.h:192`, é posterior ao
+       piso) e `(m & 0xffff) != v.tag()` descarta o registro. Mesma conclusão: φ lê o piso. Se o que falha é a marca
+       `applied` do `Retire` (`Mark` perdida, `observation_lost`), o registro **já estava em `exact`** (o `emplace_back`
+       vem depois do `Retire` e não depende do resultado); o aviso novo, que reciclou o slot, é outro aviso.
+    3. *O índice de vivos não mostra o slot.* `ForEachLive` só visita bits ligados. O `SetLive` de `n` vem **depois** do
+       `state publicado` e antes de O2, e o bit só é apagado por `ClearLive`, que **relê `state` depois do `fetch_and`**
+       (`ledger.h:347-350`) e religa o bit se o slot está `publicado`. Um `ClearLive` de um registro **anterior** do
+       mesmo slot que se intercale com o `Register` de `n`: se o `fetch_and` vem antes do `SetLive` de `n`, o bit é
+       religado por ele; se vem depois, a releitura (posterior ao `state publicado` de `n` em `S`) vê `publicado` e
+       religa. O bit só pode faltar se o slot deixou de estar publicado, que é a reciclagem (casos 1 e 2). Quem chama
+       `Free`: a **aplicação** (`protocol.h:644`, sob o `buffer_cache.mutex`), que termina antes da aplicação seguinte
+       começar (P0), e o **escritor** (`protocol.h:151`, só `late`), que termina antes do próximo `Register` daquele
+       núcleo, por π4 (mesma thread, e o `sys_core_guard` cobre o núcleo de sistema). Logo o único `ClearLive` que pode se
+       sobrepor ao `Register` de `n` é o da aplicação anterior, tratado acima.
+    Se σ o vê publicado: o registro tem `lot == X`, `core == c` e está contido na faixa (um que só cruza a borda vira
+    `apply_partial`, ambíguo, T3a): entra em `exact`.
   - (2c) **registrado e `late`**: o piso subiu antes da liberação (passo 6): φ lê `floor ≥ X`: incompleto.
   - (2d) **registrado ambíguo**: publicado antes de O2, σ o vê (ou a reciclagem, como em 2b), e o vê como `Suspect`:
     `ambiguous`, que tem precedência (i). O piso cobre `hi ≥ X`.
@@ -621,7 +667,9 @@ invalidar a linha dos contadores do escritor.
 
 **Fora da amostra, o que o escritor faz:** a flag, o hash, `seen` do próprio núcleo (um `load`+`store` na própria
 linha), `CollectT<true>`. **Nenhum** outro dado compartilhado, nenhuma leitura de relógio. (`seen` é opcional: dá a
-fração observada de páginas amostradas, que o resumo compara com 1/N. Se o revisor o quiser fora, a verificação do
+fração observada de **avisos** selecionados (`sampled/seen`), que o resumo mostra ao lado de 1/N **sem** exigir
+proximidade em roteiros com páginas quentes repetidas (a fração de avisos segue a distribuição de páginas do jogo, não a de
+páginas distintas). Se o revisor o quiser fora, a verificação do
 predicado passa a ser só o teste 15.)
 
 **Aviso amostrado:** a mais, `open` (um `store seq_cst`, em x86 um `xchg`, e um `store release`, um `mov`); 3
@@ -637,13 +685,13 @@ com a execução parada**, e o resumo imprime as identidades com o resíduo e es
 - **Linha "ligado"** (`list_diag.h:149`): `[ListDiag] ligado: partes=pop,blk; amostra=1/8 de paginas de 4 KiB
   (semente=0x1, hash=splitmix64, N valido); resumo ao fechar o jogo e totais a cada 30 s (aproximados: lidos com a
   execucao em andamento)`. Com valor inválido: `N=8 (padrao: EDEN_LIST_DIAG_SAMPLE='abc' invalido)`.
-- **Linhas `[total]`** (a cada 30 s), grupo novo `sample`: `seen`, `sampled` (e `sampled/seen`, **observado**, contra
-  `1/N`), `apply_ranges_seen`, `apply_ranges_selected`, `pop_fragments`, `pop_fragments_selected`,
+- **Linhas `[total]`** (a cada 30 s), grupo novo `sample`: `seen`, `sampled` (e `sampled/seen`, a fração de **avisos** selecionados, **não** de páginas distintas; observada, ao lado de
+  `1/N` só como referência), `apply_ranges_seen`, `apply_ranges_selected`, `pop_fragments`, `pop_fragments_selected`,
   `pop_over_notice_fragments`. No grupo `notices`: os de hoje (somados) e `floor_raises`. No grupo `blk`:
   `blk_incomplete` (`_open`, `_floor`, `_nomerge`), `blk_incomplete_gpu_bytes`, `blk_affirmed`,
   `blk_ambiguous_no_record` (dentro de `blk_ambiguous`: o `exact` vazio, a causa que a revisão 4 queria separar).
   Prefixo `(aprox.)` em todas.
-- **Resumo final:** os mesmos, mais (1) `amostra`: `N`, semente, `seen`, `sampled`, fração observada; (2) `cobertura`:
+- **Resumo final:** os mesmos, mais (1) `amostra`: `N`, semente, `seen`, `sampled`, fração de **avisos** selecionados (`sampled/seen`); (2) `cobertura`:
   `notice_overflow`, `cov_expired`, `late`, `ambiguous` e `floor_raises` lado a lado com `blk_incomplete*`, e a frase
   "pop_over_notice nas paginas amostradas e um piso enquanto estes forem diferentes de zero"; (3) `conservacao (so com
   a execucao parada)`: `sampled = registered + overflow`; `registered = applied + late + expired + pendentes`;
@@ -667,13 +715,16 @@ chamando o predicado real com `N` e semente fixos.
 | 6 | **`open`, determinístico** | escritor parado depois do `Collect` (`w.after_open`): o `Gather` retira e a aplicação roda: `blk_incomplete_open`, sem `at_risk`; solto, o lote seguinte é completo. Escritor parado antes de O2: idem. Mutante `NaiveNoOpenFlag`: a **falsa completude aparece** (o teste é sensível) |
 | 7 | **Publicação tardia e ambíguo tardio** (3.3.1 e o achado 3.7.3.d) | o aviso é publicado depois da aplicação: `late`, piso sobe, a aplicação seguinte do lote é incompleta; o ambíguo publicado depois da varredura: `open` ou piso o declara; sem os dois (mutante) o trecho sai "afirmado" |
 | 8 | **Pop atravessando páginas da amostra e fora** | faixa de 4 páginas, 2 da amostra: `pop_ranges = 1`, `pop_fragments = 4`, `pop_fragments_selected = 2`, `pop_over_notice = 1` (não 2), `pop_over_notice_fragments = 2`; bytes distintos por posição: o hash do fragmento sai de `bytes + (lo - start)` (o ponteiro errado dá `sample_different` com guest igual); faixa que começa e termina no meio de página; a varredura única é igual a uma varredura por fragmento de referência |
-| 9 | **`N = 1` equivalente ao T3a** | o mesmo roteiro aleatório contra uma cópia congelada do protocolo do T3a (`1d41515`): todos os contadores e eventos iguais **exceto** os novos; `blk_gpu_bytes_at_risk(T3a) = blk_gpu_bytes_at_risk(T3a.1) + blk_incomplete_gpu_bytes` |
-| 10 | **Conservação na amostra com a execução parada** | 6 escritores, `Gather`/aplicação e pop em threads, `N` = 1, 8 e 64: ao parar, `sampled = registered + overflow` (por núcleo e no total), `registered = applied + late + expired + pendentes`, e as demais identidades de 3.7.6; fração `sampled/seen` a menos de 4σ de 1/N; **nenhum falso completo**: para cada faixa afirmada, o conjunto de avisos da referência (a saída do `Gather` com a identidade de cada aviso) está contido em `exact`; os mutantes dos testes 3 e 6 produzem ao menos um falso completo aqui. Também sob **TSan** |
+| 9 | **`N = 1` equivalente ao T3a** | o mesmo roteiro aleatório contra uma cópia congelada do protocolo do T3a (`1d41515`) **que também tem o D1** (o gerenciador com o recorte de 2 KiB, chave ligada nos dois lados): assim a diferença que sobra é só a do diagnóstico, e a correção do gerenciador é separada (um teste à parte compara o D1 com a chave em 0 e em 1, 7.4.1). Todos os contadores e eventos iguais **exceto** os novos; `blk_gpu_bytes_at_risk(T3a) = blk_gpu_bytes_at_risk(T3a.1) + blk_incomplete_gpu_bytes` |
+| 10 | **Conservação na amostra com a execução parada** | 6 escritores, `Gather`/aplicação e pop em threads, `N` = 1, 8 e 64: ao parar, `sampled = registered + overflow` (por núcleo e no total), `registered = applied + late + expired + pendentes`, e as demais identidades de 3.7.6; a fração `sampled/seen` (de **avisos**) só é comparada com 1/N num roteiro de **páginas distintas, uma vez cada**, escolhidas pelo teste (a menos de 4σ de 1/N); com páginas quentes repetidas ela não tem de se aproximar de 1/N; **nenhum falso completo**: para cada faixa afirmada, o conjunto de avisos da referência (a saída do `Gather` com a identidade de cada aviso) está contido em `exact`; os mutantes dos testes 3 e 6 produzem ao menos um falso completo aqui. Também sob **TSan** |
 | 11 | **Contadores por núcleo** | `static_assert(sizeof == alignof == 64)` de `WriterCounters` e `WriterShared`; `Counters` não tem mais os campos do escritor; a soma por núcleo = o que o roteiro mandou |
 | 12 | **Uma leitura de relógio por `Register`** | anel com 8 slots publicados e não expirados: estouro com 1 leitura (hoje 9); registro normal: 1 |
 | 13 | **Desligado: nada muda, nada é alocado** | os roteiros de hoje; `WriterCounters`/`WriterShared` não alocados; o caminho é `CollectT<false>` |
 | 14 | **`N` e semente** | valores inválidos voltam ao padrão e a linha "ligado" diz; semente em decimal e hexadecimal |
-| 15 | **O predicado é um só** | `Sampled(a)` do escritor = o da faixa que o `Gather` real devolve (a ida e volta `u32(a >> 11)`) = o da aplicação = o de cada fragmento do pop, para endereços aleatórios inclusive as duas metades de 2 KiB de uma página; **independe do núcleo**; uniformidade (qui-quadrado) para `N` = 2, 8, 64 |
+| 15 | **O predicado é um só** | `Sampled(a)` do escritor = o da faixa que o `Gather` real devolve (a ida e volta `u32(a >> 11)`) = o da aplicação = o de cada fragmento do pop, para endereços aleatórios inclusive as duas metades de 2 KiB de uma página; **independe do núcleo**; uniformidade (qui-quadrado) para `N` = 2, 8, 64 **sobre páginas distintas, uma vez cada** (distribuição controlada pelo teste, não um roteiro com páginas quentes repetidas) |
+| 16 | **Reciclagem determinística durante o `Read`** (entre as duas cargas de `state`, `ledger.h:216` e `:237`) | ponto de parada `r.between_state_loads`: um `Register` recicla o slot do registro de `n` (expirado, relógio manual) enquanto a aplicação está entre as cargas: `observation_lost = 1`, o piso subiu antes, a faixa sai **incompleta**, nunca afirmada; o mesmo com a reciclagem **depois** do `Read` e antes de `Marks` (rejeição por geração); mutante sem o piso antes do CAS: a falsa completude aparece |
+| 17 | **`Gather` entre os pedaços de 2 KiB de um aviso amostrado** (D1 ligado) | parada em `c.between_pieces` (7.4.1): `s2 != s`, o aviso é ambíguo com `hi = s2 + 1`, os dois lotes possíveis são incompletos/ambíguos e nenhum afirma `at_risk`; sem `Gather` no meio, os dois pedaços são do lote `d + 1` e o aviso é inequívoco; **o aviso dividido entre lotes nunca recebe um lote só** |
+| 18 | **Índice de vivos contra um `ClearLive` antigo** | `Free` de um registro anterior do slot parado entre o `fetch_and` e a releitura de `state` enquanto `Register` publica `n`: ao fim o bit está ligado e a varredura visita `n` (as duas ordens do `fetch_and` e do `SetLive`) |
 
 #### 3.7.8 Os 2,6 vezes mais lotes de aplicação com o diagnóstico ligado (8.4): hipóteses lidas no código
 
