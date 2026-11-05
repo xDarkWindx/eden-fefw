@@ -479,8 +479,10 @@ contra o `gpu_dirty_memory_manager.h` real (stub de página do harness, `g++ -st
 - **Interação com o diagnóstico:** o aviso é registrado com o tamanho inteiro, mas a aplicação só cobre parte. O
   registro fica pendente e expira, ou aparece como `apply_partial`. Parte de `notice_expired` pode vir daqui
   (**hipótese**).
-- **Plano:** item D1 (`docs/handoff-planner.md`, 7.1): contar as ocorrências no `BackStats`, corrigir
-  recortando o `Collect` nos limites de 2 KiB, e medir A/B antes de mudar o padrão.
+- **O que é garantido:** o comportamento indefinido, não o resultado. A tabela acima é o que o GCC produziu e não
+  vale como previsão para o MSVC (revisão).
+- **Plano:** item D1 (`docs/handoff-planner.md`, 7.1): contar as ocorrências no `BackStats`; recortar dentro do
+  `CollectT`, nas duas variantes, com a correção ligada por padrão; uma chave temporária só para o A/B.
 
 ### Pendências de localização
 

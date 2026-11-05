@@ -142,10 +142,16 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   7.4, confirmado em GCC com UBSan). Escopo:
   - contar no `BackStats`, só com as estatísticas ligadas, os `Collect` que cruzam 2 KiB e as chamadas de
     `InvalidateGPUCache` (vazias e com dados);
-  - correção recortando o `Collect` nos limites de 2 KiB, opt-in (`EDEN_DIRTY_SPLIT_2K=1`) até o A/B;
-  - teste com o header real.
-  A/B do usuário: FE no mesmo lugar e Bananza (chão). Depois disso o padrão muda. O T3a.1 é implementado depois
-  do D1, porque o bug contamina o que ele mede.
+  - correção recortando dentro do `CollectT`, nas duas variantes (revisão: o limite é da representação do
+    gerenciador); **ligada por padrão**, com uma chave temporária `EDEN_DIRTY_SPLIT_2K=0` só para o A/B,
+    apagada depois dele (não fica como opção permanente);
+  - testes com o header real.
+  A/B do usuário: FE no mesmo lugar e Bananza (chão). Uma queda de desempenho seria custo de invalidações antes
+  perdidas: investigar, não restaurar a perda. O T3a.1 é implementado depois do D1, porque o bug contamina o
+  que ele mede.
+- Revisão do desenho do T3a.1 (sobre `b34a2e4`): aceita a direção. Pede ajustes na prova da 3.7.3 (CAS repetido,
+  aviso recortado pelo D1, exclusão do `ClearLive`, rejeição por geração em `marks`), testes novos e a correção
+  de `sampled/seen` (fração de avisos, não de páginas). Tudo foi para o codador junto com o desenho do D1.
 
 ## 8. Armadilhas
 
