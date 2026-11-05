@@ -136,6 +136,16 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   As condições: `CollectT<true>` fora da amostra, cobertura incompleta declarada e custo distribuído (o `other
   busy` sobe; a aplicação sai repartida em 2,6 vezes mais lotes). O prompt do desenho foi para o codador.
 - Próximo Bananza: depois do T3a.1, no mesmo lugar, com e sem `EDEN_NX2_MACRO_REFRESH=1`.
+- `7d509df`: desenho do T3a.1 (seção 3.7). Conferido pelo planejador e mandado ao revisor. O codador corrigiu
+  um erro meu (`protocol.h:695`: sem registro já é ambíguo) e achou o bug dos 2 KiB.
+- **D1 (antes de implementar o T3a.1):** um `Collect` que cruza 2 KiB perde bytes (`docs/gpu-contract-inventory.md`
+  7.4, confirmado em GCC com UBSan). Escopo:
+  - contar no `BackStats`, só com as estatísticas ligadas, os `Collect` que cruzam 2 KiB e as chamadas de
+    `InvalidateGPUCache` (vazias e com dados);
+  - correção recortando o `Collect` nos limites de 2 KiB, opt-in (`EDEN_DIRTY_SPLIT_2K=1`) até o A/B;
+  - teste com o header real.
+  A/B do usuário: FE no mesmo lugar e Bananza (chão). Depois disso o padrão muda. O T3a.1 é implementado depois
+  do D1, porque o bug contamina o que ele mede.
 
 ## 8. Armadilhas
 

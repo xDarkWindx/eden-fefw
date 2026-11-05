@@ -445,6 +445,43 @@ gerenciador seriam uma corrida sobre o `front_buffer`, **preexistente** e indepe
   das retiradas). O diagnóstico **não** a corrige nem a esconde: conta `gather_overlapped` (`gather_active` não
   nulo na entrada) e `apply_out_of_order`, e trata como ambíguos os lotes até ali.
 
+### 7.4 Bug preexistente: um `Collect` que cruza o limite de 2 KiB perde bytes (verificado em GCC)
+
+Achado do desenho do T3a.1 (`docs/list-diag-design.md` 3.7.1) e confirmado pelo planejador com um programa pequeno
+contra o `gpu_dirty_memory_manager.h` real (stub de página do harness, `g++ -std=c++20`).
+
+- **Código (verificado).** A transformação cobre 2 KiB, com uma máscara `u32` de blocos de 64 B (`page_bits =
+  DEVICE_PAGEBITS - 1`, `align_bits = 6`, `gpu_dirty_memory_manager.h:181-186`). `BuildTransform` calcula
+  `top_bit = (minor + size + 63) >> 6` (`:204-212`), sem cortar no fim da transformação. Se a escrita passa de 2 KiB,
+  `top_bit > 32` e `CreateMask` desloca por `32 - top_bit`, que dá a volta em `size_t` (`:195-202`): comportamento
+  indefinido.
+- **Medido (planejador, GCC 13, x86-64, `-O2`):**
+
+  | `Collect` | O `Gather` devolve |
+  | --- | --- |
+  | `[0x10000,+4096)` | `[0x10000,+2048)`: **a segunda metade some** |
+  | `[0x10400,+2048)` | **nada** |
+  | `[0x107c0,+128)` | **nada** |
+  | `[0x10000,+3000)` | `[0x10000,+960)` |
+  | `[0x10000,+2048)` e `[0x10040,+64)` | certos |
+
+  Com `-fsanitize=undefined`: `gpu_dirty_memory_manager.h:197: shift exponent 18446744073709551584 is too large for
+  32-bit type 'unsigned int'`.
+- **Quem chega lá (verificado).** `HandleRasterizerWrite` (`core/memory.cpp:704`) recebe pedaços de `WalkBlock`, de
+  até uma página de 4 KiB: `WriteBlock` (`:322`, `:337`, escritas de HLE e kernel), `ZeroBlock` e
+  `StoreDataCache`/`FlushDataCache` (`:384`, `:393`, a limpeza de cache que o jogo faz antes de entregar memória
+  à GPU). Uma escrita `Write<T>` desalinhada que cruze `0x800` também chega (até 16 B, rara).
+- **Efeito (hipótese).** A escrita segurada nunca chega ao `Gather`. A GPU continua com os bytes velhos daquela
+  parte da página até outro aviso cobri-la: incoerência silenciosa, em qualquer jogo. **No MSVC** o resultado é
+  outro comportamento indefinido; o deslocamento de hardware em x86 usa os 5 bits baixos e daria o mesmo padrão,
+  mas isso não foi conferido no binário. Não se sabe com que frequência acontece no FE ou no Bananza.
+- **Origem:** o gerenciador veio do yuzu; não foi introduzido por este fork (**hipótese**, histórico não aberto).
+- **Interação com o diagnóstico:** o aviso é registrado com o tamanho inteiro, mas a aplicação só cobre parte. O
+  registro fica pendente e expira, ou aparece como `apply_partial`. Parte de `notice_expired` pode vir daqui
+  (**hipótese**).
+- **Plano:** item D1 (`docs/handoff-planner.md`, 7.1): contar as ocorrências no `BackStats`, corrigir
+  recortando o `Collect` nos limites de 2 KiB, e medir A/B antes de mudar o padrão.
+
 ### Pendências de localização
 
 **P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com
