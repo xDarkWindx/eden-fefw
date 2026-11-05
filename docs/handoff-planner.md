@@ -132,7 +132,9 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Item 2: o plano passa a ser **T3a.1** (amostragem por página com cobertura completa nas páginas amostradas, mais
   o caminho quente: contadores por núcleo e uma leitura de relógio por `Register`), e depois o desenho do
   **T3a.2** (`blkcmp`, confirmação do B). O T3b continua esperando.
-- Item 3: o prompt do T3a.1 foi para o revisor. O codador ainda não recebeu nada.
+- Item 3: o revisor aprovou o T3a.1 com condições (revisão 4, `docs/list-diag-design.md` seção 11, linha 14).
+  As condições: `CollectT<true>` fora da amostra, cobertura incompleta declarada e custo distribuído (o `other
+  busy` sobe; a aplicação sai repartida em 2,6 vezes mais lotes). O prompt do desenho foi para o codador.
 - Próximo Bananza: depois do T3a.1, no mesmo lugar, com e sem `EDEN_NX2_MACRO_REFRESH=1`.
 
 ## 8. Armadilhas

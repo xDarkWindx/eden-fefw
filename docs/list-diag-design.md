@@ -640,11 +640,19 @@ Nenhuma violação de P0 nas três rodadas com diagnóstico.
 | d | `pop,blk` | 64 641 (5 amostras, 44-60 s) | 78,2% |
 
 Desligado 81 090, ligado 64 889: **−20,0%** de draws/s, com ruído de ~1% entre as rodadas iguais. A linha de
-base (seção 6 do `handoff-planner.md`, −18%) se confirma no mesmo lugar. A thread de trás fica **mais ociosa**
-com o diagnóstico, então o custo está antes dela, nas threads da CPU do jogo que registram os avisos (hipótese
-compatível com o código abaixo; não medido por thread).
+base (seção 6 do `handoff-planner.md`, −18%) se confirma no mesmo lugar.
 
-**Onde o custo provavelmente está (verificado no código; a parte de cada item é hipótese).** São ~555 mil avisos/s
+**O custo está distribuído, não só nas threads do jogo (correção da revisão 4; medido, mesmos relatórios).** A thread
+de trás fica menos ocupada (86,98% → 78,21%) porque recebe menos trabalho, mas o `other busy` sobe de 15,2% para
+20,2% do tempo de parede, com `prepare draw` igual por draw (7,56 → 7,60 µs). Há também uma **perturbação de
+comportamento**: os lotes de escritas seguradas passam de ~400/s (27,5 trechos cada, 10,2 páginas) para ~1 040/s
+(10,7 trechos, 4,6 páginas; último relatório de cada rodada). O total de trechos por segundo fica parecido (~11 mil). Ou seja, o diagnóstico
+**reparte a mesma aplicação em 2,6 vezes mais lotes**. Isso multiplica os custos por lote na thread de trás
+(travas, varreduras de `NoteApply`), e as janelas A e B são observadas sob um agrupamento diferente do que existe
+sem o diagnóstico. A causa é **hipótese**: escritores mais lentos espalham os avisos no tempo. Os dois lados
+(escritor e aplicação) precisam ser medidos de novo.
+
+**Custo do lado do escritor (verificado no código; quanto cada item pesa é hipótese).** São ~555 mil avisos/s
 (b: 24,4 mi em 44 s; d: 25,0 mi em 44,7 s), e **80% vão para overflow**:
 - `Ledger::Register` (`list_diag/ledger.h:160-210`) examina até `kScan = 8` slots (`:25`) e chama `Expired` em
   cada slot publicado. `Expired` lê o relógio a cada chamada (`:354-358`; `steady_clock::now`, `hooks.h:17-21`).
@@ -668,11 +676,17 @@ compatível com o código abaixo; não medido por thread).
 | `InvalidateGPUCache`: chamadas / vazias / trocas de thread | 54 509 / 48% / 1 | 55 655 / 48% / 2 | 146 754 / 90% / 24 299 |
 
 Leitura:
-- **O `at_risk` não é limite superior da exposição total.** Ele só soma os 30% de trechos não ambíguos (seção 5).
-  Os outros 70% são ambíguos, na maior parte porque o aviso do trecho caiu em overflow (sem registro, `blk` não
-  desconta nada). O limite superior de verdade é `blk_gpu_bytes_covered` (110 MB no b). Mais cobertura resolve
-  as duas coisas.
-- **A** continua raro e, no FE, consistente com sobrescrita. O `sample_different` do Bananza (4 B em
+- **O `at_risk` não é confiável, nem como limite (correção da revisão 4, verificado).** `NoteApply`
+  (`protocol.h:265-300`) só marca ambíguo um trecho com registro suspeito, de outro lote ou parcial. Um aviso
+  perdido em overflow, ou reciclado por expiração antes da aplicação, **não deixa rastro**. Com um registro
+  encontrado e outro perdido no mesmo bloco e lote, a lista `exact` fica incompleta. **Sem nenhum registro**, ela
+  fica vazia e o trecho inteiro conta como "em risco" (`AccountBlock`, `protocol.h:677`). Isso contradiz a seção 5
+  ("nenhum registro (overflow) → ambíguo"): a implementação diverge do desenho. Os 70% ambíguos vêm de
+  sobreposição com outros lotes ou com lotes ambíguos (`apply_overlap_other_lot` 74 948,
+  `apply_overlap_ambiguous_lot` 129 621 no b), não de overflow. Os 30% "não ambíguos" incluem trechos com avisos
+  perdidos. O único limite superior válido é `blk_gpu_bytes_covered` (110 MB no b).
+- **A** apareceu poucas vezes, sempre consistente com sobrescrita no FE; com 80% dos avisos recusados, isso **não
+  mostra que ele é raro** (revisão 4). O `sample_different` do Bananza (4 B em
   `0x86154b8c`, núcleo 4, pop +260 µs, aplicação +738 µs) só diz que a amostra mudou entre o pop e a aplicação
   (seção 4). Não prova nem descarta o A.
 - **Bananza:** a rodada não tem par sem diagnóstico, nem lugar estável. Foi só a carga do save e uns 5 s de chão
@@ -683,9 +697,9 @@ Leitura:
   que concentre os avisos precisa de ~3 300 slots vivos, e `Register` só examina 8 a partir do cursor: o overflow
   é estrutural, não acaso (hipótese: a distribuição por núcleo não é medida).
 
-**Consequência para o plano:** a próxima mudança do diagnóstico precisa **baixar o custo e subir a cobertura juntos**.
-Aumentar o ledger sem mexer no caminho quente aumentaria os dois. O desenho está no prompt T3a.1 (seção 11,
-revisão 4, quando aprovado).
+**Consequência para o plano:** a próxima mudança do diagnóstico precisa baixar o custo, subir a cobertura e
+**declarar a cobertura incompleta** quando ela ocorrer, tudo junto. Aumentar o ledger sem mexer no caminho quente
+aumentaria o custo. Escopo do T3a.1: seção 11, revisão 4.
 
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 
@@ -737,3 +751,37 @@ custo do T3a.
 | 11 (revisão 3, B) | O mesmo código no teste e no emulador: protocolo único em `src/video_core/list_diag/*.h`, `Diag=true` no próprio `gpu_dirty_memory_manager.h`, o harness testa a variante real; `manager.h` só para a equivalência ou sai | Sim: o harness anterior testava uma cópia, e uma divergência entre a cópia e o emulador passaria despercebida | Seção 2 e 8.1.1: headers autocontidos incluídos pelos dois; a equivalência usa o `Collect`/`Gather` antigo (`list_diag_legacy_manager.h`); o modelo e o `manager.h` saíram |
 | 12 (revisão 3, C) | P0 violada invalida o diagnóstico da sessão, não só alguns lotes: na primeira ocorrência o relatório diz, em destaque e uma vez no log, que os resultados a partir dali não são confiáveis, e o resumo repete | Sim. O `violation_floor` só tornava ambíguos alguns lotes | 3.3: `CheckViolation` (primeira ocorrência de `gather_overlapped` ou `apply_out_of_order`): uma linha no log, o prefixo `[P0 VIOLATED]` no relatório, o aviso no resumo e um **instantâneo dos contadores** no instante da violação; os contadores continuam. Sem trava corretiva |
 | 13 (achado ao implementar) | (não veio da revisão) a varredura do livro-razão por faixa lia 6 × 1024 slots, sob o `buffer_cache.mutex` | Sim, e é custo que perturba justamente o que o diagnóstico mede: a praça tem centenas de faixas por lote | 3.4: índice de slots vivos (bitmap) com a ordem publicar-depois-ligar e a releitura em `Free`; o teste confere o índice contra os slots publicados |
+| 14 (revisão 4, sobre `dc4d0a9`) | (1) Com o diagnóstico ligado, um aviso de página não amostrada deve continuar em `CollectT<true>`: misturar com `CollectT<false>` no mesmo gerenciador quebra as premissas da prova, porque os avisos não amostrados também mexem no mesmo `current` e empurram dados para `back_buffer`. (2) Overflow parcial no mesmo bloco e lote deixa `exact` incompleta sem marcar ambíguo; pede teste e mecanismo conservador. (3) Amostra por página, sim; predicado pelo mesmo endereço em todos os hooks, independente do núcleo, com `N` e semente fixos e registrados; resultados observados em primeiro lugar, sem multiplicar tudo por `N`. (4) Recorte do pop por página só no diagnóstico, com o deslocamento do ponteiro, o vínculo `(núcleo, lote)` intacto e contagens separadas (pops originais, fragmentos, fragmentos selecionados). (5) A ociosidade da trás não localiza o custo: o `other busy` sobe de 15,2% para 20,2%. (6) Contadores por núcleo continuam atômicos; conservação só com a execução parada | (1) Sim: `CollectT<true>` só troca as ordens de memória de `current` para `seq_cst` (`gpu_dirty_memory_manager.h:56-85`), e a prova da 3.3 assume essa ordem em todo acesso a `current`. No x86-64, CAS e `exchange` já são instruções com trava nas duas variantes, e a carga `seq_cst` é um `mov`: a economia perdida deve ser pequena (mapeamento padrão, não conferido no binário). (2) Sim, e é **pior**: sem nenhum registro, `exact` fica vazia e o trecho inteiro conta como em risco (`protocol.h:265-300`, `:677`), contra o que a seção 5 diz. Achado meu: a reciclagem por expiração (`ledger.h:166-201`) também perde um registro antes da aplicação dele, e cai no mesmo caso. (3) e (4) Sim. (5) Sim, conferido nos logs; achado meu: o diagnóstico reparte a aplicação em 2,6 vezes mais lotes (8.4). (6) Sim | 8.4 corrigido (custo distribuído, `at_risk` não confiável, A não mostrado como raro). Escopo do T3a.1 abaixo |
+
+**T3a.1 (escopo aprovado pelo revisor, revisão 4; desenho a cargo do codador):**
+- **Três caminhos no escritor:** desligado = `CollectT<false>` (como hoje); ligado e página fora da amostra =
+  `CollectT<true>`, sem ledger, sem carga do lote, sem contador compartilhado; ligado e página na amostra =
+  `CollectObserved` completo.
+- **Predicado:** `hash(seed, endereço >> 12) % N == 0`, sobre o mesmo endereço em todos os hooks (o `Gather`
+  entrega `PAddr`, que o `InvalidateGPUCache` já usa como `DAddr`, `gpu.cpp:133`), sem depender do núcleo. `N` e a
+  semente ficam fixos na sessão: `EDEN_LIST_DIAG_SAMPLE` (padrão 8, `1` = todas as páginas) e
+  `EDEN_LIST_DIAG_SEED` (padrão fixo), ambos impressos na linha `ligado` e no resumo.
+- **Cobertura incompleta declarada:** todo aviso de página amostrada que **não** chega a um registro aplicável
+  (overflow; reciclagem por expiração de registro não encerrado) marca, de forma conservadora, a cobertura do seu
+  `(núcleo, lote)` como incompleta. Se o lote do aviso for ambíguo, marca todos os lotes a partir dele, como o
+  `violation_floor`. A aplicação de um trecho cujo conjunto `(núcleo, lote)` tenha cobertura incompleta conta
+  `blk_incomplete` e **não** afirma `at_risk`. Sem registro nenhum num trecho amostrado com bytes da GPU, a
+  cobertura também é incompleta, como a seção 5 já previa. Nunca falso "completo"; falso "incompleto" é aceito
+  e contado. A granularidade (por `(núcleo, lote)` ou por `(núcleo, lote, página)`) é decisão do desenho.
+- **Pop:** recorte por página só no diagnóstico, com o ponteiro deslocado. Contadores separados:
+  `pop_ranges` (originais, como hoje), `pop_fragments`, `pop_fragments_selected`. Os eventos de um pop são
+  agrupados pelo pop original.
+- **Caminho quente:** uma leitura de relógio por `Register`; contadores do lado do escritor por núcleo (atômicos
+  relaxados com um escritor só, alinhados a 64 B), somados no relatório. Protocolo dos lotes, P0 e 3.3 sem
+  mudança.
+- **Relatório:** valores observados; nenhuma multiplicação por `N`. Os totais a cada 30 s são aproximados; a
+  conservação só vale no resumo final, com a execução parada.
+- **Testes novos:** mistura de páginas selecionadas e não selecionadas nos três caminhos do `Collect`; overflow
+  parcial e total no mesmo bloco e lote; reciclagem por expiração antes da aplicação; recorte de pop atravessando
+  páginas selecionadas e excluídas; `N=1` equivalente ao T3a, a não ser pelos contadores novos de cobertura
+  incompleta; aviso fora da amostra nunca toca o ledger nem os contadores do lote; conservação na amostra com a
+  execução parada.
+- **Aceite em casa:** custo ≤5% de draws/s como alvo medido; `other busy` e a linha `Invalidation batches`
+  comparados com e sem diagnóstico (a perturbação de 2,6 vezes precisa sumir ou ser explicada); `blk_incomplete`
+  baixo nas páginas amostradas. Depois, uma rodada só com `pop` e `N=1` para o A, e sementes diferentes.
+- **Fora:** T3a.2 (`blkcmp`, só desenho depois do T3a.1 medido), T3b, taxas separadas por parte.
