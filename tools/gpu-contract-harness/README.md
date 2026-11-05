@@ -278,4 +278,4 @@ cópia, não da política de callbacks.
 - **Configurações do emulador:** split ligado/desligado, DMA Safe, "Sync Memory Operations" e canais sem ABI
   nativa (que não têm snapshot) não entram.
 
-**Último run.sh:** `run.sh` completo (2000 aleatórias + 200 forçadas por escalonamento no `-O2`; 200 + 20 no TSan e no ASan/UBSan), nos dois modos de host e com 28 casos × 3 regras (incluindo `held_write_block_clobbers_gpu_bytes` e `held_write_block_exact_notices`): `ALL EXPECTATIONS MET` nos três builds, sem aviso de sanitizer, LeakSanitizer ativo e sem vazamentos, saída 0 ("all three builds met every expectation without sanitizer reports").
+**Último run.sh:** `run.sh` completo (2000 aleatórias + 200 forçadas por escalonamento no `-O2`; 200 + 20 no TSan e no ASan/UBSan), nos dois modos de host e com 29 casos × 3 regras (inclui `held_write_block_*` e `held_write_apply_before_memcpy`): `ALL EXPECTATIONS MET` nos três builds, sem aviso de sanitizer, LeakSanitizer ativo e sem vazamentos, saída 0 ("all three builds met every expectation without sanitizer reports").
