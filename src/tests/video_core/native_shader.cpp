@@ -1869,6 +1869,77 @@ TEST_CASE("Native cancellation of two nested barriers preserves the outer join",
 }
 
 
+TEST_CASE("Native conditional cancellation leaves the inner scope through exclusive cleanup", "[native-shader]") {
+    // Donkey Kong Bananza's compute pattern: @P0 BREAK P1, B1 and @P0 BRA P1 to two moves that
+    // run into the outer BSYNC; the fall-through path branches over them.
+    const std::array<Native, 12> input{{
+        {{0x7945, 160, 0x03800000, 0}},  // 0x00 BSSY B0, join after 0xa0
+        {{0x17945, 64, 0x03800000, 0}},  // 0x10 BSSY B1, join after 0x50
+        {{0x10942, 0, 0x00800000, 0}},   // 0x20 @P0 BREAK P1, B1
+        {{0x0947, 64, 0x00800000, 0}},   // 0x30 @P0 BRA P1, 0x80
+        {{0x27802, 2, 0xf00, 0}},        // 0x40 MOV R2, 2
+        {{0x17941, 0, 0x03800000, 0}},   // 0x50 BSYNC B1
+        {{0x27802, 3, 0xf00, 0}},        // 0x60 MOV R2, 3
+        {{0x7947, 32, 0x03800000, 0}},   // 0x70 BRA 0xa0
+        {{0x37802, 4, 0xf00, 0}},        // 0x80 MOV R3, 4 (cleanup)
+        {{0x47802, 5, 0xf00, 0}},        // 0x90 MOV R4, 5 (cleanup)
+        {{0x7941, 0, 0x03800000, 0}},    // 0xa0 BSYNC B0
+        VertexTransform.back(),
+    }};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    auto invalid = input;
+    invalid[3].words[2] = 0x03800000; // the branch drops the second condition
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[3].words[2] = 0x01000000; // the branch tests another predicate
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[8] = {{0x7947, 0, 0x03800000, 0}}; // control flow inside the cleanup
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    invalid = input;
+    invalid[7].words[0] = 0x8947; // the normal path can fall into the cleanup
+    REQUIRE_FALSE(Shader::Ampere::LowerToMaxwell(invalid));
+    std::vector<u64> code(0x50 / 8);
+    for (const auto word : lowered.instructions) {
+        if ((code.size() * 8) % 32 == 0) code.push_back(0);
+        code.push_back(word);
+    }
+    class CleanupEnvironment final : public EmptyEnvironment {
+    public:
+        explicit CleanupEnvironment(const std::vector<u64>& code_) : code{code_} { stage = Shader::Stage::VertexB; }
+        u64 ReadInstruction(u32 address) override { return code.at(address / 8); }
+        const std::vector<u64>& code;
+    } env{code};
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+    Shader::Maxwell::Flow::CFG cfg{env, flow_pool, 0x50};
+    INFO(cfg.Dot());
+    const auto location = [&](u32 index) {
+        const u32 offset = lowered.source_instruction_offsets[index];
+        return Shader::Maxwell::Location{0x50 + offset * 8 + ((offset + 1) / 3) * 8};
+    };
+    for (const bool p0 : {false, true}) for (const bool p1 : {false, true}) {
+        const auto* block = &*cfg.Functions().front().blocks.begin();
+        bool continued{}, cleaned{}, exited{};
+        for (u32 step = 0; step < 64 && block; ++step) {
+            continued |= !block->begin.IsVirtual() && block->Contains(location(6));
+            cleaned |= !block->begin.IsVirtual() && block->Contains(location(8));
+            if (block->end_class == Shader::Maxwell::Flow::EndClass::Exit) { exited = true; break; }
+            const auto [pred, inverted] = block->cond.GetPred();
+            REQUIRE(block->cond.GetFlowTest() == IR::FlowTest::T);
+            REQUIRE((pred == IR::Pred::P0 || pred == IR::Pred::P1 || pred == IR::Pred::PT));
+            const bool value = pred == IR::Pred::PT || (pred == IR::Pred::P0 ? p0 : p1);
+            block = value != inverted ? block->branch_true : block->branch_false;
+        }
+        INFO("P0=" << p0 << " P1=" << p1);
+        REQUIRE(exited);
+        REQUIRE(cleaned == (p0 && p1));
+        REQUIRE(continued == !(p0 && p1));
+    }
+}
+
+
 TEST_CASE("Native full warp synchronization retains ordering after reconvergence", "[native-shader]") {
     std::array<Native, 4> input{{
         {{0x7945, 16, 0x03800000, 0}},
@@ -7065,7 +7136,9 @@ TEST_CASE("Native Donkey Kong Bananza instructions lower to the matching Maxwell
         // HSETP2.EQ.AND P0 = R52.H1 == R52.H1 && P0
         Case{{{0x34007234, 0x30000034, 0x00702800, 0x000fe400}}, Opcode::HSETP2_reg, 0, 0},
         // TEX.LB CUBE R8, R43 = tex({R8, R9}, {R24, bias R25}), RGB
-        Case{{{0x08087b60, 0x70800c18, 0x051e072b, 0x000fc200}}, Opcode::TEX, 0, 0});
+        Case{{{0x08087b60, 0x70800c18, 0x051e072b, 0x000fc200}}, Opcode::TEX, 0, 0},
+        // TXQ R0 = width of the texture at R2, the only component queried
+        Case{{{0x02007b6f, 0x00800c00, 0x000001ff, 0x000f4200}}, Opcode::TXQ, 0, 0});
     const std::array<Native, 2> input{{instruction, VertexTransform.back()}};
     const auto lowered = Shader::Ampere::LowerToMaxwell(input);
     INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
@@ -7078,23 +7151,23 @@ TEST_CASE("Native Donkey Kong Bananza instructions lower to the matching Maxwell
 }
 
 TEST_CASE("Native float set combines the comparison with an input predicate", "[native-shader]") {
-    // FSET.BF.LT.<op> R5 = (R1 < R2) <op> P0, the form Donkey Kong Bananza uses with AND.
+    // FSET.BF.LE.<op> R5 = (R1 <= R2) <op> P0; Donkey Kong Bananza uses the AND form (with LT).
     const u32 operation = GENERATE(0U, 1U, 2U); // AND, OR, XOR
     const bool p0 = GENERATE(false, true);
     const std::array<Native, 2> input{{{{0x0105720aU, 0x00000002U,
-                                         0x00011200U | (operation << 10), 0}},
+                                         0x00013200U | (operation << 10), 0}},
                                        VertexTransform.back()}};
     Shader::ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     TranslateScalarNative(input, block);
-    for (const auto [a, b] : {std::pair{1.0f, 2.0f}, std::pair{2.0f, 1.0f}}) {
+    for (const auto [a, b] : {std::pair{1.0f, 2.0f}, std::pair{2.0f, 2.0f}, std::pair{2.0f, 1.0f}}) {
         ScalarNativeMachine machine;
         machine.regs[1] = std::bit_cast<u32>(a);
         machine.regs[2] = std::bit_cast<u32>(b);
         machine.predicates.fill(true);
         machine.predicates[0] = p0;
         machine.Execute(block);
-        const bool less = a < b;
+        const bool less = a <= b;
         const bool expected = operation == 0 ? (less && p0) : operation == 1 ? (less || p0) : (less != p0);
         REQUIRE(std::bit_cast<float>(machine.regs[5]) == (expected ? 1.0f : 0.0f));
     }

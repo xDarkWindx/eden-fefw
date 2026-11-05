@@ -1842,20 +1842,31 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                  (u64{1} << 22) | (u64{mask} << 31) | (u64{insn.Bits(90, 1)} << 49));
             break;
         }
-        case 0xb6f: { // TXQ dimensions or mip count.
-            const u32 mask = insn.Bits(72, 4);
-            if (insn.Bits(59, 5) || insn.Bits(64, 8) != 255 || (mask != 3 && mask != 8) ||
+        case 0xb6f: { // TXQ dimensions or mip count, any component mask (from Eglantine).
+            // Up to two results go to Rd, Rd+1 directly (Donkey Kong Bananza queries the width
+            // alone); more, with a second destination (bits 64-71) for the third and fourth, come
+            // out packed in scratch and are copied as for TEX.
+            const u32 mask = insn.Bits(72, 4), components = static_cast<u32>(std::popcount(mask));
+            const u32 second_dest = insn.Bits(64, 8);
+            const bool direct = second_dest == 255;
+            if (insn.Bits(59, 5) || mask == 0 || (direct && components > 2) ||
                 insn.Bits(76, 14) || insn.Bits(91, 1) || insn.Bits(54, 5) >= 18 ||
                 insn.Bits(40, 14) > 0x1fff ||
-                (mask == 3 ? ((dest & 1) || dest >= 254) : dest >= 255))
+                (direct ? (components == 2 && (dest & 1)) || dest >= 254
+                        : dest >= 248 || second_dest >= 248))
                 return fail(index, "native texture dimension query mode");
             const u32 binding = insn.Bits(54, 5);
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native texture descriptor buffer conflict");
             result.required_texture_buffer = binding;
-            emit(0xdf48000000000000ULL | predicate | dest | (u64{insn.Bits(24, 8)} << 8) |
+            emit(0xdf48000000000000ULL | predicate | (direct ? dest : 250) | (u64{insn.Bits(24, 8)} << 8) |
                  (u64{1} << 22) | (u64{mask} << 31) | (u64{insn.Bits(40, 14)} << 36) |
                  (u64{insn.Bits(90, 1)} << 49));
+            for (u32 i = 0; !direct && i < components; ++i) {
+                const u32 target = i < 2 ? (dest == 255 ? 255U : static_cast<u32>(dest) + i) : second_dest + (i - 2);
+                if (target != 255)
+                    emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{250 + i} << 20));
+            }
             break;
         }
         case 0xb69: { // TMML.LOD 2D, one selected fixed-point LOD result.
@@ -3504,13 +3515,21 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             }
             const u32 count = static_cast<u32>(barrier_tokens.size() - 1);
             if (index + count >= code.size()) return fail(index, "native barrier cancellation bounds");
+            // BREAK's second condition (87-90, PT when unused): the scope is left when the guard
+            // and it both hold (@P0 BREAK P1, B1 in Donkey Kong Bananza). Accepted for a single
+            // cancellation whose exit branch carries the same guard and condition, so the scope is
+            // left exactly on the path that takes the branch.
+            const u32 cancel_condition = insn.Bits(87, 4);
+            if (cancel_condition != 7 && count != 1) return fail(index, "native barrier cancellation mode");
+            const u32 cancel_mode = cancel_condition == 7 ? 0x03800000U : cancel_condition << 23;
             for (u32 i = 0; i < count; ++i) {
                 const auto& cancel = code[index + i];
                 if (cancel.words[0] != ((barrier_tokens[count - i] << 16) | (native_predicate << 12) | 0x942) ||
-                    cancel.words[1] || cancel.words[2] != 0x03800000 || barrier_sync_scopes[count - i])
+                    cancel.words[1] || cancel.words[2] != cancel_mode || barrier_sync_scopes[count - i])
                     return fail(index, "native barrier cancellation mode");
             }
             const auto prove_exit_path = [&]() {
+                if (cancel_condition != 7) return false;
                 const u32 first = index + count;
                 const auto& entry = code[first];
                 if (entry.Bits(0, 12) != 0x947 ||
@@ -3613,7 +3632,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             }
             if (branch_index >= code.size()) return false;
             bool split_exit = false;
-            if (count == 1 && native_predicate != 7 && branch_index + 1 < code.size()) {
+            if (count == 1 && native_predicate != 7 && cancel_condition == 7 && branch_index + 1 < code.size()) {
                 const auto& resume = code[branch_index];
                 if (resume.words[0] == (((native_predicate ^ 8U) << 12) | 0x947) &&
                     resume.words[2] == 0x03800000 &&
@@ -3624,8 +3643,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 }
             }
             const auto& branch = code[branch_index];
+            // The exit branch's own second condition must match the BREAK's (PT for both when unused).
             if (branch.Bits(0, 12) != 0x947 || branch.Bits(12, 4) != (split_exit ? 7U : native_predicate) ||
-                branch.words[2] != 0x03800000)
+                (branch.words[2] & ~(0xfU << 23)) != 0 || branch.Bits(87, 4) != cancel_condition)
                 return false;
             const s64 target = s64{branch_index + 1} * 16 + static_cast<s32>(branch.words[1]);
             const s64 join = barrier_targets.front() - 16;
@@ -3633,10 +3653,38 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if (target < inner_end || target > join || target % 16 || join < 0 || join % 16 ||
                 static_cast<u64>(join / 16) >= code.size() ||
                 code[join / 16].words[0] != ((barrier_tokens.front() << 16) | 0x7941) ||
-                code[join / 16].words[1] || code[join / 16].words[2] != 0x03800000 ||
-                (barrier_tokens.size() == 2 && target != join && !split_exit))
+                code[join / 16].words[1] || code[join / 16].words[2] != 0x03800000)
                 return false;
-            for (s64 at = (split_exit ? target : inner_end) / 16; target != join && at < join / 16; ++at) {
+            // With two scopes the branch may also land on straight-line cleanup that runs into the
+            // outer join (Donkey Kong Bananza: two moves, then BSYNC B0). The outer SYNC removes the
+            // canceled inner token along with its own, so the join sees the same stack either way.
+            // The cleanup must belong to this exit alone: entered from no other branch, and not by
+            // falling through, as the unconditional branch before it ensures.
+            const auto branch_destination = [&](size_t at) {
+                const u64 raw = code[at].words[1] | (u64{code[at].words[2] & 0x3ffff} << 32);
+                return s64(at + 1) * 16 + (static_cast<s64>(raw << 14) >> 14);
+            };
+            const auto exclusive_cleanup = [&] {
+                const auto& before = code[target / 16 - 1];
+                if (before.Bits(0, 12) != 0x947 || before.Bits(12, 4) != 7 || before.Bits(87, 4) != 7)
+                    return false;
+                for (size_t at = 0; at < code.size(); ++at) {
+                    if (at == branch_index || code[at].Bits(0, 12) != 0x947) continue;
+                    const s64 destination = branch_destination(at);
+                    if (destination >= target && destination < join) return false;
+                }
+                return std::all_of(code.begin() + target / 16, code.begin() + join / 16, [](const auto& cleanup) {
+                    const u32 op = cleanup.Bits(0, 12);
+                    return op != 0x947 && op != 0x945 && op != 0x941 && op != 0x942 && op != 0x944 &&
+                           op != 0x948 && op != 0x949 && op != 0x94d && op != 0x950 && op != 0x958 &&
+                           op != 0x95b;
+                });
+            };
+            const bool cleanup_block =
+                barrier_tokens.size() == 2 && target != join && !split_exit && exclusive_cleanup();
+            if (barrier_tokens.size() == 2 && target != join && !split_exit && !cleanup_block)
+                return false;
+            for (s64 at = (split_exit ? target : inner_end) / 16; !cleanup_block && target != join && at < join / 16; ++at) {
                 const auto& exit = code[at];
                 const u32 op = exit.Bits(0, 12);
                 if (op == 0x947) {
