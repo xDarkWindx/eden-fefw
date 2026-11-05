@@ -290,6 +290,10 @@ o padrão antes de medir.
 - `docs/gpu-produced-data-plan.md`: passos 2 a 6.
 - `docs/back-thread-split-plan.md`: continua valendo para o desempenho do FE; o passo 4 conversa com os
   achados dele sobre `Drain`.
+- `docs/future-optimizations-plan.md`: preparação (sem obrigação agora) para separar engine e rasterizador,
+  descriptor sets persistentes por banco e heap bindless; os fatos compartilhados (versão de bytes, geração de
+  descritor, mapeamento, tempo de vida, dependência, processamento, conclusão, publicação) e o que conferir nas
+  interfaces destes contratos para não ficarem específicos de command lists.
 
 ## 9. Perguntas abertas (revisão 1)
 
