@@ -484,6 +484,106 @@ contra o `gpu_dirty_memory_manager.h` real (stub de página do harness, `g++ -st
 - **Plano:** item D1 (`docs/handoff-planner.md`, 7.1): contar as ocorrências no `BackStats`; recortar dentro do
   `CollectT`, nas duas variantes, com a correção ligada por padrão; uma chave temporária só para o A/B.
 
+### 7.4.1 D1: desenho da correção e da contagem (sem código)
+
+Só desenho; **nada do emulador foi escrito**. Números de linha são os de `72e41f1`.
+
+**Recorte, dentro de `CollectT` (`core/gpu_dirty_memory_manager.h:60-85`), nas duas variantes.** O corpo atual
+(`:65-84`: `BuildTransform` e o laço de CAS) vira `CollectOne<Diag, Hooks>(address, size)`, sem mudança alguma (mesmas
+ordens). `CollectT` passa a ser:
+
+```
+size == 0 e chave ligada:  retorna (sem construir máscara)
+(address & 2047) + size <= 2048:   CollectOne(address, size)         // o caminho de hoje, sem laço e sem ler a chave
+senão, chave desligada:            CollectOne(address, size)         // o código de hoje, com o comportamento indefinido
+senão:  enquanto size > 0:  n = min(size, 2048 - (address & 2047));  CollectOne(address, n);  address += n;  size -= n
+```
+
+- 2048 é `page_size` (`:182`, `1 << page_bits`); a conta usa a constante, não o literal. Cada pedaço cabe numa
+  transformação (`top_bit <= 32`), então `CreateMask` (`:195-202`) nunca recebe deslocamento negativo.
+- A chave é lida **só** quando a faixa cruza 2 KiB: o caso comum (cabe) não paga nem uma carga. Com a chave em 0 o
+  tamanho zero também segue o código de hoje (a saída idêntica do teste).
+- As ordens de memória de cada pedaço são as da variante (`CollectOne` as calcula como hoje). Nenhuma trava nova: o
+  laço chama `CollectOne` em sequência, cada chamada com o seu `guard`/CAS próprio.
+- O hook de teste `Hooks::At` ganha um ponto `c.between_pieces` entre dois pedaços (vazio em produção), para o teste
+  determinístico.
+
+**A chave, lida uma vez, num header de `core/`.** Em `gpu_dirty_memory_manager.h`, antes da classe, no estilo de
+`g_parts` (`video_core/list_diag.h`):
+
+```
+inline std::atomic<u8> g_dirty_split_2k{ParseSplitKey(std::getenv("EDEN_DIRTY_SPLIT_2K"))};  // 0 só se o texto for "0"
+inline bool DirtySplit2K() { return g_dirty_split_2k.load(std::memory_order_relaxed) != 0; }
+```
+
+`ParseSplitKey` é `constexpr`-amigável: ausente ou qualquer valor diferente de `"0"` → 1. É inicializada na carga do
+programa (uma vez), e a leitura é uma carga relaxada, só no caminho que cruza. **O teste a liga e desliga** com
+`g_dirty_split_2k.store(1/0)` com o sistema parado (como os testes fazem com `g_parts`); o harness não precisa
+de variável de ambiente. **Comentário no código e neste doc: a chave é TEMPORÁRIA, existe só para o A/B do usuário
+e será apagada depois dele (o comportamento correto fica fixo); não é uma opção permanente.**
+
+**Com `EDEN_LIST_DIAG` ligado.** `CollectObserved` (`protocol.h:99-`) chama `CollectT<true>` entre as leituras `s`
+e `s2`; o laço fica **dentro** dessa chamada, então todos os pedaços ficam entre `s` e `s2`, com as mesmas ordens
+`seq_cst`. A suficiência de `s == d && s2 == s` vale para **cada** pedaço pelo argumento da 3.7.3 (caminho efetivo
+`A_p` de cada pedaço, antes de `s2` na ordem do programa): sem incremento de `lot_started` entre `s` e `s2`, nenhuma
+retirada começou entre os dois, e todos os pedaços são do lote `d + 1`. Um `Gather` que comece **entre** os pedaços
+incrementa `lot_started` antes de retirar e, como o incremento precede a retirada e ela precede o segundo pedaço
+ou o segue, `s2 != s`: o aviso sai **ambíguo**, com `hi = s2 + 1` (3.7.3, passo 3). **Um aviso dividido entre
+lotes nunca recebe um lote só**: só o caso inequívoco atribui `d + 1`. O registro é um só (o aviso inteiro, com o
+tamanho original); o que a aplicação cobre de cada lote é decidido pelo `exact`/`Suspect` como hoje.
+
+**Contagem (só com `EDEN_BACK_THREAD_STATS=1`; sem as estatísticas nada é lido nem escrito).**
+
+1. *Pedaços que cruzam 2 KiB.* Em `core/memory.cpp`, no lambda de `HandleRasterizerWrite`, **imediatamente antes** da
+   chamada `CollectNotice` (`:768`), dentro de `if (BackStats::Enabled())`:
+   `if ((address & 2047) + size > 2048) { Add(shared.dirty_cross_calls, 1); Add(shared.dirty_cross_bytes, size);
+   Add(shared.dirty_cross_by_source[src], 1); }`. Só passam por ali os pedaços **segurados** (o lambda retorna antes
+   se `OnCPUWrite` não segura, `:752-755`); é o conjunto que o `Collect` vê. Também `dirty_held_calls` (o denominador).
+   **Fonte:** `HandleRasterizerWrite(v_address, size, src = Src::Other)` ganha um parâmetro `enum class Src : u8`,
+   constante em cada chamador (`WriteBlockImpl` `:322` = `WriteBlock`; `ZeroBlock` `:337`; `StoreDataCache` `:384` e
+   `FlushDataCache` `:393` = `CacheOp`; `Write<T>` `:652`; `WriteExclusive*` `:665`, `:679` = `Exclusive`). O parâmetro
+   só é lido dentro do `if (Enabled())`: o compilador o dobra, sem custo fora das estatísticas (a conferir no binário).
+2. *`InvalidateGPUCache`.* Em `video_core/gpu.cpp`, no `Impl::InvalidateGPUCache`: `invalidate_total` na entrada
+   (`:124`, ao lado do `ScopedSharedTime`), `invalidate_empty` no `cached_writes.empty()` (`:147`), e `invalidate_data`
+   logo depois da junção, antes de `OnCachedWrites` (o contador `held_writes.batches` já existe, `vk_rasterizer.cpp:959`,
+   e deve bater com `invalidate_data`: serve de conferência). Todos atrás de `BackStats::Enabled()`.
+3. *Estrutura.* `struct Shared` (`back_thread_stats.h:168-240`) ganha: `dirty_held_calls`, `dirty_cross_calls`,
+   `dirty_cross_bytes`, `dirty_cross_by_source[6]`, `invalidate_total`, `invalidate_empty`, `invalidate_data`, todos
+   `std::atomic<u64>` com `Add` relaxado como os vizinhos. (Linha compartilhada entre os seis núcleos: aceitável porque
+   só existe com as estatísticas ligadas, que já pagam isso nos `cpu_write_*`.)
+
+**Linha do Report** (`back_thread_stats.cpp`, depois de "Guest CPU writes to cached pages", `:335`):
+
+```
+Dirty 2 KiB crossings (EDEN_DIRTY_SPLIT_2K={on|off}): held pieces {held:.0f}/s, crossing 2 KiB {n:.1f}/s ({b:.0f} B/s,
+{pct:.2f}% of held); by source: Write<T> {a:.1f}/s, WriteBlock {b:.1f}/s, ZeroBlock {c:.1f}/s, cache op {d:.1f}/s,
+exclusive {e:.1f}/s; InvalidateGPUCache {t:.0f}/s: empty {z:.0f}/s, with data {w:.0f}/s
+```
+
+`on|off` vem de `DirtySplit2K()`. O texto "temporary switch, removed after the A/B" entra no `LOG_INFO` quando a chave está
+em `off`, para um log antigo não ser lido como configuração permanente.
+
+**Testes** (`tools/list-diag-harness/`, header real, variantes `<false>` e `<true>`, builds `-O2`, TSan e
+ASan+UBSan **com zero erro de UBSan**: o `shift exponent` do 7.4 não pode aparecer com a chave ligada):
+
+| # | Teste | Confere |
+| --- | --- | --- |
+| 1 | Faixa exata de 2 KiB (`[0x10000,+2048)`, `[0x10800,+2048)`) | um pedaço; devolve a faixa inteira |
+| 2 | Página inteira de 4 KiB (`[0x10000,+4096)`) | dois pedaços; `Gather` devolve `[0x10000,+4096)` (pode vir em duas faixas contíguas) |
+| 3 | Início desalinhado (`[0x10033,+3000)`, `[0x107ff,+2)`) | cobre todo byte, arredondado a 64 B |
+| 4 | Cruzamento curto `[0x107c0,+128)` | duas faixas de 64 B; hoje (chave 0) não devolve nada |
+| 5 | Tamanho zero | chave ligada: sem efeito, sem UB; chave desligada: o de hoje (só no build sem UBSan) |
+| 6 | Os casos da tabela do 7.4 | `[0x10000,+4096)`, `[0x10400,+2048)`, `[0x107c0,+128)`, `[0x10000,+3000)`, `[0x10000,+2048)`+`[0x10040,+64)`: faixas inteiras, arredondadas a 64 B |
+| 7 | Equivalência aleatória | para `(endereço, tamanho)` dentro de uma página de 4 KiB, a união do `Gather` cobre **todo byte escrito** e não passa do arredondamento de 64 B; nas duas variantes |
+| 8 | Chave em 0 | saída idêntica à do código de hoje (o legado de `list_diag_legacy_manager.h`) nos casos que não cruzam 2 KiB; nos que cruzam, o teste só confere que a chave 0 reproduz a tabela do 7.4 (sem UBSan) |
+| 9 | Determinístico: `Gather` entre os dois pedaços de um aviso, diagnóstico ligado | parada em `c.between_pieces`; o `Gather` retira; o aviso sai **ambíguo**, nenhum dos dois lotes o afirma (`blk_affirmed = 0`), os dois pedaços aparecem em lotes diferentes na saída do `Gather` |
+| 10 | Pedaços sem `Gather` no meio | aviso inequívoco, os dois pedaços no lote `d + 1` |
+| 11 | Chave lida uma vez | `DirtySplit2K()` só muda com `store` explícito do teste |
+
+**Interação com o T3a.1 e o resto.** O D1 vem antes do T3a.1 (o bug contamina o que ele mede). A aplicação de um
+aviso recortado cobre as duas metades, e o `apply_partial` que o bug produzia deve cair (hipótese). Uma queda de
+desempenho no A/B seria custo de invalidações antes perdidas: investigar, não restaurar a perda.
+
 ### Pendências de localização
 
 **P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com
