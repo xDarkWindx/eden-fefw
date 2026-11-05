@@ -9,13 +9,26 @@ está na seção 10. As mudanças centrais: a tabela de páginas deixou de ser a
 filtro; o modo "aprendido" não vale para comandos; nenhuma consulta a caches sai da thread de trás; e a
 ordem de implementação põe diagnóstico e protocolo antes da arquitetura global.
 
+**Revisão 3 (2026-11-05):** incorpora a terceira revisão, sobre `af41962`. O núcleo passa a ser descrito
+por três contratos (memória, sincronização, apresentação; seção 2.2), com semântica de falha que preserva a
+consistência (seção 12) e critérios de robustez e um protótipo pequeno como próximo passo (seção 13). O que
+mudou está na seção 10.
+
 ## 0. Objetivo
 
-Hoje, cada jogo novo pode exigir mudanças no núcleo do emulador (coerência de memória, sincronização,
-ligação de recursos), além do esperado (instruções de shader, macros, serviços). O objetivo é que **um jogo
-novo só peça trabalho na camada de ISA**: instruções e formas de shader, métodos de engine e comandos de
-serviço. O que o jogo faz com memória, ordem e recursos deve ter um caminho geral no núcleo, ligado pelo
-padrão que o jogo usa, e não pelo título.
+Hoje, cada jogo novo pode exigir mudanças espalhadas pelo núcleo do emulador (coerência de memória,
+sincronização, ligação de recursos), além do esperado (instruções de shader, macros, serviços).
+
+**Meta (revisão 3):** incorporar uma descoberta sobre o hardware com **mudança localizada, efeitos conhecidos
+e testes que protejam o resto**. Um jogo pode revelar uma regra de memória, sincronização ou apresentação
+ainda desconhecida; isso é normal e vai acontecer. A descoberta vira uma regra geral do hardware, na camada
+do contrato responsável (seção 2.2), com teste próprio, e corrige o comportamento para todos os jogos que
+usam o mesmo mecanismo. Nunca uma exceção pelo nome do jogo.
+
+**Critério prático:** "consigo adicionar esta regra, reproduzir o problema num teste pequeno e demonstrar
+quais caminhos ela afeta?" Se a regra exige alterações dispersas ou depende de detalhes internos de vários
+caches, falta uma abstração, ou a descoberta mostrou que o contrato estava incompleto (e o contrato é que
+muda, explicitamente).
 
 Três requisitos, nas palavras do usuário:
 
@@ -41,7 +54,9 @@ Três requisitos, nas palavras do usuário:
 | Ligação de texturas por draw | bancos, tabelas compactas, memos (100adbf, 20d998e, 9c1e70d) | **Desempenho**, e frágil: cada jogo com outro padrão de banco pede outro atalho. |
 | Variáveis de ambiente | 19 nomes distintos em chamadas `getenv("EDEN_...")` em `src/` (grep; não conta nomes montados em tempo de execução nem configurações da interface): `EDEN_BACK_THREAD_STATS`, `EDEN_CPU_WRITE_PAGES`, `EDEN_FLUSH_DRAWS`, `EDEN_GPU_HIGH_PARTS`, `EDEN_GPU_SPLIT`, `EDEN_HELD_WRITE_MERGE`, `EDEN_INLINE_DEFER`, `EDEN_MME_JIT`, `EDEN_NATIVE_ARITHMETIC_REPORT`, `EDEN_NATIVE_DESCRIPTOR_REPORT`, `EDEN_NATIVE_FRONTEND`, `EDEN_NATIVE_SHADER_FIXTURES`, `EDEN_NATIVE_SPIRV_CHECK`, `EDEN_NO_HEAP_REUSE`, `EDEN_NX2_MACRO_REFRESH`, `EDEN_NX2_RESETFIX`, `EDEN_NX2_VDEC_EOS_RELEASE_NOW`, `EDEN_TEXTURE_TABLE_STATS`, `EDEN_WINDOW_TITLE` | **Operação.** |
 
-## 2. Princípios
+## 2. Princípios e contratos
+
+### 2.1 Princípios
 
 1. **Paga quem usa.** Cada mecanismo tem um teste barato que decide se o caminho caro roda. "Barato" é
    medido no FE; uma leitura atômica não é custo zero, ainda mais quando roda por página ou por draw.
@@ -67,8 +82,48 @@ Três requisitos, nas palavras do usuário:
 10. **Mudança automática só para o lado seguro.** O emulador pode, sozinho, passar um consumidor para um modo
     mais exato quando detecta um problema; nunca o contrário dentro da sessão.
 11. **Defender no ponto de consumo.** Todo dado que vem de um produtor que pode ter falhado ou atrasado
-    (contagens de draw, argumentos indiretos, tamanhos, ponteiros) é conferido onde é usado, e um valor
-    impossível vira trabalho pulado e contado, não crash nem device lost.
+    (contagens de draw, argumentos indiretos, tamanhos, ponteiros) é conferido onde é usado, **antes** de o
+    item mudar qualquer estado. Um valor impossível vira trabalho pulado e contado, não crash nem device lost.
+12. **Falha preserva consistência.** Um item só é pulado se for possível provar que ele não mudou estado
+    compartilhado (caches, registradores, comandos gravados). Se não for possível, o canal é suspenso com
+    diagnóstico, ou o contexto é reconstruído. Continuar mesmo assim é opção explícita de compatibilidade,
+    nunca o padrão.
+
+### 2.2 Contratos
+
+O núcleo é descrito por três contratos. Cada regra nova do hardware entra na camada responsável por um
+deles, e os consumidores continuam usando a mesma interface, sem conhecer o jogo nem espalhar verificações
+pelo rasterizador.
+
+| Contrato | Pergunta que responde | Interface (proposta) | Dono |
+| --- | --- | --- | --- |
+| **Memória** | Quem produziu estes bytes, que versão o consumidor precisa e até quando ela vale? | `Request(faixas, posição do consumidor) → Transferência { bytes, produtores incluídos, versão, fence de conclusão, válida até }` | Thread de trás (caches) |
+| **Sincronização** | Que condição precisa ser satisfeita, quem pode satisfazê-la e como esperar sem bloquear esse produtor? | `Dependência { condição (semáforo ≥/= valor, syncpoint ≥ valor, fence), quem satisfaz (canal, cliente do host1x, CPU), limite, ação ao estourar }` | Frente (agendamento dos canais) + quem satisfaz |
+| **Apresentação** | Quando a imagem está pronta, quando pode ser exibida e quando seus recursos podem ser reutilizados? | `Frame { pronto (fence do produtor), exibível (ritmo e intervalo de troca), liberado (fence de liberação devolvida ao jogo) }` | Serviços de vídeo (vi2, decodificador) + thread de trás |
+
+**Memória — "até quando vale":** uma transferência deixa de valer quando um produtor posterior escreve
+nas mesmas faixas, quando a CPU do jogo as escreve ou quando o espaço da GPU é remapeado. O consumidor
+recebe a validade junto com os bytes e não precisa saber por quê.
+
+**Sincronização — "sem bloquear o produtor":** quem espera nunca segura um recurso de que o produtor
+precisa. Um canal à espera fica estacionado, e a frente continua alimentando os outros canais (o produtor
+pode estar num deles). Uma dependência que não se satisfaz no limite suspende o canal com diagnóstico
+(seção 12).
+
+**Apresentação — por que é contrato próprio (casos reais):** o Eglantine 6a22450 mostra o Bananza
+rodando um frame à frente da thread da GPU e reescrevendo memória que ela ainda não tinha lido, com comandos
+mal lidos, travamentos e crashes. A correção deles foi por título ("esperar cada frame do Bananza"), porque
+a regra geral que testaram custava ao Mario Kart World (18 → 31 ms por frame). Neste fork, a liberação de
+quadros do decodificador de vídeo já passou por correções do mesmo tipo (1207e2b, d03d95d). A regra geral
+é: nada que o jogo enxerga como "liberado" (fence de apresentação, quadro do decodificador, conclusão
+sinalizada antes da hora) pode deixar o jogo reaproveitar um recurso que o emulador ainda vai ler. O
+snapshot de comandos daqui (`nvhost_gpu.cpp:392-397`) é uma aplicação parcial dessa regra (só para as
+palavras das listas). Como este fork trata o "frame à frente" ainda não foi verificado.
+
+**Toda extensão de um contrato declara:** a condição nova, as esperas novas, os recursos retidos (cópias,
+buffers, canais estacionados), o custo quando ninguém usa, os caminhos afetados e o teste que reproduz o
+problema. Regras de sincronização podem afetar o desempenho global mesmo com implementação localizada; a
+declaração é o que torna esse custo visível antes de entrar.
 
 ## 3. Camadas
 
@@ -152,13 +207,14 @@ Uma tabela única (`video_core/policy.h`), lida uma vez no início, com sintaxe 
 | --- | --- | --- |
 | `list_fetch` | `submitted` / `exact` | `submitted` até a validação (gpu-produced-data-plan 4.2) |
 | `macro_params` | `submitted` / `exact` | como hoje |
-| `cpu_buffer_read` | `none` / `learned` / `fence` | `learned` (o que existe hoje no Vulkan) |
+| `cpu_buffer_read` | `none` / `learned` / `fence` | `learned` (concessão de precisão que já existe no Vulkan; seção 12.3) |
 | `cpu_texture_read` | `none` / `exact` | `none` (hoje) |
 | `semaphore_order` | `immediate` / `ordered` | `immediate` |
 | `invalidate_flush` | `off` / `on` | `off` |
 | `split` | `0` / `1` / `2` | `2` |
 
-- **"Learned"** só para dados lidos pela CPU do jogo (princípio 6), nunca para comandos.
+- **"Learned"** nunca para comandos (princípio 6). Para dados lidos pela CPU do jogo ele é uma concessão de
+  precisão, não uma política segura (seção 12.3).
 - **Accurate não é "todas as políticas no máximo" (revisão).** O nível High hoje controla, além das quatro
   partes de `accuracy_parts.h`: queries precisas (`vk_query_cache.cpp:177`), renderização condicional
   (`:1520-1540`), o split desligado (`gpu_split.cpp:77-80`), o adiamento de fences (`fence_manager.h:82`,
@@ -260,6 +316,13 @@ o padrão antes de medir.
 | Ordem: diagnóstico e protocolo antes da arquitetura global | Seção 5 reescrita conforme a revisão |
 | (revisão 2) Posição no ring não é dependência satisfeita | 3.3 e passo 4 da seção 5 |
 | (diretriz do usuário) Segurança antes de desempenho, com orçamento | Seção 0, princípios 9-11, seção 12, passo 1b |
+| (revisão 3) Timeout com `continue` por padrão não é seguro | 12.2 c: padrão `suspend` (canal suspenso com diagnóstico); `continue` só explícito |
+| (revisão 3) Pular um item depois de exceção exige recuperação definida | Princípio 12; 12.2 b: fase de validação sem mudança de estado; depois dela, suspender o canal ou reconstruir |
+| (revisão 3) Leitura velha da CPU também pode ter efeito persistente | 12.3: `cpu_buffer_read=learned` é concessão existente, não política segura |
+| (revisão 3) Escalar não desfaz leituras anteriores | 12.2 d e 12.4: o verificador é diagnóstico; a sessão é marcada como possivelmente comprometida |
+| (revisão 3) Meta "só ISA" forte demais | Seção 0: descoberta vira regra geral do hardware, com teste, na camada do contrato |
+| (revisão 3) Contratos explícitos de memória, sincronização e apresentação | Seção 2.2, com a declaração obrigatória de cada extensão |
+| (revisão 3) Três evidências de robustez; protótipo pequeno | Seção 13 |
 
 ## 11. Teste com casos reais: os Zeldas do Lichii
 
@@ -303,9 +366,9 @@ aparecer como a perda de um degrau em parte dos frames; o número observado tamb
 | # | Mecanismo | Tipo | Hoje neste fork (verificado) | Proposta |
 | --- | --- | --- | --- | --- |
 | a | Guardas no ponto de consumo | conter | Nenhuma guarda geral; só um `ASSERT` nas macros HLE do Switch 1 (`macro.cpp:112`) | Contagens de vértices e índices contra o tamanho dos recursos ligados, argumentos indiretos, tamanhos de alocação (o caso do `QuadIndexBuffer` do Lichii 92a1a0f): valor impossível = draw pulado, log com limite e contador por motivo |
-| b | Contenção de exceções nas threads da GPU | conter | Exceções de shader são capturadas (`vk_rasterizer.cpp:392`, `vk_pipeline_cache.cpp`); o laço da thread de trás do split não captura nada | Capturar no item de trabalho (draw, dispatch, cópia): pular o item, marcar o canal como degradado, log e contador; nunca abortar o processo por um item |
-| c | Esperas com limite | conter | Acquires esperam sem limite; o `acquire_timeout` é TODO (`puller.cpp:293`) | Toda espera nova (a espera real do syncpoint, por exemplo) com limite de tempo: ao estourar, log com o que esperava e política `continue` ou `hold` (padrão `continue`) |
-| d | Verificador por amostragem | detectar | Não existe | Em builds normais, 1 de cada N consumidores candidatos (listas, macros, argumentos indiretos) é comparado com a versão coerente, por cópia assíncrona da GPU para um buffer privado. Diferença = log uma vez com os detalhes, escalada daquele consumidor para o modo exato até o fim da sessão (princípio 10) e linha no relatório. Custo dentro do orçamento; N ajustável |
+| b | Contenção de exceções nas threads da GPU | conter | Exceções de shader são capturadas (`vk_rasterizer.cpp:392`, `vk_pipeline_cache.cpp`); o laço da thread de trás do split não captura nada | Cada item de trabalho (draw, dispatch, cópia) tem uma **fase de validação**, que lê estado e confere entradas sem mudar nada, e uma **fase de efeito**. Exceção na validação: item pulado, contador, log; o estado continua consistente. Exceção na fase de efeito (caches, registradores ou comandos já mudados): o canal é **suspenso** com diagnóstico (o resto do emulador segue respondendo e o log diz o que estava em curso). Reconstruir o contexto (invalidar os caches do canal e recomeçar no próximo frame) é uma extensão futura, com teste próprio. Continuar depois de uma exceção na fase de efeito é opção explícita de compatibilidade |
+| c | Esperas com limite | conter | Acquires esperam sem limite; o `acquire_timeout` é TODO (`puller.cpp:293`) | Toda espera nova (a espera real do syncpoint, por exemplo) tem limite. Ao estourar, a dependência **continua não satisfeita**: o padrão é `suspend` (o canal fica estacionado, com diagnóstico do que esperava, quem poderia satisfazer e o valor atual) e a espera continua sendo reavaliada; `continue` (seguir sem a dependência) é opção explícita de compatibilidade, e `abort` serve à depuração |
+| d | Verificador por amostragem | detectar | Não existe | Em builds normais, 1 de cada N consumidores candidatos (listas, macros, argumentos indiretos) é comparado com a versão coerente, por cópia assíncrona da GPU para um buffer privado. É **diagnóstico**: uma diferença gera log com os detalhes, marca a sessão como **possivelmente comprometida** no relatório e escala aquele consumidor para o modo exato até o fim da sessão (princípio 10). Isso protege as leituras seguintes, mas **não desfaz** as anteriores; o relatório recomenda reabrir o jogo, e a política escalada pode ser gravada na configuração do jogo só com o consentimento do usuário |
 | e | Relatório de saúde | detectar | `EDEN_BACK_THREAD_STATS` mede tempo, não saúde | Um bloco curto no log a cada 60 s e no fim da sessão: escaladas, rejeições por estágio, draws pulados por motivo, escritas perdidas, esperas estouradas, políticas em vigor. O usuário manda esse bloco em vez do log inteiro |
 | f | Fuzz da entrada de comandos | prevenir | Não existe | No harness dos casos dirigidos: listas mutadas e aleatórias contra `DmaPusher` e puller reais; critério: sem crash, sem travar, sem estado corrompido depois de uma lista inválida |
 | g | Modo verificação | detectar | Havia verificação das cópias de registradores do split (`EDEN_GPU_SPLIT_VERIFY` no `docs/perf-handoff.md`), removida na limpeza | `EDEN_VERIFY=1`: invariantes dos caches (faixas da GPU contra o rastreio), cópias de registradores da frente, versões das transferências; caro, só para investigação |
@@ -318,13 +381,59 @@ aparecer como a perda de um degrau em parte dos frames; o número observado tamb
   com produtor na fila (`exact-drain`); e só se os dois estourarem o orçamento, `submitted` com o
   verificador por amostragem (que detecta, mas não previne), por decisão do usuário.
 - `macro_params`: mesma regra.
-- `cpu_buffer_read` continua `learned`: o erro possível é um dado lido uma vez, não um comando, e o
-  verificador cobre a detecção.
+- `cpu_buffer_read=learned` é uma **concessão de precisão que já existe** (no Vulkan, a primeira leitura
+  pela CPU de um buffer escrito pela GPU não baixa nada, `vk_rasterizer.cpp:883-908`), não uma política
+  comprovadamente segura. Um dado velho pode decidir uma alocação, um endereço ou uma sequência de comandos
+  do jogo, com efeito persistente. Fica como padrão por custo: o modo `fence` (baixar nas fences tudo o que a
+  GPU escreveu) custou ao Eglantine 250-330 MB/s de cópias e ~7% na preparação de draws (NX2_NOTES, linha
+  131, medido por eles). Antes de mudar o padrão, medir o `fence` (ou um meio-termo) contra o orçamento. Até
+  lá, a concessão fica declarada no relatório de saúde.
 
 ### 12.4 Limites
 
-- Detectar não é prevenir: o verificador por amostragem pega um problema novo depois de algumas ocorrências.
-  Por isso ele é a última linha, não a primeira.
+- Detectar não é prevenir nem recuperar: o verificador pega um problema novo depois de algumas ocorrências
+  e só protege o que vem depois. Uma sessão em que ele encontrou diferença pode já estar corrompida. Por isso
+  ele é a última linha, não a primeira.
+- Suspender um canal deixa o jogo parado naquele ponto. É o comportamento certo quando a alternativa é
+  executar comandos com estado inconsistente, e o diagnóstico precisa dizer o bastante para virar uma regra
+  ou um teste.
 - Guardas no consumo evitam crash e device lost, mas um draw pulado ainda é imagem errada; o relatório de
   saúde é o que transforma isso em diagnóstico.
 - Conter exceções pode esconder bugs; por isso cada contenção conta, loga e aparece no relatório.
+
+## 13. Critérios de robustez e protótipo
+
+### 13.1 As três evidências (revisão 3)
+
+O núcleo só é chamado de robusto com:
+
+1. **Os casos dirigidos passando sob escalonamentos diferentes das threads:** primeira escrita, vários
+   canais, retomada dentro da entrada, reutilização pela CPU, remapeamento, escrita parcial de página, dois
+   produtores na mesma faixa. "Escalonamentos diferentes": o harness injeta atrasos e trocas de ordem entre
+   frente, trás e GPU falsa (como os harnesses TSan do split) e repete cada caso milhares de vezes.
+2. **Nenhum consumidor usando bytes sem relação definida** entre produtor, versão e conclusão: todo
+   consumidor de dados produzidos pela GPU passa pelo contrato de memória. Isso é conferido por inventário
+   (lista dos consumidores e do caminho de cada um) e, no modo verificação, em tempo de execução.
+3. **Falhas e dependências não resolvidas com comportamento explícito que preserva a consistência:** cada
+   ponto de falha da seção 12.2 tem teste (exceção na validação, exceção no efeito, espera que estoura,
+   produtor rejeitado).
+
+### 13.2 Protótipo (próximo passo)
+
+Pequeno, testável fora do jogo, e com a propriedade que a revisão pediu: **uma hipótese derrubada é
+corrigida localmente, com evidência, sem contaminar o resto**.
+
+- **Escopo:** o contrato de memória e o de sincronização, só para command lists.
+  - `Dependência` com as condições que existem hoje (semáforo, syncpoint, WFI, bit de sync) e a regra de
+    visibilidade como **um único ponto trocável**: a hipótese "o produtor só é visível ao fetch depois de uma
+    dependência satisfeita" mora num lugar só. Se cair, troca-se essa regra pela conservadora
+    (`exact-drain`), e nenhum consumidor muda.
+  - `Transferência` com faixas, produtores incluídos, versão, fence e validade.
+  - O consumidor "busca de command list" usando só essas duas interfaces.
+- **Fora do escopo:** mudar o comportamento do emulador. O protótipo entra desligado, primeiro como o build
+  de diagnóstico (`docs/gpu-produced-data-plan.md`, 4.1.2), que já usa as mesmas interfaces.
+- **Pronto quando:** os casos da 13.1, item 1, passam no harness sob escalonamentos aleatórios; trocar a regra
+  de visibilidade muda o resultado só dos casos que dependem dela; e a declaração da seção 2.2 (esperas,
+  recursos retidos, custo sem uso, caminhos afetados) está escrita para ele.
+- **Roda na nuvem:** harness e casos não precisam do PC do usuário. O jogo só entra depois, para a matriz
+  do Bananza e o A/B do FE.
