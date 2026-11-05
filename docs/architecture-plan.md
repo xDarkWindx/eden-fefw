@@ -24,8 +24,10 @@ Três requisitos, nas palavras do usuário:
 - **Idempotente:** as operações do núcleo são do tipo "garanta que X esteja em dia". Repetir uma delas tem
   o mesmo efeito que fazê-la uma vez. A consulta repetida custa pouco, mas não zero. Nenhuma correção depende
   de um evento ser entregue exatamente uma vez.
-- **Rápida:** o caminho que um jogo não usa custa o mínimo possível, medido. O benchmark é o Fortune's Weave
-  na praça (~21 FPS aqui contra ~14 nos forks, medido pelo usuário), que não pode piorar em nenhum passo.
+- **Rápida, mas segura antes de rápida (diretriz do usuário, 2026-11-05):** uma pequena regressão no FE é
+  aceitável em troca de algo mais seguro, adaptável e agnóstico. O mais importante é antecipar e se proteger
+  dos problemas antes que eles aconteçam, porque eles vão acontecer. O desempenho continua medido em todo
+  passo, contra um **orçamento** explícito (seção 12.1), e não contra "zero regressão".
 
 ## 1. De onde vem a troca constante (verificado neste fork e nos forks)
 
@@ -59,6 +61,14 @@ Três requisitos, nas palavras do usuário:
    desligável e com log.
 8. **Verificável fora do jogo.** Toda mudança de núcleo deve poder ser checada no corpus de shaders e,
    depois, em replays de frames.
+9. **Seguro por padrão, rápido por medição.** Entre dois modos corretos, o padrão é o mais barato. Entre um
+   modo correto e um rápido que pode errar, o padrão é o correto, se couber no orçamento. Modos que podem
+   errar só por escolha explícita.
+10. **Mudança automática só para o lado seguro.** O emulador pode, sozinho, passar um consumidor para um modo
+    mais exato quando detecta um problema; nunca o contrário dentro da sessão.
+11. **Defender no ponto de consumo.** Todo dado que vem de um produtor que pode ter falhado ou atrasado
+    (contagens de draw, argumentos indiretos, tamanhos, ponteiros) é conferido onde é usado, e um valor
+    impossível vira trabalho pulado e contado, não crash nem device lost.
 
 ## 3. Camadas
 
@@ -198,6 +208,7 @@ o padrão antes de medir.
 | 5 | Consumidor de command lists, opt-in; validar reutilização pela CPU, primeira escrita e retomada depois de acquire | baixo enquanto opt-in |
 | 6 | Decidir: reverter o 6d3dd9a no split, padrão do consumidor | o objetivo é ganhar de volta as macros na frente |
 | 7 | Registro de políticas (sem mudar padrões) | nenhum |
+| 1b | Proteções da seção 12.2 que não dependem de nada: guardas no consumo, contenção de exceções, esperas com limite, relatório de saúde | baixo; entram cedo, junto do passo 1 |
 | 8 | Trabalhos separados, cada um com evidência própria: arrays de ids, plugins, BDA, heap bindless, replay | varia |
 
 ## 6. O que não muda
@@ -248,6 +259,7 @@ o padrão antes de medir.
 | Contagem de 19 variáveis sem critério | Critério e lista na seção 1 |
 | Ordem: diagnóstico e protocolo antes da arquitetura global | Seção 5 reescrita conforme a revisão |
 | (revisão 2) Posição no ring não é dependência satisfeita | 3.3 e passo 4 da seção 5 |
+| (diretriz do usuário) Segurança antes de desempenho, com orçamento | Seção 0, princípios 9-11, seção 12, passo 1b |
 
 ## 11. Teste com casos reais: os Zeldas do Lichii
 
@@ -272,3 +284,47 @@ ainda tem perguntas abertas (seção 9 e `docs/gpu-produced-data-plan.md`, seç�
 Este fork: o `WriteMemory` daqui não baixa a página (`buffer_cache.h:132-138`), então o b13c4c1 não se
 aplica como está; falta verificar se o upload de páginas marcadas pela CPU sobrescreve bytes da GPU no
 mesmo buffer. Esse é o caso dirigido "escrita parcial de página" do outro plano.
+
+## 12. Proteção antecipada
+
+A diretriz é antecipar os problemas e se proteger deles antes que aconteçam. Três tipos de proteção, da mais
+forte para a mais fraca: **prevenir** (o modo correto por padrão), **conter** (um erro vira trabalho pulado e
+contado, não crash) e **detectar** (o emulador percebe sozinho e escala para o modo seguro).
+
+### 12.1 Orçamento de desempenho
+
+Proposta, para o usuário confirmar ou mudar: cada item de segurança pode custar até **5% de draws/s** na
+praça e no palácio do FE, e a soma dos itens até **10%**, sempre medido e registrado no doc do item. Acima
+disso, a decisão é do usuário. Com a praça em ~21 FPS e o FPS em degraus (30/24/22/20), 5% de draws/s pode
+aparecer como a perda de um degrau em parte dos frames; o número observado também é registrado.
+
+### 12.2 Mecanismos
+
+| # | Mecanismo | Tipo | Hoje neste fork (verificado) | Proposta |
+| --- | --- | --- | --- | --- |
+| a | Guardas no ponto de consumo | conter | Nenhuma guarda geral; só um `ASSERT` nas macros HLE do Switch 1 (`macro.cpp:112`) | Contagens de vértices e índices contra o tamanho dos recursos ligados, argumentos indiretos, tamanhos de alocação (o caso do `QuadIndexBuffer` do Lichii 92a1a0f): valor impossível = draw pulado, log com limite e contador por motivo |
+| b | Contenção de exceções nas threads da GPU | conter | Exceções de shader são capturadas (`vk_rasterizer.cpp:392`, `vk_pipeline_cache.cpp`); o laço da thread de trás do split não captura nada | Capturar no item de trabalho (draw, dispatch, cópia): pular o item, marcar o canal como degradado, log e contador; nunca abortar o processo por um item |
+| c | Esperas com limite | conter | Acquires esperam sem limite; o `acquire_timeout` é TODO (`puller.cpp:293`) | Toda espera nova (a espera real do syncpoint, por exemplo) com limite de tempo: ao estourar, log com o que esperava e política `continue` ou `hold` (padrão `continue`) |
+| d | Verificador por amostragem | detectar | Não existe | Em builds normais, 1 de cada N consumidores candidatos (listas, macros, argumentos indiretos) é comparado com a versão coerente, por cópia assíncrona da GPU para um buffer privado. Diferença = log uma vez com os detalhes, escalada daquele consumidor para o modo exato até o fim da sessão (princípio 10) e linha no relatório. Custo dentro do orçamento; N ajustável |
+| e | Relatório de saúde | detectar | `EDEN_BACK_THREAD_STATS` mede tempo, não saúde | Um bloco curto no log a cada 60 s e no fim da sessão: escaladas, rejeições por estágio, draws pulados por motivo, escritas perdidas, esperas estouradas, políticas em vigor. O usuário manda esse bloco em vez do log inteiro |
+| f | Fuzz da entrada de comandos | prevenir | Não existe | No harness dos casos dirigidos: listas mutadas e aleatórias contra `DmaPusher` e puller reais; critério: sem crash, sem travar, sem estado corrompido depois de uma lista inválida |
+| g | Modo verificação | detectar | Havia verificação das cópias de registradores do split (`EDEN_GPU_SPLIT_VERIFY` no `docs/perf-handoff.md`), removida na limpeza | `EDEN_VERIFY=1`: invariantes dos caches (faixas da GPU contra o rastreio), cópias de registradores da frente, versões das transferências; caro, só para investigação |
+| h | Corpus, casos dirigidos e (depois) replay | prevenir | Testes de shader existem | Rodam na nuvem a cada mudança de núcleo, antes de chegar ao usuário |
+
+### 12.3 O que muda nos padrões
+
+- `list_fetch`: o padrão, depois de validado, é o modo exato mais barato que passar nos casos dirigidos, se
+  couber no orçamento. Ordem de preferência: exato por dependências; exato por espera em toda entrada
+  com produtor na fila (`exact-drain`); e só se os dois estourarem o orçamento, `submitted` com o
+  verificador por amostragem (que detecta, mas não previne), por decisão do usuário.
+- `macro_params`: mesma regra.
+- `cpu_buffer_read` continua `learned`: o erro possível é um dado lido uma vez, não um comando, e o
+  verificador cobre a detecção.
+
+### 12.4 Limites
+
+- Detectar não é prevenir: o verificador por amostragem pega um problema novo depois de algumas ocorrências.
+  Por isso ele é a última linha, não a primeira.
+- Guardas no consumo evitam crash e device lost, mas um draw pulado ainda é imagem errada; o relatório de
+  saúde é o que transforma isso em diagnóstico.
+- Conter exceções pode esconder bugs; por isso cada contenção conta, loga e aparece no relatório.

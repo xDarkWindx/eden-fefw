@@ -43,8 +43,11 @@ Este plano é o primeiro caso concreto de `docs/architecture-plan.md`. O desenho
 
 ## 1. Restrições
 
-- **O FE não pode piorar.** A praça está em ~20 FPS porque a thread de trás trabalha ~43 ms por frame
-  (`docs/back-thread-split-plan.md`, 3.14). O modo 2 do split existe para tirar as macros dela.
+- **Segurança antes de desempenho, com orçamento (diretriz do usuário, 2026-11-05).** Uma pequena regressão
+  no FE é aceitável em troca de algo mais seguro e agnóstico, dentro do orçamento de
+  `docs/architecture-plan.md`, seção 12.1 (proposta: até 5% de draws/s por item). A praça está em ~20 FPS
+  porque a thread de trás trabalha ~43 ms por frame (`docs/back-thread-split-plan.md`, 3.14); o modo 2 do
+  split existe para tirar as macros dela, e o custo de cada passo continua medido.
 - **No FE, este fork é bem mais rápido que os forks de origem.** O usuário testou o Eglantine e o Lichii:
   no pior ponto da praça, ~14 FPS lá contra ~21 aqui (2026-11-05; versões e configurações não registradas).
   Os forks servem de referência do que o Bananza precisa, não de desenho. Nada deles entra no caminho do FE
@@ -242,7 +245,9 @@ limpos geram falsos positivos; medir contra entradas com bytes realmente diferen
 acquire de syncpoint muda o comportamento de todos os jogos que usam syncpoint, e por isso entra atrás de
 chave própria, com A/B no FE.
 
-**Chave:** `EDEN_GPU_LISTS=0/1` (padrão 0 até validar no Bananza e no FE).
+**Chave e padrão:** `EDEN_GPU_LISTS=0/1`, padrão 0 até passar nos casos dirigidos e no Bananza. Depois
+disso, o padrão segue `docs/architecture-plan.md`, seção 12.3: o modo exato mais barato que couber no
+orçamento, mesmo com um custo pequeno no FE.
 
 ### 4.3 Releitura de macro
 
