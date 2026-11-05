@@ -7047,6 +7047,36 @@ TEST_CASE("Native float to signed byte conversion saturates through a 16-bit con
     REQUIRE(((conversions[1] >> 50) & 1) == 1);       // saturate
 }
 
+TEST_CASE("Native Donkey Kong Bananza instructions lower to the matching Maxwell operation", "[native-shader]") {
+    using Shader::Maxwell::Opcode;
+    struct Case {
+        Native instruction;
+        Opcode expected;
+        u32 size_shift;  // bit of the Maxwell size field, or 0 to skip the size check
+        u32 size;
+    };
+    const auto [instruction, expected, size_shift, size] = GENERATE(
+        // LDG.E.S8 R78 = [UR4 + R78]
+        Case{{{0x4e4e7981, 0x00000004, 0x081ea300, 0x000ea200}}, Opcode::LDG, 48, 1},
+        // STG.E.U8 [R2.64] = R17
+        Case{{{0x02007386, 0x00000011, 0x0010a100, 0x001fe800}}, Opcode::STG, 48, 0},
+        // F2I.TRUNC R2 = UR7
+        Case{{{0x00027d05, 0x00000007, 0x0821f100, 0x000ef000}}, Opcode::F2I_reg, 0, 0},
+        // HSETP2.EQ.AND P0 = R52.H1 == R52.H1 && P0
+        Case{{{0x34007234, 0x30000034, 0x00702800, 0x000fe400}}, Opcode::HSETP2_reg, 0, 0},
+        // TEX.LB CUBE R8, R43 = tex({R8, R9}, {R24, bias R25}), RGB
+        Case{{{0x08087b60, 0x70800c18, 0x051e072b, 0x000fc200}}, Opcode::TEX, 0, 0});
+    const std::array<Native, 2> input{{instruction, VertexTransform.back()}};
+    const auto lowered = Shader::Ampere::LowerToMaxwell(input);
+    INFO("offset=" << lowered.error_offset << " error=" << lowered.error);
+    REQUIRE(lowered);
+    const auto found = std::ranges::find_if(lowered.instructions, [&](u64 word) {
+        return Shader::Maxwell::Decode(word) == expected;
+    });
+    REQUIRE(found != lowered.instructions.end());
+    if (size_shift != 0) REQUIRE(((*found >> size_shift) & 7) == size);
+}
+
 TEST_CASE("Native wide and high multiply-add retain carries and aliased inputs", "[native-shader]") {
     const bool wide = GENERATE(false, true);
     const bool signed_product = GENERATE(false, true);
