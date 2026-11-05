@@ -60,6 +60,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/accuracy_parts.h"
 
 namespace Vulkan {
 
@@ -867,7 +868,7 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
             return true;
         }
     }
-    if (!Settings::IsGPULevelHigh()) {
+    if (!VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::TextureFlush)) {
         return false;
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
@@ -1115,7 +1116,7 @@ void RasterizerVulkan::ReleaseFences(bool force) {
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
                                                 VideoCommon::CacheType which) {
-    if (Settings::IsGPULevelHigh()) {
+    if (VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::FlushOnInvalidate)) {
         FlushRegion(addr, size, which);
     }
     InvalidateRegion(addr, size, which);

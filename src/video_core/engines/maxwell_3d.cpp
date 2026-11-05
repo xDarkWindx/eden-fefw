@@ -26,6 +26,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/accuracy_parts.h"
 
 namespace Tegra::Engines {
 
@@ -263,7 +264,7 @@ bool Maxwell3D::ReadMacroMemory(GPUVAddr address, std::span<u32> words) {
 }
 
 void Maxwell3D::RefreshParametersImpl() {
-    if (!Settings::IsGPULevelHigh()) {
+    if (!VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::MacroParameters)) {
         return;
     }
     size_t current_index = 0;

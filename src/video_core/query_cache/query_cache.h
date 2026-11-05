@@ -27,6 +27,7 @@
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
+#include "video_core/accuracy_parts.h"
 
 namespace VideoCommon {
 
@@ -294,7 +295,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     if (is_fence) {
         impl->rasterizer.SignalFenceCoalesced(std::move(operation));
     } else {
-        if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+        if (!VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::QueryOrdering) &&
+            counter_type == QueryType::Payload) {
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);

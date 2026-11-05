@@ -21,6 +21,7 @@
 #include "video_core/gpu_thread.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
+#include "video_core/accuracy_parts.h"
 
 namespace VideoCommon::GPUThread {
 
@@ -149,7 +150,7 @@ void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
 }
 
 void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async) {
-    if (Settings::IsGPULevelHigh()) {
+    if (VideoCommon::IsHighAccuracyPart(VideoCommon::HighAccuracyPart::FlushOnInvalidate)) {
         if (!is_async) {
             PushCommand(FlushRegionCommand(addr, size), false, is_async);
         } else {
