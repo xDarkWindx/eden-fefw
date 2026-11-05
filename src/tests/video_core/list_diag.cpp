@@ -1037,6 +1037,31 @@ TEST_CASE("list diag: off, nothing changes; on, the production hooks work", "[li
     g_parts = saved;
 }
 
+// This test creates the state of the diagnostic: it must come after the one that checks that nothing
+// is allocated while the diagnostic is off (the tests run in the order they are written).
+TEST_CASE("list diag: a line says the diagnostic is on, and the totals line carries a tag", "[list-diag]") {
+    const u32 saved = g_parts.load();
+    g_parts = PartPop | PartBlk;
+    State(); // created (and its log sink installed) before the capture below
+    static std::vector<std::string> captured;
+    captured.clear();
+    const LogSink saved_sink = g_sink.load();
+    g_sink = [](const std::string& line) { captured.push_back(line); };
+    LogStartup();
+    REQUIRE(captured.size() == 1);
+    CHECK(captured[0].find("[ListDiag] ligado: partes=pop,blk") == 0);
+    CHECK(captured[0].find("list: T3b") == std::string::npos);
+    const auto totals = State().SummaryLines("total");
+    CHECK(!totals.empty());
+    CHECK(totals[0].find("[ListDiag][total]") == 0);
+    g_parts = 0;
+    captured.clear();
+    LogStartup(); // off: silence
+    CHECK(captured.empty());
+    g_sink = saved_sink;
+    g_parts = saved;
+}
+
 // =============================================================================================
 // Threads: writers, one invalidator at a time (the precondition), a pop thread; the ground truth
 // is the Gather itself.

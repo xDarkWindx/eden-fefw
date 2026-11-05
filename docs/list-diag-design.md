@@ -601,6 +601,13 @@ Anotar também os degraus de FPS. Fechar o jogo pelo menu (para o resumo sair no
 **Bananza**, onde o chão some, GPU em Fast, com o split como está (sem `EDEN_GPU_SPLIT=0`): uma rodada
 `$env:EDEN_LIST_DIAG="pop,blk"`, o tempo que for preciso para o chão aparecer ou não, e fechar pelo menu.
 
+**O que deve aparecer no log** (com `EDEN_LIST_DIAG=pop,blk`; sem a variável **nenhuma** linha `[ListDiag]`):
+1. na partida do GPU, **uma** linha: `[ListDiag] ligado: partes=pop,blk; resumo ao fechar o jogo e totais a cada 30 s`.
+   Se ela não está no log, a variável não chegou ao processo (outro PowerShell, ou o exe não é o build novo);
+2. a cada ~30 s, linhas `[ListDiag][total] ...` (os contadores não nulos), para o log ter dados mesmo se o jogo for morto;
+3. na hora, `[ListDiag][pop] hit/applied/never` e `[ListDiag][blk]` quando houver ocorrência (pode não haver nenhuma);
+4. ao fechar pelo menu, `[ListDiag][summary] ...` (e uma linha por núcleo com as chamadas ao `Gather`).
+
 **O que me mandar** (de `user\log\eden_log.txt`; `Select-String -Path user\log\eden_log.txt -Pattern "ListDiag"`):
 
 1. **Todas** as linhas `[ListDiag][summary]` (os contadores totais e, por núcleo, as chamadas ao `Gather`);

@@ -246,6 +246,7 @@ struct GPU::Impl {
     /// core timing events.
     void Start() {
         Settings::UpdateGPUAccuracy();
+        VideoCommon::ListDiag::LogStartup();
         gpu_thread.StartThread(*renderer, renderer->Context(), scheduler);
     }
 

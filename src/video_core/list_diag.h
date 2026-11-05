@@ -128,12 +128,49 @@ inline void NotePopHook(u64 start, u64 end, const u8* bytes) {
     State().NotePop(start, end, bytes);
 }
 
-/// gpu.cpp, after an application: the log, at most once per second, outside every cache lock.
+inline std::string PartsText() {
+    const u32 parts = g_parts.load(std::memory_order_relaxed);
+    std::string text;
+    for (const auto& [bit, name] : {std::pair<u32, const char*>{PartPop, "pop"}, {PartBlk, "blk"}, {PartList, "list"}}) {
+        if ((parts & bit) != 0) {
+            text += text.empty() ? name : std::string{","} + name;
+        }
+    }
+    return text;
+}
+
+/// gpu.cpp, when the GPU starts: ONE line that says the diagnostic is on and which parts (nothing
+/// at all when it is off). Without it a log with no [ListDiag] line cannot tell "off" from "broken".
+inline void LogStartup() {
+    if (g_parts.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    State(); // creates the state and installs the log sink
+    Emit("[ListDiag] ligado: partes=" + PartsText() + (Enabled(PartList) ? " (list: T3b, ainda nao implementada)" : "") +
+         "; resumo ao fechar o jogo e totais a cada 30 s");
+}
+
+/// gpu.cpp, after an application: the log, at most once per second, outside every cache lock; and
+/// every 30 seconds a line of totals, so that the log holds data even if the game is killed
+/// instead of closed from the menu (the summary is written at shutdown only).
 inline void DrainLog() {
     if (g_state.load(std::memory_order_acquire) == nullptr) {
         return;
     }
-    State().MaybeDrain(Emit);
+    Impl& state = State();
+    state.MaybeDrain(Emit);
+    static std::atomic<u64> last_heartbeat{0};
+    const u64 now = ProdHooks::NowUs();
+    u64 last = last_heartbeat.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_heartbeat.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last >= 30'000'000 && last_heartbeat.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        for (const std::string& line : state.SummaryLines("total")) {
+            Emit(line);
+        }
+    }
 }
 
 /// back_thread_stats.cpp Report(): the lines of the periodic block, if the diagnostic is on.

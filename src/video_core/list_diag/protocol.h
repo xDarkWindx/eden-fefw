@@ -502,17 +502,17 @@ public:
 
     /// The summary at the end of the session: every non-zero counter, the P0 notice if it applies,
     /// and the counters as they were when the violation was first seen.
-    std::vector<std::string> SummaryLines() {
+    std::vector<std::string> SummaryLines(const char* tag = "summary") {
         CheckViolation();
         auto fields = Fields(counters);
         std::vector<std::string> lines;
         if (P0Violated()) {
-            lines.push_back("[ListDiag][summary] *** precondicao P0 violada: os resultados do diagnostico a partir da primeira "
+            lines.push_back(std::string{"[ListDiag]["} + tag + "] *** precondicao P0 violada: os resultados do diagnostico a partir da primeira "
                             "violacao nao sao confiaveis (gather_overlapped=" +
                             std::to_string(Get(counters.gather_overlapped)) +
                             ", apply_out_of_order=" + std::to_string(Get(counters.apply_out_of_order)) + ") ***");
         }
-        std::string line = "[ListDiag][summary]";
+        std::string line = std::string{"[ListDiag]["} + tag + "]";
         for (const FieldRef& f : fields) {
             const u64 value = Get(*f.counter);
             if (value != 0) {
@@ -523,12 +523,12 @@ public:
         for (unsigned core = 0; core < N; ++core) {
             const u64 calls = Get(counters.gather_calls[core]);
             if (calls != 0) {
-                lines.push_back("[ListDiag][summary] gather[" + std::to_string(core) + "]=" + std::to_string(calls) +
+                lines.push_back(std::string{"[ListDiag]["} + tag + "] gather[" + std::to_string(core) + "]=" + std::to_string(calls) +
                                 " empty=" + std::to_string(Get(counters.gather_empty[core])));
             }
         }
         if (P0Violated()) {
-            std::string before = "[ListDiag][summary] counters at the first violation:";
+            std::string before = std::string{"[ListDiag]["} + tag + "] counters at the first violation:";
             for (size_t i = 0; i < fields.size() && i < at_violation_.size(); ++i) {
                 if (at_violation_[i] != 0) {
                     before += std::string{" "} + fields[i].name + "=" + std::to_string(at_violation_[i]);
