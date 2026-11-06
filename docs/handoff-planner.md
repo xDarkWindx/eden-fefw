@@ -234,8 +234,9 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - `52e726b`: staging não achado cancela (`StagingState`, descarte `blkcmp_discard_staging`); o texto do Report e a nota
   do scheduler estão corrigidos. Conferido pelo planejador (82 casos, 79 passam e 3 falham como esperado; mutantes 6 e
   2). O build está liberado para o usuário.
-- Rodada 5 (`list-diag-design.md` 8.7): o build compilou no MSVC. O rastreador novo reordena mais (~20% dos uploads contra
-  ~9%). O custo ainda não foi concluído, porque a 5a chegou à cena aos ~100 s e oscilou; pedi a repetição. O staging foi
+- Rodada 5 (`list-diag-design.md` 8.7): o build compilou no MSVC. Com a repetição 5a2, o T4.1 dá −0,9% (ruído de ~6%
+  entre rodadas iguais), sem sinal de custo. A fração reordenada varia de uma rodada para outra com o mesmo rastreador
+  (10% a 21%); a primeira leitura, "o novo reordena mais", foi retirada. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
@@ -248,6 +249,9 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Na frente do split nunca se consultam caches nem o scheduler, nem depois de uma espera parcial. **Exceção:** depois de um
   `DrainBack` completo, a frente pode usar o rasterizador até mandar mais trabalho (`puller.cpp:179-180`; revisão 5).
 - **Protocolo de rodadas (usuário, 2026-11-06):** uma rodada de cada configuração; repetir só quando algo for
-  inesperado ou precisar de confirmação. Um par só tem ruído de ~1%: dizer isso ao comparar.
+  inesperado ou precisar de confirmação. O usuário sempre para ~25 s depois de o save carregar, qualquer que seja a
+  demora do emulador ou do menu. **Comparar alinhando pelo início da cena** (o primeiro relatório com mais de 40 mil
+  draws/s): descartar esse relatório e usar a média dos 5 seguintes. Não filtrar por ocupação da trás. O ruído entre
+  rodadas iguais já foi de ~1% (rodada 3) e de ~6% (rodada 5): dizer o ruído ao comparar.
 - Os nomes dos arquivos de log que o usuário manda nem sempre dizem a configuração: confira a linha
   `[ListDiag] ligado` (no primeiro par, o "desligado_b" estava com o diagnóstico ligado).

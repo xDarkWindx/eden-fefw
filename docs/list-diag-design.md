@@ -1638,22 +1638,34 @@ linhas de log:
 5a com o rastreador novo; 5b com `EDEN_USAGE_TRACKER_OLD=1`; 5c com `pop,blk,blkcmp` e o rastreador novo. A linha
 `Upload reordering` diz o rastreador ativo em cada uma. Sem P0; todas as identidades fecham com resíduo 0.
 
-**Custo do T4.1: ainda sem conclusão.** Na 5a o jogo só chega à cena por volta de 100 s (na 5b, aos 36 s), e os draws/s
-oscilam de 73 mil a 94 mil depois disso. Com as amostras de trás ≥ 85%: 5a 76 803 (3 amostras), 5b 80 302 (5): −4,4%, mas a
-5a não é comparável assim. **Pedido ao usuário:** confirmar o que foi diferente na 5a e repetir a rodada do rastreador
-novo nas mesmas condições da 5b.
+**Método (corrigido):** as rodadas são alinhadas pelo **início da cena**, o primeiro relatório com mais de 40 mil draws/s.
+Descarta-se esse relatório, que ainda é transição, e usa-se a média dos 5 seguintes. O usuário sempre para ~25 s depois
+de o save carregar, então essa janela cobre o mesmo trecho em todas as rodadas, qualquer que seja a demora do emulador e
+do menu. O filtro antigo ("trás ≥ 85% ocupada") descartava amostras válidas da 5a e não alinhava as rodadas.
 
-**Reordenação (trecho estável, medido):**
+**Custo do T4.1 (medido; uma repetição a pedido do planejador, 5a2):**
 
-| | Rastreador | Permitidas e feitas pelo `upload_cmdbuf` | Em ordem do stream buffer | Fração reordenada |
+| Rodada | Rastreador | Cena começa | 5 amostras seguintes (draws/s) | Média |
 | --- | --- | --- | --- | --- |
-| 5a | novo | ~2 100/s (~9,9 MiB/s) | ~8 400/s | ~20% |
-| 5b | antigo | ~1 100/s (~6,5 MiB/s) | ~10 500/s | ~9% |
-| 5c | novo, com diagnóstico | ~1 700/s | ~8 700/s | ~16% |
+| 5a | novo | 101 s (o emulador e o menu demoraram) | 94 132, 85 048, 77 514, 73 462, 79 433 | 81 918 |
+| 5a2 | novo | 37 s | 81 138, 74 879, 76 647, 75 670, 78 207 | 77 308 |
+| 5b | antigo | 36 s | 81 016, 79 093, 80 571, 80 059, 80 771 | 80 302 |
 
-O rastreador novo **reordena mais**. É o esperado: o antigo, com o UB do tamanho < 64 B saindo `~0` no x86, marcava a
-palavra inteira (4 KiB) e tirava a reordenação de uploads vizinhos (`t4-coherence-fix-plan.md` 9.2, casos 1 e 4). Permissão e
-efeito batem nas três rodadas: toda cópia permitida vem do stream buffer.
+Novo (duas rodadas) 79 613 contra antigo 80 302: **−0,9%**. As duas rodadas iguais diferem entre si em 5,8%, então o ruído
+desta campanha é bem maior que o ~1% da rodada 3. **Conclusão: nenhum sinal de custo do T4.1**, dentro de um ruído grande.
+
+**Reordenação (medido):** a fração de uploads que vai para o `upload_cmdbuf` no trecho estável foi:
+
+| Rodada | Rastreador | Fração reordenada |
+| --- | --- | --- |
+| 5a | novo | 18-21% (~2 100/s) |
+| 5c | novo, com diagnóstico | 15-17% (~1 700/s) |
+| 5a2 | novo | **10-11%** (~1 150/s) |
+| 5b | antigo | 9-10% (~1 100/s) |
+
+**A fração varia de uma rodada para outra com o mesmo rastreador** (5a contra 5a2), então a diferença não pode ser
+atribuída ao T4.1. A primeira versão desta seção dizia que o rastreador novo reordena mais; isso foi retirado. Não há sinal
+de que ele reordene menos. Permissão e efeito batem em todas: toda cópia permitida vem do stream buffer.
 
 **`blkcmp` (5c):**
 - **staging coerente em 203 de 203 comparações**, invalidado em 0, nenhum `staging_nao_achado`. Isso vale para as
