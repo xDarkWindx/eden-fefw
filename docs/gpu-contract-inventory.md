@@ -631,7 +631,7 @@ configuração do protocolo acima: o FE parado no ponto de sempre, só `EDEN_BAC
   amostra por amostra, aos lotes de `held_writes` que já existiam (`vk_rasterizer.cpp:959`), e `CrossesTransform` é a
   mesma função que o harness testa.
 - **Bananza:** as duas rodadas não chegam a um trecho estável (o log acaba em ~52 s, ainda subindo), então não há
-  custo comparável. O chão ficou como relatado pelo usuário.
+  custo comparável. O chão nas duas rodadas: **a confirmar pelo usuário**.
 - **Taxa de `InvalidateGPUCache` sem diagnóstico (nova):** no FE estável, ~1 800 chamadas/s, ~77% vazias, ~400/s com
   dados. Com o diagnóstico (8.4 do `list-diag-design.md`), os totais da sessão davam ~1 240/s e 48% vazias, com os lotes
   de escritas em ~1 040/s. Os números não são do mesmo trecho, então só sugerem que o diagnóstico faz **menos**
