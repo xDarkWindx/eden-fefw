@@ -88,13 +88,20 @@ seção 4; não é garantia de correção. O1 depende de dois consertos: o laço
   `mask_width = 32` (a largura da máscara), não o tamanho do grão em bytes. Vale para os dois grãos.
 - **O recorte do `CollectT` (D1)** corta na transformação do grão (128 B ou 2 KiB). `HasWrites` (T4.0) não mudou: o endereço
   `0xffffffff` de 128 B é uma transformação legítima, identificada pela máscara.
-- **Custo do escritor** (aceite): um contador das vezes que o `CollectOne` toma o `guard` (a troca de transformação). Fica dentro
-  do `guard`, que já é tomado, com um `load` e um `store` (sem operação com `lock`); nenhum contador no caminho do CAS. Sempre
-  ligado, uma linha própria no relatório das estatísticas (`Dirty grain ...: guard taken ... /s, ...% of the held pieces`).
+- **Custo do escritor** (aceite): um contador das vezes que o `CollectOne` toma o `guard` (a troca de transformação). **Corrigido na
+  revisão 6:** o contador pertence ao gerenciador (`GuardTakes()`), é **cumulativo** e nunca zera; é incrementado dentro do
+  `guard` com `load` e `store` (um escritor por gerenciador, W1; sem operação com `lock`), nenhum no caminho do CAS, e **só com as
+  estatísticas ligadas** (um `const bool` do gerenciador, lido uma vez da mesma condição de `EDEN_BACK_THREAD_STATS`, testado dentro
+  do `guard`). O relatório (`Dirty grain ...`) lê o valor cumulativo de cada gerenciador e calcula a diferença desde a leitura anterior
+  (o valor anterior fica com o leitor, `DirtyGuardReader`). Soma só os gerenciadores do `System`: ele registra o array
+  (`DirtyGuardRegistry`, `Register` no construtor do `Impl`, `Unregister` no destrutor, antes de o array morrer) e o relatório lê sob a
+  trava do registro, então nenhum gerenciador de teste ou ferramenta entra por acidente e não há alocador de slots. A chave de cada
+  valor lido é (registro, índice): um registro novo nunca herda o valor de outro, mesmo no mesmo endereço. Isto mede trocas de
+  transformação, não o custo total do escritor.
 - **Faixas por lote:** a linha "Invalidation batches" conta faixas em bytes e páginas de 4 KiB, não depende do grão; com 4 B ela
   deve mostrar mais faixas por lote antes da junção, e é o que se confere no emulador.
-- **Layout:** o gerenciador cresce 8 bytes (o grão e o índice do contador). O teste do harness que exigia o layout antigo passou a
-  exigir exatamente esse acréscimo.
+- **Layout:** o gerenciador cresce 16 bytes (o grão e a flag do contador, 8 com o padding, e o contador, 8). O teste do harness que
+  exigia o layout antigo passou a exigir exatamente esse acréscimo.
 - **Não compilado na nuvem:** `core/core.cpp`, `core/memory.cpp` e `video_core/back_thread_stats.cpp` (só checagem de sintaxe com
   GCC/clang).
 

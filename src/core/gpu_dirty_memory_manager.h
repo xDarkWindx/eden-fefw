@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -38,23 +39,16 @@ enum class DirtyGrain : u8 { B64, B4 };
     return grain == DirtyGrain::B4 ? 4 : 64;
 }
 
-/// How many times a writer took the guard of its manager (the swap of the transformation in `CollectOne`): the cost of the
-/// grain on the writer. Always on. Incremented INSIDE the guard, which is taken anyway; none on the CAS path. One cache line
-/// per slot, a manager keeping one slot for good (the slots are read and cleared by the statistics report).
-struct alignas(64) DirtyGuardSlot {
-    std::atomic<u64> takes{};
-};
-inline constexpr size_t kDirtyGuardSlots = 16;
-inline std::array<DirtyGuardSlot, kDirtyGuardSlots> g_dirty_guard_slots;
-inline std::atomic<u32> g_dirty_guard_next_slot{};
+/// The condition of EDEN_BACK_THREAD_STATS (the statistics are on): the variable is set, not empty and does not start with '0'.
+/// One definition for the report (video_core/back_thread_stats.cpp) and for the counter of the guard below.
+[[nodiscard]] inline bool StatsEnvEnabled(const char* value) {
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
-/// Sum of the takes since the last call, and cleared.
-[[nodiscard]] inline u64 TakeDirtyGuardTakes() {
-    u64 total = 0;
-    for (DirtyGuardSlot& slot : g_dirty_guard_slots) {
-        total += slot.takes.exchange(0, std::memory_order_relaxed);
-    }
-    return total;
+/// Read once, at the first use: whether the statistics are on for the session. The counter of the guard counts only then.
+[[nodiscard]] inline bool SessionDirtyStats() {
+    static const bool enabled = StatsEnvEnabled(std::getenv("EDEN_BACK_THREAD_STATS"));
+    return enabled;
 }
 
 /// Stop points for the tests of the diagnostic (EDEN_LIST_DIAG, docs/list-diag-design.md). A test
@@ -85,17 +79,18 @@ static_assert(sizeof(GatherLotState) == 64);
 
 class GPUDirtyMemoryManager {
 public:
-    /// The grain of the session (EDEN_DIRTY_GRAIN, read once).
-    GPUDirtyMemoryManager() : GPUDirtyMemoryManager{SessionDirtyGrain()} {}
+    /// The grain of the session (EDEN_DIRTY_GRAIN, read once) and the statistics of the session.
+    GPUDirtyMemoryManager() : GPUDirtyMemoryManager{SessionDirtyGrain(), SessionDirtyStats()} {}
 
     /// An explicit grain. The manager is no template (the arrays of managers, the statistics and the diagnostic keep one
     /// type); the grain is a `const bool` next to `current`, and `CollectT` and the iteration of `GatherT` choose between two
     /// instantiations of their bodies by it: each has its shifts and masks as COMPILE-TIME constants, so the 64 B path is the
     /// code of before plus one load and one predictable branch (a fixed value for the whole session), with no variable shift.
-    explicit GPUDirtyMemoryManager(DirtyGrain grain)
-        : current{default_transform}, fine_grain{grain == DirtyGrain::B4},
-          guard_slot{static_cast<u8>(g_dirty_guard_next_slot.fetch_add(1, std::memory_order_relaxed) %
-                                     kDirtyGuardSlots)} {
+    ///
+    /// `count_guard_takes` turns on the counter of the guard takes (the writer cost of the grain, `GuardTakes`): fixed at
+    /// construction like the grain, and tested INSIDE the guard, so that without the statistics a writer does nothing more.
+    explicit GPUDirtyMemoryManager(DirtyGrain grain, bool count_guard_takes = SessionDirtyStats())
+        : current{default_transform}, fine_grain{grain == DirtyGrain::B4}, count_guard{count_guard_takes} {
         back_buffer.reserve(256);
         front_buffer.reserve(256);
     }
@@ -117,6 +112,18 @@ public:
 
     [[nodiscard]] DirtyGrain Grain() const {
         return fine_grain ? DirtyGrain::B4 : DirtyGrain::B64;
+    }
+
+    /// How many times a writer took the guard of THIS manager (the swap of the transformation in `CollectOne`): the writer
+    /// cost of the grain. CUMULATIVE, owned by the manager, never reset: a reader keeps its own previous value and takes the
+    /// difference (DirtyGuardReader). Written only inside the guard, so there is one writer at a time (W1) and a load and a
+    /// store are exact; read by any thread, relaxed. Counts only when the manager was made with the statistics on.
+    [[nodiscard]] u64 GuardTakes() const {
+        return guard_takes.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool CountsGuardTakes() const {
+        return count_guard;
     }
 
     /// `Diag = false` is the code of before the diagnostic, with its memory orders. `Diag = true`
@@ -177,11 +184,13 @@ private:
             if (tmp.address != t.address) {
                 if (HasWrites(tmp)) {
                     std::scoped_lock lk(guard);
-                    // Writer cost of the grain (see DirtyGuardSlot): under the guard, never on the CAS path. The slot of a manager
-                    // is its own (at most kDirtyGuardSlots managers are alive together) and the guard orders the writers
-                    // of this manager, so a load and a store do: no lock-prefixed operation.
-                    DirtyGuardSlot& slot = g_dirty_guard_slots[guard_slot];
-                    slot.takes.store(slot.takes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                    // Writer cost of the grain (GuardTakes): under the guard, never on the CAS path, and only with the statistics
+                    // on. The guard orders the writers of this manager (W1), so a load and a store are exact.
+                    if (count_guard) {
+                        const u64 takes = guard_takes.load(std::memory_order_relaxed);
+                        Hooks::At("c.guard_count"); // test stop point (folds away): between the load and the store
+                        guard_takes.store(takes + 1, std::memory_order_relaxed);
+                    }
                     back_buffer.emplace_back(tmp);
                     current.exchange(t, exchange_order);
                     return;
@@ -353,11 +362,92 @@ private:
     std::atomic<TransformAddress> current{};
     /// The grain, fixed at construction (next to `current`: the same cache line).
     const bool fine_grain; ///< true: 4 B grain (transformation 128 B); false: 64 B (2 KiB)
-    const u8 guard_slot;   ///< Which DirtyGuardSlot counts this manager's guard takes
+    const bool count_guard; ///< the statistics are on: count the guard takes
     std::mutex guard;
     std::atomic<u64> gather_epoch{};
+    std::atomic<u64> guard_takes{}; ///< cumulative; written only inside `guard`
     std::vector<TransformAddress> back_buffer;
     std::vector<TransformAddress> front_buffer;
+};
+
+/// Which managers the statistics report reads: the ones the session's System owns (an array that lives as long as the System),
+/// registered explicitly at its start and unregistered at its end. No manager registers itself, so a manager made by a test or a
+/// tool is never summed in by accident, and there is no allocator of slots. The report reads under `mutex_`, and so does
+/// Unregister: once it returns, the report no longer touches the array that is about to be destroyed.
+class DirtyGuardRegistry {
+public:
+    /// Returns the serial of this registration (never reused), the identity a reader keeps its previous values by.
+    u64 Register(std::span<const GPUDirtyMemoryManager> managers) {
+        std::scoped_lock lock{mutex_};
+        const u64 serial = next_serial_++;
+        entries_.push_back({serial, managers});
+        return serial;
+    }
+
+    void Unregister(u64 serial) {
+        std::scoped_lock lock{mutex_};
+        std::erase_if(entries_, [serial](const Entry& entry) { return entry.serial == serial; });
+    }
+
+    /// `visit(serial, index, manager)` for every registered manager, under the registry's lock.
+    template <class Visit>
+    void ForEach(Visit&& visit) const {
+        std::scoped_lock lock{mutex_};
+        for (const Entry& entry : entries_) {
+            for (size_t index = 0; index < entry.managers.size(); ++index) {
+                visit(entry.serial, index, entry.managers[index]);
+            }
+        }
+    }
+
+private:
+    struct Entry {
+        u64 serial;
+        std::span<const GPUDirtyMemoryManager> managers;
+    };
+    mutable std::mutex mutex_;
+    std::vector<Entry> entries_;
+    u64 next_serial_{1};
+};
+
+/// The registry of the session: the System registers its array here.
+[[nodiscard]] inline DirtyGuardRegistry& SessionDirtyGuardRegistry() {
+    static DirtyGuardRegistry registry;
+    return registry;
+}
+
+/// What the statistics report keeps: the cumulative value last read of each registered manager, by (registration, index). The
+/// counters are never reset; the report takes the DIFFERENCE since its previous reading. A manager that was unregistered is
+/// forgotten here, and one registered later (even at the same address) is another registration, so counts never mix.
+class DirtyGuardReader {
+public:
+    /// The guard takes of every registered manager since the previous call (the first call: since the start).
+    [[nodiscard]] u64 ReadDelta(const DirtyGuardRegistry& registry) {
+        std::vector<Seen> now;
+        u64 total = 0;
+        registry.ForEach([&](u64 serial, size_t index, const GPUDirtyMemoryManager& manager) {
+            const u64 cumulative = manager.GuardTakes();
+            u64 previous = 0;
+            for (const Seen& seen : seen_) {
+                if (seen.serial == serial && seen.index == index) {
+                    previous = seen.cumulative;
+                    break;
+                }
+            }
+            total += cumulative - previous; // monotonic: the manager only ever adds
+            now.push_back({serial, index, cumulative});
+        });
+        seen_ = std::move(now);
+        return total;
+    }
+
+private:
+    struct Seen {
+        u64 serial;
+        size_t index;
+        u64 cumulative;
+    };
+    std::vector<Seen> seen_;
 };
 
 } // namespace Core

@@ -371,8 +371,8 @@ TEST_CASE("list diag: the lot state lives outside the manager, one cache line pe
     STATIC_REQUIRE(sizeof(Core::GatherLotState) == 64);
     STATIC_REQUIRE(alignof(Core::GatherLotState) == 64);
     // The manager has no member of the diagnostic. Its only additions are the O1 fields (docs/t4-coherence-fix-plan.md, revision 5):
-    // the grain (two const u8) and the slot of the guard counter (one u8), which take 8 bytes with the padding.
-    STATIC_REQUIRE(sizeof(Manager) == sizeof(Legacy::GPUDirtyMemoryManager) + 8);
+    // the grain and the flag of the guard counter (two const bool, 8 bytes with the padding) and the counter itself (8 bytes).
+    STATIC_REQUIRE(sizeof(Manager) == sizeof(Legacy::GPUDirtyMemoryManager) + 16);
 }
 
 // =============================================================================================
@@ -3242,50 +3242,160 @@ TEST_CASE("O1: for any write the 4 B coverage holds the bytes, and lies inside t
 
 TEST_CASE("O1: the writer cost counter counts the guard takes (the swaps of the transformation), only inside the guard",
           "[list-diag][o1]") {
-    (void)Core::TakeDirtyGuardTakes();
     constexpr u64 kBase = 0x400000;
     {
         // 16 writes 128 B apart in one 2 KiB region: one transformation at 64 B, a swap each time at 4 B.
-        Manager m64{k64};
+        Manager m64{k64, true};
         for (u64 i = 0; i < 16; ++i) {
             m64.Collect(kBase + i * 128, 4);
         }
-        CHECK(Core::TakeDirtyGuardTakes() == 0);
-        Manager m4{k4};
+        CHECK(m64.GuardTakes() == 0);
+        Manager m4{k4, true};
         for (u64 i = 0; i < 16; ++i) {
             m4.Collect(kBase + i * 128, 4);
         }
-        CHECK(Core::TakeDirtyGuardTakes() == 15); // the first goes to the empty `current` by CAS: no guard
+        CHECK(m4.GuardTakes() == 15); // the first goes to the empty `current` by CAS: no guard
     }
     {
         // Several writes in the same transformation: the CAS path only, nothing counted.
-        Manager m4{k4};
+        Manager m4{k4, true};
         for (u64 i = 0; i < 32; ++i) {
             m4.Collect(kBase + i * 4, 4);
         }
         m4.Collect(kBase + 8, 4);
-        CHECK(Core::TakeDirtyGuardTakes() == 0);
+        CHECK(m4.GuardTakes() == 0);
     }
     {
         // After a Gather `current` is empty again: the next write is by CAS, the one after a different region by the guard.
-        Manager m4{k4};
+        Manager m4{k4, true};
         std::function<void(PAddr, size_t)> cb = [](PAddr, size_t) {};
         m4.Collect(kBase, 4);
         m4.Gather(cb);
         m4.Collect(kBase + 1024, 4);
-        CHECK(Core::TakeDirtyGuardTakes() == 0);
+        CHECK(m4.GuardTakes() == 0);
         m4.Collect(kBase + 2048, 4);
-        CHECK(Core::TakeDirtyGuardTakes() == 1);
+        CHECK(m4.GuardTakes() == 1);
+        m4.Gather(cb); // a Gather does not reset it: it is cumulative
+        CHECK(m4.GuardTakes() == 1);
     }
     {
         // A write that crosses the edge is two pieces: the guard is taken once for the second piece after the first.
-        Manager m64{k64};
+        Manager m64{k64, true};
         m64.Collect(kBase + 2040, 20);
-        CHECK(Core::TakeDirtyGuardTakes() == 1);
-        Manager m4{k4};
+        CHECK(m64.GuardTakes() == 1);
+        Manager m4{k4, true};
         m4.Collect(kBase + 124, 8);
-        CHECK(Core::TakeDirtyGuardTakes() == 1);
+        CHECK(m4.GuardTakes() == 1);
     }
+}
+
+TEST_CASE("O1: the counter counts only with the statistics on: off, a writer does nothing more", "[list-diag][o1]") {
+    CHECK(!Core::StatsEnvEnabled(nullptr));
+    CHECK(!Core::StatsEnvEnabled(""));
+    CHECK(!Core::StatsEnvEnabled("0"));
+    CHECK(!Core::StatsEnvEnabled("0x"));
+    CHECK(Core::StatsEnvEnabled("1"));
+    CHECK(Core::StatsEnvEnabled("2"));
+    Manager off{k4, false};
+    Manager on{k4, true};
+    CHECK(!off.CountsGuardTakes());
+    CHECK(on.CountsGuardTakes());
+    for (u64 i = 0; i < 64; ++i) {
+        off.Collect(0x600000 + i * 128, 4);
+        on.Collect(0x600000 + i * 128, 4);
+    }
+    CHECK(off.GuardTakes() == 0); // the swaps happened (the Gather below delivers all of them), nothing was counted
+    CHECK(on.GuardTakes() == 63);
+    std::vector<std::pair<u64, u64>> got;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
+    off.Gather(cb);
+    CHECK(got.size() == 64);
+    // The manager made without a flag follows the statistics of the session (the variable is not set in the harness).
+    Manager by_default;
+    CHECK(by_default.CountsGuardTakes() == Core::SessionDirtyStats());
+}
+
+TEST_CASE("O1: the report reads during an increment, and no count is lost or comes back", "[list-diag][o1]") {
+    Gates gates;
+    Manager m{k4, true};
+    Core::DirtyGuardRegistry registry;
+    const u64 serial = registry.Register(std::span<const Manager>{&m, 1});
+    Core::DirtyGuardReader reader;
+    constexpr u64 kBase = 0x700000;
+    // Five takes first (the first write goes to the empty `current`).
+    for (u64 i = 0; i < 6; ++i) {
+        m.CollectT<false, TestHooks>(kBase + i * 128, 4);
+    }
+    REQUIRE(m.GuardTakes() == 5);
+    g_gates = &gates;
+    gates.Arm("c.guard_count");
+    std::thread writer([&] { m.CollectT<false, TestHooks>(kBase + 6 * 128, 4); });
+    gates.WaitReached("c.guard_count"); // the writer loaded 5 and has not stored 6
+    CHECK(reader.ReadDelta(registry) == 5);
+    gates.Release("c.guard_count");
+    writer.join();
+    g_gates = nullptr;
+    CHECK(reader.ReadDelta(registry) == 1); // the one in flight, once
+    CHECK(reader.ReadDelta(registry) == 0); // and not again
+    CHECK(reader.ReadDelta(registry) == 0);
+    for (u64 i = 7; i < 12; ++i) {
+        m.Collect(kBase + i * 128, 4);
+    }
+    CHECK(reader.ReadDelta(registry) == 5);
+    CHECK(m.GuardTakes() == 11); // the manager keeps the cumulative value: the sum of the readings is the whole
+    registry.Unregister(serial);
+}
+
+TEST_CASE("O1: managers created and destroyed with an older one alive do not mix the counts", "[list-diag][o1]") {
+    Core::DirtyGuardRegistry registry;
+    Core::DirtyGuardReader reader;
+    constexpr u64 kBase = 0x800000;
+    // `prime` makes the first write of a manager (a CAS into the empty `current`: no guard); `take(m, n)` then makes n writes in new
+    // transformations, each a swap: exactly n guard takes.
+    std::map<const Manager*, u64> next_index;
+    const auto prime = [&](Manager& m) {
+        next_index[&m] = 1;
+        m.Collect(kBase, 4);
+    };
+    const auto take = [&](Manager& m, u64 count) {
+        for (u64 i = 0; i < count; ++i) {
+            m.Collect(kBase + next_index[&m]++ * 128, 4);
+        }
+    };
+    auto old = std::make_unique<Manager>(k4, true);
+    prime(*old);
+    const u64 old_serial = registry.Register(std::span<const Manager>{old.get(), 1});
+    take(*old, 3);
+    CHECK(reader.ReadDelta(registry) == 3);
+    // A second manager with the older alive: both count, each its own.
+    auto second = std::make_unique<Manager>(k4, true);
+    prime(*second);
+    const u64 second_serial = registry.Register(std::span<const Manager>{second.get(), 1});
+    take(*second, 2);
+    take(*old, 4); // 3 + 4 cumulative on the old one: the next reading takes the 4
+    CHECK(reader.ReadDelta(registry) == 6);
+    // A manager nobody registered is never read, however much it counts.
+    Manager rogue{k4, true};
+    prime(rogue);
+    take(rogue, 7);
+    CHECK(reader.ReadDelta(registry) == 0);
+    // The second one goes away and another takes its place, at the same address when the allocator gives it back.
+    registry.Unregister(second_serial);
+    second.reset();
+    second = std::make_unique<Manager>(k4, true);
+    prime(*second);
+    const u64 third_serial = registry.Register(std::span<const Manager>{second.get(), 1});
+    CHECK(third_serial != second_serial);
+    take(*second, 1);
+    CHECK(reader.ReadDelta(registry) == 1); // only the new one: the old one's 2 do not come back, nor are lost
+    take(*old, 2);
+    take(*second, 5);
+    CHECK(reader.ReadDelta(registry) == 7);
+    // Everything unregistered: nothing to read.
+    registry.Unregister(third_serial);
+    registry.Unregister(old_serial);
+    take(*old, 3);
+    CHECK(reader.ReadDelta(registry) == 0);
 }
 
 TEST_CASE("O1: ParseDirtyGrain, the session grain and the layout", "[list-diag][o1]") {

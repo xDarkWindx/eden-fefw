@@ -17,7 +17,7 @@ namespace {
 
 int ReadMode() {
     const char* const value = std::getenv("EDEN_BACK_THREAD_STATS");
-    if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+    if (!Core::StatsEnvEnabled(value)) { // the one definition of "the statistics are on" (also the counter of the dirty guard)
         return 0;
     }
     return value[0] == '2' ? 2 : 1;
@@ -370,9 +370,12 @@ void Report() {
                  source(DirtySource::ZeroBlock), source(DirtySource::CacheOp),
                  source(DirtySource::Exclusive), source(DirtySource::Other), per_s(inv_total),
                  per_s(inv_empty), per_s(inv_data));
-        // The writer cost of the grain (docs/t4-coherence-fix-plan.md, revision 5): how many times a writer took the guard of its
-        // manager (the swap of the transformation in CollectOne). Always counted (inside the guard, never on the CAS path).
-        const u64 guard_takes = Core::TakeDirtyGuardTakes();
+        // The writer cost of the grain (docs/t4-coherence-fix-plan.md, revisions 5 and 6): how many times a writer took the guard
+        // of its manager (the swap of the transformation in CollectOne), summed over the managers the System registered. The
+        // counters are cumulative and never reset: the reader keeps the previous values and reports the difference. Counted
+        // only with the statistics on (this report only exists then).
+        static Core::DirtyGuardReader guard_reader;
+        const u64 guard_takes = guard_reader.ReadDelta(Core::SessionDirtyGuardRegistry());
         const size_t grain = Core::DirtyGrainBytes(Core::SessionDirtyGrain());
         LOG_INFO(Render_Vulkan,
                  "Dirty grain {} B (transformation {} B{}): guard taken (transformation swaps) {:.1f}/s, {:.2f}% of the "

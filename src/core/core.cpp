@@ -118,6 +118,14 @@ struct System::Impl {
                  32 * DirtyGrainBytes(grain),
                  grain == DirtyGrain::B4 ? ", EXPERIMENTAL (EDEN_DIRTY_GRAIN=4): writes aligned to 4 B keep their GPU neighbours"
                                          : ", default");
+        // The statistics report (video_core/back_thread_stats.cpp) sums the guard counter of THESE managers, registered here
+        // explicitly: a manager made elsewhere is never read, and there is no allocator of slots.
+        dirty_guard_registration = SessionDirtyGuardRegistry().Register(gpu_dirty_memory_managers);
+    }
+
+    ~Impl() {
+        // Before the array is destroyed: once Unregister returns the report no longer reads it.
+        SessionDirtyGuardRegistry().Unregister(dirty_guard_registration);
     }
 
     u64 program_id;
@@ -517,6 +525,7 @@ struct System::Impl {
     std::optional<Tegra::GPU> gpu_core;
 
     std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES> gpu_dirty_memory_managers;
+    u64 dirty_guard_registration{}; ///< the serial of the registration of the array above (DirtyGuardRegistry)
     std::vector<std::vector<u8>> user_channel;
     std::vector<std::vector<u8>> general_channel;
 
