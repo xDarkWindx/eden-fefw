@@ -165,6 +165,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - A/B do D1 (7.4.1): custo −0,03% (ruído) e **zero** cruzamentos segurados no FE e no Bananza. A correção fica, a
   chave sai e a contagem fica nas estatísticas. Próximo: o codador fecha o D1 e implementa o T3a.1 (desenho
   fechado), e o diff vai ao revisor.
+- Feito: `7addd24` (chave do D1 removida) e `c700e86` (T3a.1), com o estado em `6598a02`. O planejador reproduziu o
+  harness e os mutantes. O diff está com o revisor. Depois dele vem a medição em casa (protocolo na resposta ao
+  usuário: FE no mesmo lugar, desligado e `pop,blk` alternados, mais uma rodada `pop` com `N=1`; Bananza com e
+  sem `EDEN_NX2_MACRO_REFRESH=1`).
 
 ## 8. Armadilhas
 

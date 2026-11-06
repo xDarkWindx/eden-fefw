@@ -780,6 +780,10 @@ Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto dei
   `LIST_DIAG_FORCE_MUTANT=coverage|open` liga um em todos os testes: o primeiro derruba 6 dos 52 casos, o segundo 2.
 - Teste 9: `src/tests/video_core/list_diag_t3a_frozen.h` é a cópia congelada do T3a (`1d41515`) em `namespace T3aFrozen`; ela usa
   o mesmo gerenciador real, então os dois lados têm o D1.
+- **Conferência do planejador (`6598a02`):** os três builds reproduzidos na nuvem (112 701 asserções em 52 casos, sem falha).
+  Mutantes no binário `-O2`, três rodadas cada: `coverage` derruba sempre os mesmos 6 casos (30 asserções, número que varia
+  com o estresse); `open` derruba sempre os testes 6 e 7, e o teste 10 (`list_diag.cpp:2053`/`:2058`) também o pega em 2 de 3
+  rodadas. É sensibilidade a mais do estresse, não confiável, como o codador disse.
 - Teste 13 é só "o contador do escritor não se mexe com o diagnóstico desligado"; o resto do desligado já era coberto por
   "off, nothing changes".
 
@@ -788,7 +792,7 @@ Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto dei
 - Não muda: protocolo dos slots e dos lotes; P0; 3.3 e 3.3.1; o que é aplicado; o desligado. A única mudança de
   **sentido** é o campo `lot` do registro ambíguo (guarda `hi`; 3.7.3, passo 4).
 - Em aberto: (a) o `BuildTransform` com escrita que cruza 2 KiB (3.7.1): **confirmado** pelo planejador (GCC, UBSan), bug preexistente, `docs/gpu-contract-inventory.md` 7.4, item D1; (b) o custo do `seq_cst` em ARM;
-  (c) a granularidade por página, só se a medição pedir; (d) os contadores do `BackStats` do item 3 acima;
+  (c) a granularidade por página, só se a medição pedir; (d) os contadores do `BackStats` do item 3 acima: **feitos no D1** (`InvalidateGPUCache` total, vazias e com dados);
   (e) `EDEN_HELD_WRITE_MERGE=0` torna toda cobertura incompleta, por premissa.
 
 
