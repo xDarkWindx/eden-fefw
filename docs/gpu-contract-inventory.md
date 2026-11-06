@@ -683,6 +683,19 @@ desempenho no A/B seria custo de invalidações antes perdidas: investigar, não
   reportado.
 - **Ordem:** item próprio, depois do resultado do T3a.2.
 
+### 7.6 Precondição W1: um escritor por gerenciador (achado do codador ao escrever o teste do T4.0)
+
+- **Código (verificado pelo planejador).** No `CollectOne` (`core/gpu_dirty_memory_manager.h`), o caminho do `guard` faz
+  `back_buffer.emplace_back(tmp)` com o valor lido **antes** e depois `current.exchange(t)`, sem comparar. Se outro
+  escritor fizer CAS em `current` entre essa leitura e o `exchange`, os bits que ele pôs se perdem. O codador viu isso
+  num programa de teste com dois escritores: o gerenciador antigo perdeu cobertura em 3 de 20 rodadas.
+- **Hoje (verificado):** cada núcleo tem o seu gerenciador. As threads que não são de CPU do jogo caem em `sys_core` e
+  são serializadas pelo `sys_core_guard` (`core/memory.cpp:713-720`). O `Gather` toma o `guard` e não sofre a perda.
+  Então a corrida não acontece no emulador como ele é.
+- **Vira precondição W1**, como a P0: um escritor por gerenciador. O diagnóstico já a assume (π4). Qualquer mudança que
+  ponha dois escritores no mesmo gerenciador (outro mapeamento de threads para núcleos, escrita de outra thread fora do
+  `sys_core_guard`) quebra W1 e precisa trocar o `exchange` por CAS.
+
 ### Pendências de localização
 
 **P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com
