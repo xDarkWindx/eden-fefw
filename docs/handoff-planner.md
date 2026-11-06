@@ -277,6 +277,44 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
+## 7.2 Contra erros difíceis de rastrear e decisões que induzem a erro (usuário, 2026-11-06)
+
+**Regras para o planejador, o revisor e o codador:**
+1. **Nada falha em silêncio.** Opção inválida, estado desconhecido, entrada não achada e descarte do diagnóstico viram
+   contador, linha de log ou erro claro. Nunca um valor padrão que finge sucesso. Exemplo real: o staging não achado
+   contava como "invalidated", corrigido em `52e726b`.
+2. **Nada funciona por acaso.** Comportamento indefinido que "dá certo no x86" é defeito. Exemplos reais: o
+   `UsageTracker` antigo, conservador só porque o deslocamento indefinido saía `~0`; e o laço do `Gather`, certo só
+   porque a máscara tinha 32 bits e o grão 64.
+3. **Todo teste novo tem de falhar sem a correção.** O planejador confere com uma mutação temporária, como vem fazendo.
+   Teste que passa nos dois casos não protege nada.
+4. **Afirmação tem grau e caminho de volta.** É **verificado** (lido no código), **medido** (de quem, quantas rodadas, que
+   ruído) ou **hipótese**. Uma conclusão que caiu fica no doc como **retirada**, com o motivo; não é apagada. Exemplos reais
+   de conclusões retiradas: "o rastreador novo reordena mais", "nenhum sinal de custo", "~240 comparações", "o
+   `IsUsed` é conservador".
+5. **Medir com método fixo e dizer o ruído.** Alinhar pelo início da cena (7.1). Uma rodada por braço é triagem, e a
+   diferença entre duas rodadas iguais é "diferença observada", não "ruído estimado". Nunca escrever "sem custo"; no
+   máximo "não foi demonstrada regressão líquida".
+6. **O log tem de dizer o que rodou.** O commit compilado, a configuração efetiva (o resumo da L4) e cada chave
+   temporária ativa. Sem isso, o planejador deduz a configuração pelo conteúdo do log, e essa dedução pode errar.
+7. **Chave temporária tem data para sair**, registrada no doc do item, e é apagada depois do A/B (D1 e T4.1 foram
+   apagadas assim). Uma chave esquecida vira um comportamento que ninguém lembra de testar.
+8. **Uma decisão registra a evidência e o que a derrubaria.** Por exemplo: o O1 é mitigação porque as escritas medidas
+   são alinhadas a 4 B nos dois jogos. Se outro jogo mostrar muitas escritas desalinhadas, a decisão volta ao O2.
+9. **A ferramenta de diagnóstico declara a própria interferência.** Exemplos reais: o `Finish` do `blkcmp` zera as
+   queries de oclusão; o diagnóstico mudou o agrupamento dos lotes; o contador de tamanhos roda nas threads do jogo.
+10. **Uma política não esconde um conserto** (`architecture-plan.md` 5.1): ela escolhe entre comportamentos que
+    funcionam.
+
+**Armadilhas abertas, que viram itens:**
+- **A versão no log está velha (verificado).** `GenerateSCMRev.cmake` gera o `scm_rev.cpp` com o `configure_file` no momento
+  em que o CMake é configurado (`src/common/CMakeLists.txt:20`), não a cada compilação. Os logs das rodadas 1 a 7 diziam
+  `bold-dirac-tppzm7-32e6e17` em builds de `fc22def` em diante. **Item pequeno:** gerar a revisão a cada compilação, ou
+  imprimir na partida o commit lido em tempo de compilação. Vem antes da L4, porque a regra 6 depende dele.
+- **Configuração efetiva:** vem com a L4 (o resumo).
+- **Chaves temporárias ativas:** `EDEN_DIRTY_GRAIN` (O1, até o A/B). As outras variáveis atuais estão no inventário que a
+  L4 vai fazer.
+
 ## 8. Armadilhas
 
 - Arquivos com CRLF (por exemplo `texture_cache/texture_cache.h`): preserve as quebras de linha.
