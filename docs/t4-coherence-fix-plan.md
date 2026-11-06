@@ -53,7 +53,9 @@ downloads (A).
 | # | Opção | Como | Custo e risco (hipótese, a medir) |
 | --- | --- | --- | --- |
 | O1 | **Grão menor no gerenciador** | mantém `{u32 address, u32 mask}` e o CAS de 8 B, mas troca `align_bits` de 6 para 2 ou 3. A transformação cobre 32 grãos: 128 B com grão de 4 B, 256 B com grão de 8 B. O recorte do D1 já existe (`CollectT`) | Uma mudança pequena no lugar que já foi corrigido e testado. Escritas grandes viram mais pedaços (`WriteBlock` de 4 KiB: 32 pedaços com grão de 4 B, contra 2 hoje); `back_buffer`, `Gather` e a junção por página recebem mais faixas. **Residual:** escritas menores que o grão (u8, u16 com grão de 4 B) ainda cobrem vizinhos. Com 128 B, o `address >> 7` usa todos os 32 bits, e o endereço mais alto coincide com o marcador `default_transform.address = ~0U`. Isso é inofensivo: o marcador tem máscara 0 e uma escrita ali se junta a ele (verificado na leitura de `CollectOne`, `:100-121`), mas precisa de um teste de borda |
-| O2 | **Máscara de bytes só nos blocos parciais** | mantém o grão de 64 B; quando a escrita não cobre o bloco inteiro, registra a máscara de bytes desse bloco numa estrutura à parte, por núcleo e por lote | Exato até o byte. Mas é uma segunda estrutura no caminho do escritor (~1 milhão de avisos/s no FE, medido), com o mesmo problema de capacidade do ledger do diagnóstico (estouro de 44%, medido): no estouro, ela teria de cair num comportamento seguro. Muda o protocolo do `Collect` e do `Gather` |
+| O2 | **Máscara de bytes só nos blocos parciais** | mantém o grão de 64 B; quando a escrita não cobre o bloco inteiro, registra a máscara de bytes desse bloco numa estrutura à parte, por núcleo e por lote | Exato até o byte. Mas é uma segunda estrutura no caminho do escritor (~1 milhão de avisos/s no FE, medido), e uma capacidade a dimensionar. Ela **não herda necessariamente o estouro do ledger do diagnóstico** (revisão 5): o ledger
+pode descartar observações; uma estrutura de coerência exata tem de preservar a informação, ou ter um caminho alternativo
+correto quando enche. Depende da implementação. Muda o protocolo do `Collect` e do `Gather` |
 | O3 | **Juntar os bytes da GPU antes de subir** | na aplicação, para um bloco que cruza `gpu_modified_ranges`, ler os bytes da GPU, sobrepor só os bytes que a CPU escreveu e subir o resultado | Precisa dos mesmos bytes exatos (O1 ou O2) para saber o que sobrepor; e ainda lê da GPU na aplicação (síncrono: picos de 20-30 ms por leitura, medido no `blkcmp`). Só faz sentido se O1 e O2 não puderem dar posições exatas |
 | O4 | **Manter o guest coerente** | baixar mais cedo o que a GPU escreve (como `AsyncBufferDownloads` em Switch 1), para que o guest tenha o valor atual e subir o bloco inteiro não estrague nada | Não muda o gerenciador. Mas traz de volta o custo de banda e de espera que o caminho de Switch 2 evita, e mexe em A (mais downloads publicados). Custo provavelmente acima do orçamento (**hipótese**) |
 
@@ -106,19 +108,24 @@ acima de 40 mil draws/s.
 | Pedaços segurados | ~50-60 mil/s, ~6,5 B cada | ~1 milhão/s, ~4,7 B cada |
 | Fonte | 100% `Write<T>` | 100% `Write<T>` (sem `WriteBlock`, `ZeroBlock` ou operação de cache) |
 | Menores que 4 B | 0,12-0,19% | 0,02% |
-| Endereço **e** tamanho alinhados a 4 B | 99,8-99,9% | **100,0%** |
+| Endereço **e** tamanho alinhados a 4 B | 99,8-99,9% | **~100%** (o relatório arredonda para 100,0%) |
 | Endereço e tamanho alinhados a 8 B | 60-66% | **17-18%** (~41% só o endereço alinhado, ~41% nenhum dos dois) |
 | Pedaços do `CollectT` por escrita (grão 4, grão 8, base de 64 B) | 1,000 / 1,000 / 1,000 | 1,000 / 1,000 / 1,000 |
 | Grãos tocados por escrita (grão 4 / 8 / 64 B) | 1,60-1,66 / 1,00 / 1,00 | 1,17-1,18 / 1,00 / 1,00 |
 
 **Leitura:**
-- **Grão de 4 B:** cobre na garantia de O1 praticamente todas as escritas seguradas do FE, 100% na cena e ~99,7-99,8% na
-  carga. Ficam de fora as menores que 4 B e as desalinhadas, 0,2-0,3% na carga, que é onde o `blkcmp` viu o B
+- **Grão de 4 B:** cobre na garantia de O1 praticamente todas as escritas seguradas do FE, ~100% na cena (menos as 0,02%
+  menores que 4 B) e ~99,7-99,8% na carga. Ficam de fora as menores que 4 B e as desalinhadas, 0,2-0,3% na carga, que é onde o `blkcmp` viu o B
   (`list-diag-design.md` 8.7).
 - **Grão de 8 B:** não serve. Cerca de 40% das escritas da cena (4 B em endereço `4 mod 8`) arrastariam 4 bytes vizinhos.
-- **Custo no escritor:** nenhum pedaço a mais no `CollectT`, porque as escritas são minúsculas. O custo que falta medir é o
-  do lado da aplicação: com grão de 4 B, escritas não adjacentes no mesmo bloco de 64 B deixam de ser uma faixa só, e o
-  `Gather`, a junção por página e o `OnCachedWrites` recebem mais faixas (**hipótese**; até 16 por bloco).
+- **Custo no escritor (corrigido, revisão 5):** nenhuma escrita vira mais de um pedaço do `CollectT`, mas isso **não** quer
+  dizer custo zero. Com transformação de 128 B em vez de 2 KiB, escritas vizinhas caem mais vezes em transformações
+  diferentes. Duas células adjacentes de 4 B podem ficar em transformações diferentes. Isso aumenta as trocas de
+  transformação, as tomadas do `guard`, as inserções em `back_buffer` e as tentativas de CAS.
+- **Custo na aplicação:** escritas não adjacentes no mesmo bloco de 64 B deixam de ser uma faixa só, e o `Gather`, a junção
+  por página e o `OnCachedWrites` recebem mais faixas (**hipótese**; até 16 por bloco).
+- **Os dois custos entram no aceite**, medidos no emulador: o desempenho total e as faixas por lote.
+- **Residual:** a frequência pequena das escritas fora da garantia não mostra que o efeito delas seja pequeno.
 - **Limites:** é um jogo e uma rodada. Isto dimensiona as escritas fora da garantia de O1; não mede quantos vizinhos
   divergentes elas teriam (revisão 4).
 
@@ -142,8 +149,9 @@ as cutscenes e entra na caverna. O usuário ficou ~26 s dentro da caverna, andan
   cena.
 - O alinhamento a 8 B varia por jogo e por fase: 17% na cena do FE, 99% na caverna do Bananza, 6,6% na carga do Bananza.
 
-**Conclusão para a escolha:** o grão de 4 B põe ~99,7-100% das escritas seguradas dos dois jogos na garantia de O1, sem
-pedaço a mais no escritor. As escritas de 8 B do Bananza tocam dois grãos contíguos, que continuam numa faixa só. O de 8 B
+**Conclusão para a escolha:** o grão de 4 B põe ~99,7% a ~100% das escritas seguradas dos dois jogos na garantia de O1, sem
+dividir nenhuma em mais pedaços; o custo do escritor (trocas de transformação e `guard`) continua a medir. As escritas de
+8 B do Bananza tocam dois grãos contíguos, que continuam numa faixa só **se** caírem na mesma transformação de 128 B. O de 8 B
 fica descartado pelo FE. Isto continua dimensionando, não medindo perda, e são dois jogos com uma rodada cada.
 
 ## 5. Confirmação e reprodução (em paralelo; não é condição para o desenho)
@@ -498,4 +506,23 @@ antes; pode ser o custo do contador novo de tamanhos nas threads do jogo, que s�
 - O contador da seção 4 segue com a especificação acima.
 - A escolha entre O1 e O2 preserva a distinção: O1 é mitigação para escritas alinhadas ao grão. Ter poucas escritas fora
   do alinhamento não transforma O1 numa solução exata.
+
+### Revisão 5 (sobre `5dfcbe9`): O1 de 4 B como mitigação experimental
+
+- **Decisão:** O1 com grão de 4 B, **como mitigação experimental**. Virar padrão depende dos testes e do custo medido no
+  emulador, tanto o total quanto o do escritor e o da aplicação.
+- **Corrigido no corpo (4.1 e 3):**
+  - o custo no escritor não é zero (transformação de 128 B: mais trocas, `guard`, `back_buffer` e CAS);
+  - "100% alinhadas" vira "~100%", porque as 0,02-0,04% menores que 4 B existem, e a frequência pequena do residual não
+    mostra efeito pequeno;
+  - O2 não herda necessariamente o estouro do ledger.
+- **Para o código:**
+  - O1 entra junto com o conserto do laço do `Gather`;
+  - testes com o grão real de 4 B: bordas de 128 B, sequências separadas de bits e os negativos do residual;
+  - medição do desempenho total e das faixas por lote.
+- **Continuam abertos:** o G residual, o A e o M. O O1 não encerra a coerência de memória.
+- A revisão de `d5e7158`, `1b0d10d`, `86aec48` e `5aab322` já foi respondida:
+  - a remoção da chave e a otimização do rastreador foram aprovadas;
+  - o contador de tamanhos está funcionalmente correto, com a ressalva do seu custo e da interferência dele na comparação
+    de desempenho, já que roda nas threads do jogo com as estatísticas ligadas.
 
