@@ -208,7 +208,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   Prompt do codador: reprodução, T4.0 e desenho do T3a.2b, em três commits.
 - Feitos `46e1bd8` (reprodução: 3 `[!shouldfail]` falham como esperado), `c300b88` (T4.0, `HasWrites`) e `825c5b3`
   (desenho do T3a.2b, 3.8.9). O planejador reproduziu o harness, os mutantes e a sensibilidade do teste de borda. Achado
-  W1 (um escritor por gerenciador): `gpu-contract-inventory.md` 7.6. Com o revisor. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  W1 (um escritor por gerenciador): `gpu-contract-inventory.md` 7.6. Com o revisor.
+- Revisão 2 do T4: o T4.0 foi aprovado. Os testes residuais precisam de dados da GPU em [40, 48); falta um teste
+  determinístico do ABA. O `blkcmp` assíncrono tem três pendências: a coerência do staging, a vida do buffer fonte e a
+  contagem no encerramento. Achado: os downloads não invalidam memória não coerente (inventário 7.7). Próximo do
+  codador: corrigir os testes, desenhar o T4.1 e atualizar a 3.8.9. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas

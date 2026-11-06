@@ -692,9 +692,29 @@ desempenho no A/B seria custo de invalidações antes perdidas: investigar, não
 - **Hoje (verificado):** cada núcleo tem o seu gerenciador. As threads que não são de CPU do jogo caem em `sys_core` e
   são serializadas pelo `sys_core_guard` (`core/memory.cpp:713-720`). O `Gather` toma o `guard` e não sofre a perda.
   Então a corrida não acontece no emulador como ele é.
-- **Vira precondição W1**, como a P0: um escritor por gerenciador. O diagnóstico já a assume (π4). Qualquer mudança que
-  ponha dois escritores no mesmo gerenciador (outro mapeamento de threads para núcleos, escrita de outra thread fora do
-  `sys_core_guard`) quebra W1 e precisa trocar o `exchange` por CAS.
+- **Vira precondição W1**, como a P0: um escritor por gerenciador, **inclusive sem o diagnóstico**. É condição de
+  funcionamento do gerenciador, não só da prova dos lotes: o `guard` sozinho não basta para dois escritores. O T4 não
+  passa a suportar vários escritores. Se um dia precisar, não basta trocar o `exchange` por CAS; a inserção em
+  `back_buffer` de uma tentativa que falhou também tem de ser tratada (revisão 2 do T4).
+
+### 7.7 Possível bug latente: downloads lidos sem invalidar memória não coerente
+
+- **Código (verificado pelo planejador, a partir de um apontamento do revisor).** A memória de download só *prefere*
+  `HOST_CACHED | HOST_COHERENT` (`vulkan_common/vulkan_memory_allocator.cpp:96-99`); a alocação usa `requiredFlags = 0`
+  (`:289-293`). Então o tipo escolhido pode ser cacheado e **não** coerente. Nesse caso, ler o mapeamento depois de a GPU
+  terminar exige `vmaInvalidateAllocation`, que `vk::Buffer::Invalidate()` faz só quando precisa
+  (`vulkan_wrapper.cpp:534-538`).
+- **Quem invalida hoje:** só a apresentação (`renderer_vulkan.cpp:311`, `:354`; `present/frame_gen.cpp:327`). Os
+  downloads do cache de buffers (`DownloadBufferMemory`, `PopAsyncBuffers`), os do cache de texturas e o `blkcmp` leem
+  o `mapped_span` do staging **sem** invalidar, e o `StagingBufferRef` nem expõe a operação.
+- **Efeito (hipótese):** numa GPU cujo tipo de download seja cacheado sem coerência, um download pode entregar ao guest
+  bytes velhos. Em placas NVIDIA de desktop costuma existir um tipo cacheado **e** coerente, que satisfaz a preferência;
+  não foi conferido qual tipo a RTX 5060 Ti do usuário recebe. É mais provável em Android, Intel e alguns drivers de AMD.
+- **Para o `blkcmp`:** o resultado síncrono da rodada 4 (8.6) supõe staging coerente. O planejador não conferiu isso na
+  máquina do usuário, e o log não diz. Daqui para a frente, o `blkcmp` invalida antes de comparar e registra se a memória
+  era coerente.
+- **Contrato:** é o contrato de memória (GPU → CPU) do `architecture-plan.md` 2.2. É candidato a item próprio (invalidar
+  no pool depois da conclusão, em todos os downloads), com A/B, separado do T4.
 
 ### Pendências de localização
 

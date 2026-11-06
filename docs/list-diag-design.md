@@ -1076,6 +1076,26 @@ a liberação do staging deferido no `BufferCache` real; o custo. A confirmaçã
 zero, `blkcmp_pending_max` abaixo do limite, `cancelled` zero em encerramento limpo, e as diferenças da versão síncrona
 reaparecendo (ou não) com o mesmo padrão.
 
+
+**Revisão de `825c5b3` (pelo revisor, conferida pelo planejador): o que falta antes de implementar o assíncrono.**
+1. **Visibilidade do staging:** a memória de download não tem coerência garantida (`vulkan_memory_allocator.cpp:96-99`,
+   `:289-293`; inventário 7.7). Sai a alternativa "a espera do tick a torna visível": a conclusão da GPU não substitui a
+   invalidação de memória não coerente. O pool passa a dar acesso a `vk::Buffer::Invalidate()` (`vulkan_wrapper.cpp:534-538`)
+   para o staging, e ela é chamada depois de `IsFree(tick)` e antes da comparação. O `StagingBufferRef` hoje só entrega o
+   mapeamento. **O `blkcmp` síncrono também precisa disso**, depois do `Finish`, e deve registrar se a memória era
+   coerente: o resultado da 8.6 supõe coerência.
+2. **Vida do buffer fonte:** `DelayedDestructionRing::Tick()` (`delayed_destruction_ring.h:20-23`) avança e destrói uma
+   posição sem consultar fence nem tick da GPU, e o cache de buffers o avança no `TickFrame`. O staging diferido protege o
+   destino, não a fonte. Antes da implementação, documentar qual espera garante que a cópia terminou antes de o buffer
+   fonte ser destruído. Se não houver, segurar o recurso até o tick da cópia. O mesmo para a afirmação de que o pool só é
+   destruído com a GPU ociosa: citar o caminho de encerramento, porque o destrutor sozinho não prova isso.
+3. **Encerramento:** "pendente" inclui toda entrada que ainda está na fila, mesmo com o tick concluído e sem comparação
+   processada. A identidade final sai **depois** de classificar comparados, pendentes e cancelados, ou aparece marcada como
+   fotografia intermediária.
+4. **Tick depois do `Record`:** procede (`RecordWithUploadBuffer` não avança o tick; `SubmitExecution` avança), e
+   continua dependendo da exclusão entre os produtores do scheduler.
+5. **20/s** é orçamento experimental. Tirar o `Finish` remove aquela espera, não toda a interferência: continuam as
+   barreiras, as restrições de reordenação e a pressão na fila.
 ## 4. Problema A: janela do pop (contadores e logs próprios)
 
 **Definição do evento** (item 1a): *um pop (download antigo publicado) que grava bytes cobertos por um **aviso

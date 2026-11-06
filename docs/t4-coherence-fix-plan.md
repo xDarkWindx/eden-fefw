@@ -144,3 +144,18 @@ Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Tam
 
 A reprodução dirigida e o `blkcmp` assíncrono seguem em paralelo, sem ampliar o diagnóstico.
 
+### Revisão 2 (sobre `be79604`), conferida pelo planejador
+
+- **T4.0 aprovado.** O ABA "vazio → `Gather` repõe o vazio → CAS do escritor" é coberto: o CAS bem-sucedido é a
+  publicação efetiva, sem escrita perdida, e o `s2` vê o `lot_started` do `Gather` (`protocol.h:377-386`). Não precisa
+  de geração em `current`, mas precisa de um **teste determinístico** dessa intercalação, porque estresse e equivalência
+  serial não garantem que ela ocorreu.
+- **Os testes residuais não mostrariam o residual de O1.** `AssembleB` (`src/tests/video_core/list_diag.cpp:2780`) põe os
+  bytes divergentes da GPU só em [0, 32). Com grão de 4 B, as escritas [41, 45) e [41, 42) subiriam [40, 48) e [40, 44),
+  bytes em que host e guest começam iguais, e o C1 passaria escondendo a perda. **Correção:** nos cenários residuais,
+  dados divergentes da GPU em [40, 48).
+- **O teste das duas sequências** deve montar os endereços a partir do grão candidato, para continuar sendo "duas
+  sequências na mesma transformação" quando o grão mudar.
+- **W1** é condição de funcionamento do gerenciador, inclusive sem o diagnóstico (inventário 7.6).
+- **Próximo passo: o desenho do T4.1.**
+
