@@ -804,6 +804,20 @@ cobertura da 3.7, nem o que o emulador faz com o guest, `gpu_modified_ranges`, `
 Muda, **só para as faixas sorteadas**, o que acontece entre a sincronização do buffer e o upload: uma cópia diagnóstica
 do que a GPU tem, com um `Finish`. Graus de certeza como no resto; números de linha são os de `47e4a8a`.
 
+**Conferência do planejador (`8022a1d`, antes do revisor).** O T3a.1b foi reproduzido: três builds com 112 724
+asserções em 53 casos; sem a linha do cursor, só o teste novo falha; os mutantes derrubam 6 (`coverage`) e 2 ou 3
+(`open`, conforme o estresse) casos. Na 3.8 conferi: o `TickFrame` do cache de buffers roda sob o `buffer_cache.mutex`
+(`vk_rasterizer.cpp:1194-1197`), e o `OnCachedWrites` também (`:974`). `Finish` submete e espera
+(`vk_scheduler.cpp:67-75`). O `UsageTracker` (`usage_tracker.h`) é conservador numa página; o único defeito real é o
+deslocamento de 64 bits com tamanho < 64 B (`:92`, que o UBSan acusa), preexistente. Dois pontos para a revisão:
+1. **`is_draw_thread` só é ligado com as estatísticas** (`vk_rasterizer.cpp:338-340`). A contagem por thread da
+   3.8.6 precisa de marca própria do diagnóstico, para não depender de `EDEN_BACK_THREAD_STATS`.
+2. **Na versão síncrona, a ordem cópia → upload é garantida pelo `Finish`**, antes de o upload ser gravado. Um upload
+   reordenado vai para o contexto seguinte, depois de a cópia ter terminado. O `MarkUsage` e o descarte
+   `reorder_unprotected` só são necessários na versão assíncrona. Na síncrona, eles só acrescentam perturbação
+   (este upload perde a reordenação, e o reset do rastreador atrasa) e descartes desnecessários. Proposta: tirá-los da
+   versão 1 e deixá-los escritos como requisito da assíncrona.
+
 #### 3.8.1 Do `NoteApply` até `InlineMemoryImplementation`
 
 Todos na **mesma thread** e dentro do mesmo `buffer_cache.mutex`: `RasterizerVulkan::OnCachedWrites` toma o mutex

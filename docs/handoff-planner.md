@@ -182,6 +182,9 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão 5 (`list-diag-design.md` seção 11, linha 15): o T3a.1 não tem bloqueador. O `blkcmp` compara com o payload
   real do upload, com staging próprio e a ordem garantida por `MarkUsage`. Vêm o T3a.1b (avanço do cursor no estouro)
   e o desenho do T3a.2; o T3a.3 fica condicional.
+- `5e94a57` (T3a.1b) e `8022a1d` (desenho do `blkcmp`, 3.8) foram conferidos pelo planejador (nota no topo da 3.8) e
+  estão com o revisor. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
 
