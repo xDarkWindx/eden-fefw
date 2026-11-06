@@ -370,6 +370,60 @@ void Report() {
                  source(DirtySource::Exclusive), source(DirtySource::Other), per_s(inv_total),
                  per_s(inv_empty), per_s(inv_data));
     }
+    {
+        // Size and alignment of the held pieces (docs/t4-coherence-fix-plan.md, 4). Compare the loading window with the
+        // stable scene by the time of the report. It sizes the writes OUTSIDE the guarantee of O1 and the cost estimate in
+        // pieces and grains; it does NOT measure neighbouring bytes with diverging GPU data, nor losses.
+        auto& hs = shared.held_shape;
+        const u64 pieces = Take(hs.pieces);
+        const u64 bytes = Take(hs.bytes);
+        const u64 empty = Take(hs.empty);
+        const u64 under_4 = Take(hs.under_4);
+        const auto pct = [pieces](u64 value) {
+            return pieces != 0 ? static_cast<double>(value) * 100.0 / static_cast<double>(pieces) : 0.0;
+        };
+        std::array<std::array<u64, static_cast<size_t>(HeldShape::Align::Count)>, HeldShape::kGrains.size()> align{};
+        for (size_t g = 0; g < HeldShape::kGrains.size(); ++g) {
+            for (size_t c = 0; c < align[g].size(); ++c) {
+                align[g][c] = Take(hs.align[g][c]);
+            }
+        }
+        std::array<u64, HeldShape::kCostSlots> cost_pieces{}, cost_grains{};
+        for (size_t i = 0; i < HeldShape::kCostSlots; ++i) {
+            cost_pieces[i] = Take(hs.cost_pieces[i]);
+            cost_grains[i] = Take(hs.cost_grains[i]);
+        }
+        std::array<u64, static_cast<size_t>(DirtySource::Count)> by_source{}, by_source_bytes{};
+        for (size_t s = 0; s < by_source.size(); ++s) {
+            by_source[s] = Take(hs.pieces_by_source[s]);
+            by_source_bytes[s] = Take(hs.bytes_by_source[s]);
+        }
+        const auto src_text = [&](DirtySource s) {
+            const size_t i = static_cast<size_t>(s);
+            return fmt::format("{:.1f}/s {:.0f} B/s", per_s(by_source[i]), per_s(by_source_bytes[i]));
+        };
+        const auto align_text = [&](size_t g) {
+            const auto& a = align[g];
+            return fmt::format("both {:.1f}% / address only {:.1f}% / size only {:.1f}% / neither {:.1f}%",
+                               pct(a[static_cast<size_t>(HeldShape::Align::Both)]),
+                               pct(a[static_cast<size_t>(HeldShape::Align::AddressOnly)]),
+                               pct(a[static_cast<size_t>(HeldShape::Align::SizeOnly)]),
+                               pct(a[static_cast<size_t>(HeldShape::Align::Neither)]));
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Held pieces by size and alignment (sizes the writes outside the O1 guarantee; does not measure "
+                 "diverging neighbour bytes or losses): pieces {:.0f}/s, {:.0f} B/s, zero-size {:.1f}/s; by source: "
+                 "Write<T> [{}], WriteBlock [{}], ZeroBlock [{}], cache op [{}], exclusive [{}], other [{}]; "
+                 "under 4 B {:.2f}%; 4 B-aligned (address, size): {}; 8 B-aligned: {}; Collect pieces/piece "
+                 "(T = 32 x grain) grain 4: {:.3f}, grain 8: {:.3f}, 64 B baseline (2 KiB): {:.3f}; grains "
+                 "touched/piece grain 4: {:.2f}, grain 8: {:.2f}, 64 B: {:.2f}",
+                 per_s(pieces), per_s(bytes), per_s(empty), src_text(DirtySource::WriteT),
+                 src_text(DirtySource::WriteBlock), src_text(DirtySource::ZeroBlock), src_text(DirtySource::CacheOp),
+                 src_text(DirtySource::Exclusive), src_text(DirtySource::Other), pct(under_4), align_text(0),
+                 align_text(1), avg(cost_pieces[0], pieces), avg(cost_pieces[1], pieces),
+                 avg(cost_pieces[2], pieces), avg(cost_grains[0], pieces), avg(cost_grains[1], pieces),
+                 avg(cost_grains[2], pieces));
+    }
     // EDEN_LIST_DIAG (parts pop, blk): totals and rate of its counters, empty when it is off.
     for (const std::string& line : ListDiag::ReportLines(seconds)) {
         LOG_INFO(Render_Vulkan, "{}", line);

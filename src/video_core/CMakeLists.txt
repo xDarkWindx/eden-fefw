@@ -101,6 +101,7 @@ add_library(video_core STATIC
     native_semaphore.h
     back_thread_stats.cpp
     back_thread_stats.h
+    held_shape.h
     list_diag.cpp
     list_diag.h
     list_diag/counters.h

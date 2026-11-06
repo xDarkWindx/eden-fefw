@@ -777,6 +777,8 @@ struct Memory::Impl {
                     BackStats::Add(BackStats::shared.dirty_cross_bytes, size);
                     BackStats::Add(BackStats::shared.dirty_cross_by_source[static_cast<size_t>(src)], 1);
                 }
+                // Size and alignment of the same held pieces (docs/t4-coherence-fix-plan.md, 4).
+                BackStats::shared.held_shape.Add(address, size, static_cast<size_t>(src));
             }
             VideoCommon::ListDiag::CollectNotice(gpu_dirty_managers[core], static_cast<unsigned>(core),
                                                  address, size);

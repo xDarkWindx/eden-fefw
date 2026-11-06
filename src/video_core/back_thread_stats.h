@@ -21,6 +21,7 @@
 #endif
 
 #include "common/common_types.h"
+#include "video_core/held_shape.h"
 
 // Where the thread that prepares draws (the GPU back thread with the split, the GPU thread
 // without it) spends its time, and what it waits for (docs/back-thread-split-plan.md, phase 0).
@@ -245,6 +246,8 @@ struct Shared {
     std::atomic<u64> dirty_cross_calls{};
     std::atomic<u64> dirty_cross_bytes{};
     std::array<std::atomic<u64>, static_cast<size_t>(DirtySource::Count)> dirty_cross_by_source{};
+    // Size and alignment of the held pieces, same point as the counts above (docs/t4-coherence-fix-plan.md, 4).
+    HeldShape::Counters<static_cast<size_t>(DirtySource::Count)> held_shape;
     std::atomic<u64> invalidate_total{};
     std::atomic<u64> invalidate_empty{};
     std::atomic<u64> invalidate_data{};

@@ -35,6 +35,7 @@
 #include "common/range_sets.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/usage_tracker.h"
+#include "video_core/held_shape.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "video_core/list_diag.h"
 #include "video_core/list_diag/protocol.h"
@@ -3425,6 +3426,118 @@ TEST_CASE("T4.1 [6]: the defects of the old tracker, documented without running 
     VideoCommon::UsageTracker fresh{kUtBuffer};
     fresh.Track(100, 64);
     CHECK(fresh.IsUsed(0, 100));         // the new one does
+}
+
+TEST_CASE("size counter [1]: pieces and grains of a held write against a byte-by-byte reference", "[list-diag][shape]") {
+    namespace HS = VideoCommon::HeldShape;
+    // Reference: the split CollectT does (piece = min(size, T - address % T)) and the set of grains of the bytes.
+    const auto ref_pieces = [](u64 address, u64 size, u64 transform) {
+        u64 count = 0;
+        while (size != 0) {
+            const u64 piece = std::min<u64>(size, transform - (address % transform));
+            address += piece;
+            size -= piece;
+            ++count;
+        }
+        return count;
+    };
+    const auto ref_grains = [](u64 address, u64 size, u64 grain) {
+        std::set<u64> touched;
+        for (u64 i = 0; i < size; ++i) {
+            touched.insert((address + i) / grain);
+        }
+        return static_cast<u64>(touched.size());
+    };
+    std::mt19937_64 rng{0x517e};
+    u64 compared = 0;
+    for (const u64 address : {u64{0}, u64{1}, u64{3}, u64{4}, u64{7}, u64{8}, u64{63}, u64{64}, u64{127}, u64{128},
+                              u64{255}, u64{256}, u64{2047}, u64{2048}, u64{0x1000003}}) {
+        for (u64 size = 1; size <= 5000; size += (size < 600 ? 1 : 37)) {
+            for (size_t i = 0; i < HS::kCostSlots; ++i) {
+                const u64 grain = HS::kCostGrains[i];
+                const u64 transform = HS::TransformOf(grain);
+                CHECK(HS::PiecesOf(address, size, transform) == ref_pieces(address, size, transform));
+                // The formula of the doc, where its sum cannot wrap, is the same value.
+                CHECK(HS::PiecesOf(address, size, transform) == 1 + ((address % transform) + size - 1) / transform);
+                CHECK(HS::GrainsTouched(address, size, grain) == ref_grains(address, size, grain));
+                CHECK(HS::GrainsTouched(address, size, grain) ==
+                      ((address + size - 1) / grain) - (address / grain) + 1);
+                ++compared;
+            }
+        }
+    }
+    for (int n = 0; n < 2000; ++n) {
+        const u64 address = rng() & 0xffffffffffULL;
+        const u64 size = 1 + rng() % 9000;
+        for (size_t i = 0; i < HS::kCostSlots; ++i) {
+            const u64 transform = HS::TransformOf(HS::kCostGrains[i]);
+            CHECK(HS::PiecesOf(address, size, transform) == ref_pieces(address, size, transform));
+            CHECK(HS::GrainsTouched(address, size, HS::kCostGrains[i]) == ref_grains(address, size, HS::kCostGrains[i]));
+            ++compared;
+        }
+    }
+    CHECK(compared > 10000);
+    // The baseline is the transformation of today (2 KiB), and the transformations of the candidates are 32 x grain.
+    CHECK(HS::TransformOf(HS::kBaselineGrain) == 2048);
+    CHECK(HS::TransformOf(4) == 128);
+    CHECK(HS::TransformOf(8) == 256);
+    // The piece count agrees with CrossesTransform of the real manager: one piece exactly when it does not cross.
+    for (u64 address = 0; address < 4096; address += 5) {
+        for (u64 size : {u64{1}, u64{2}, u64{64}, u64{2047}, u64{2048}, u64{2049}, u64{4096}}) {
+            CHECK((HS::PiecesOf(address, size, 2048) == 1) ==
+                  !Core::GPUDirtyMemoryManager::CrossesTransform(address, size));
+        }
+    }
+}
+
+TEST_CASE("size counter [2]: zero size first, no wrap, and the alignment categories", "[list-diag][shape]") {
+    namespace HS = VideoCommon::HeldShape;
+    // Zero size: no formula runs (a `size - 1` would wrap to 2^64 - 1), and the shape says so.
+    CHECK(HS::PiecesOf(100, 0, 2048) == 0);
+    CHECK(HS::GrainsTouched(100, 0, 4) == 0);
+    CHECK(HS::ShapeOf(100, 0).empty);
+    CHECK(!HS::ShapeOf(100, 1).empty);
+    // A huge size does not wrap: 2^64 - 1 bytes from address 3 with T = 128.
+    const u64 huge = ~u64{0};
+    CHECK(HS::PiecesOf(3, huge, 128) == 1 + (huge - 1) / 128 + (3 + (huge - 1) % 128 >= 128 ? 1 : 0));
+    CHECK(HS::PiecesOf(0, huge, 128) == 1 + (huge - 1) / 128);
+    CHECK(HS::GrainsTouched(~u64{0}, 1, 4) == 1); // the last address: no sum with the size
+    // Categories: both, address only, size only, neither (they overlap in the sense of being counted per grain).
+    using A = HS::Align;
+    CHECK(HS::AlignOf(8, 16, 4) == A::Both);
+    CHECK(HS::AlignOf(8, 6, 4) == A::AddressOnly);
+    CHECK(HS::AlignOf(10, 16, 4) == A::SizeOnly);
+    CHECK(HS::AlignOf(10, 6, 4) == A::Neither);
+    CHECK(HS::AlignOf(4, 8, 8) == A::SizeOnly);
+    CHECK(HS::AlignOf(8, 4, 8) == A::AddressOnly);
+    CHECK(HS::AlignOf(8, 8, 8) == A::Both);
+    // The same piece differs by grain: aligned to 4 in both, to 8 in neither.
+    const HS::Shape shape = HS::ShapeOf(4, 4);
+    CHECK(shape.align[0] == A::Both);
+    CHECK(shape.align[1] == A::Neither); // address 4 and size 4 are not multiples of 8
+    CHECK(!shape.under_4);
+    CHECK(HS::ShapeOf(0, 3).under_4);
+    CHECK(HS::ShapeOf(0, 4).under_4 == false);
+    // Counters: zero size counted apart and out of every denominator; the rest sums per source.
+    HS::Counters<3> counters;
+    counters.Add(0, 0, 1);
+    counters.Add(4, 4, 0);
+    counters.Add(3, 5, 2);
+    counters.Add(2048 - 2, 4, 2); // crosses 2 KiB: 2 baseline pieces
+    CHECK(counters.empty.load() == 1);
+    CHECK(counters.pieces.load() == 3);
+    CHECK(counters.bytes.load() == 13);
+    CHECK(counters.pieces_by_source[0].load() == 1);
+    CHECK(counters.pieces_by_source[1].load() == 0);
+    CHECK(counters.pieces_by_source[2].load() == 2);
+    CHECK(counters.bytes_by_source[2].load() == 9);
+    CHECK(counters.under_4.load() == 0);
+    CHECK(counters.cost_pieces[2].load() == 1 + 1 + 2);
+    u64 category_sum = 0;
+    for (const auto& c : counters.align[0]) {
+        category_sum += c.load();
+    }
+    CHECK(category_sum == counters.pieces.load());
 }
 
 TEST_CASE("blkcmp [10]: a staging entry not found cancels the comparison (counters and identities)", "[list-diag][blkcmp]") {
