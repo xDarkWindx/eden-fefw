@@ -53,6 +53,9 @@ extern const int mode;
 #endif
 }
 
+/// Where a held guest write came from (core/memory.cpp HandleRasterizerWrite), for the 2 KiB statistics.
+enum class DirtySource : u8 { WriteT, WriteBlock, ZeroBlock, CacheOp, Exclusive, Other, Count };
+
 /// Consecutive spans of RasterizerVulkan::PrepareDraw, each attributed by Mark to one bucket.
 enum Draw : u32 {
     FlushWork,     ///< FlushWork (dispatching to the worker, flushing every 4096 draws)
@@ -236,6 +239,15 @@ struct Shared {
     std::atomic<u64> semaphore_readback_ticks{};
     InvalidationCounters held_writes;   ///< RasterizerVulkan::OnCachedWrites (guest writes)
     InvalidationCounters flush_caching; ///< RasterizerVulkan::InnerInvalidation (engine writes)
+    // Held pieces (core/memory.cpp, just before the Collect) that cross the end of a 2 KiB
+    // transformation, and the calls of GPU::InvalidateGPUCache (docs/gpu-contract-inventory.md, 7.4.1).
+    std::atomic<u64> dirty_held_calls{};
+    std::atomic<u64> dirty_cross_calls{};
+    std::atomic<u64> dirty_cross_bytes{};
+    std::array<std::atomic<u64>, static_cast<size_t>(DirtySource::Count)> dirty_cross_by_source{};
+    std::atomic<u64> invalidate_total{};
+    std::atomic<u64> invalidate_empty{};
+    std::atomic<u64> invalidate_data{};
     std::atomic<u64> gpu_modified_queries{};
     std::atomic<u64> gpu_modified_true{};
     std::atomic<u64> gpu_modified_one_page{}; ///< Queries within one 4 KiB page

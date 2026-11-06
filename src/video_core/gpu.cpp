@@ -124,6 +124,9 @@ struct GPU::Impl {
     void InvalidateGPUCache() {
         const VideoCommon::BackStats::ScopedSharedTime list_start{
             VideoCommon::BackStats::shared.list_start};
+        if (VideoCommon::BackStats::Enabled()) {
+            VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.invalidate_total, 1);
+        }
         // Collected first and applied as one batch: every region used to lock the texture and
         // buffer caches on its own, and each unlock woke a guest CPU thread waiting for them.
         // Per thread: fences can also apply them (fence_manager.h).
@@ -145,6 +148,9 @@ struct GPU::Impl {
             system.GatherGPUDirtyMemory(callback_writes);
         }
         if (cached_writes.empty()) {
+            if (VideoCommon::BackStats::Enabled()) {
+                VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.invalidate_empty, 1);
+            }
             if (diag) {
                 VideoCommon::ListDiag::DrainLog();
             }
@@ -173,6 +179,9 @@ struct GPU::Impl {
                 }
             }
             cached_writes.resize(out + 1);
+        }
+        if (VideoCommon::BackStats::Enabled()) {
+            VideoCommon::BackStats::Add(VideoCommon::BackStats::shared.invalidate_data, 1);
         }
         if (diag) {
             const std::vector<std::pair<u64, u64>> final_ranges{cached_writes.begin(), cached_writes.end()};

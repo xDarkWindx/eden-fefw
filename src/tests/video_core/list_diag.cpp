@@ -1237,3 +1237,232 @@ TEST_CASE("list diag: stress with threads, ground truth from the Gather", "[list
     const StressResult mutant = RunStress({notices, 4096, 1'000'000'000ull, 99, 1});
     CHECK(mutant.bad_claims + mutant.missing > 0);
 }
+
+// =============================================================================================
+// D1 (docs/gpu-contract-inventory.md, 7.4.1): CollectT splits a write that crosses the end of a 2 KiB
+// transformation. The expected result is the union of the written bytes rounded out to 64-byte
+// blocks; the output of the old behaviour for a crossing write is undefined and is NOT tested.
+
+namespace {
+
+/// Restores the temporary switch of the split (the tests change it with the system stopped).
+struct SplitKey {
+    explicit SplitKey(bool on) : old{Core::g_dirty_split_2k.load()} {
+        Core::g_dirty_split_2k.store(on ? 1 : 0);
+    }
+    ~SplitKey() {
+        Core::g_dirty_split_2k.store(old);
+    }
+    u8 old;
+};
+
+using Blocks = std::set<u64>; ///< 64-byte block numbers
+
+Blocks ExpectedBlocks(u64 addr, u64 size) {
+    Blocks blocks;
+    for (u64 b = addr / 64; b <= (addr + size - 1) / 64; ++b) {
+        blocks.insert(b);
+    }
+    return blocks;
+}
+
+template <bool Diag, class M>
+Blocks Delivered(M& manager, std::vector<std::pair<u64, u64>>* ranges = nullptr) {
+    Blocks blocks;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) {
+        REQUIRE(a % 64 == 0);
+        REQUIRE(s % 64 == 0);
+        if (ranges != nullptr) {
+            ranges->emplace_back(a, s);
+        }
+        for (u64 b = a / 64; b < (a + s) / 64; ++b) {
+            blocks.insert(b); // the same block may come twice (entries of different Collects): a union
+        }
+    };
+    if constexpr (Diag) {
+        Core::GatherLotState lots;
+        u64 lot = 0;
+        manager.template GatherT<true, TestHooks>(cb, &lots, &lot);
+    } else {
+        manager.Gather(cb);
+    }
+    return blocks;
+}
+
+template <bool Diag>
+void CollectAndCheck(u64 addr, u64 size) {
+    INFO("addr=0x" << std::hex << addr << " size=" << std::dec << size << " diag=" << Diag);
+    Manager manager;
+    manager.template CollectT<Diag, TestHooks>(addr, size);
+    CHECK(Delivered<Diag>(manager) == ExpectedBlocks(addr, size));
+}
+
+template <bool Diag>
+void RunD1Cases() {
+    SplitKey on{true};
+    // Exact 2 KiB, both halves; a whole 4 KiB page.
+    CollectAndCheck<Diag>(0x10000, 2048);
+    CollectAndCheck<Diag>(0x10800, 2048);
+    CollectAndCheck<Diag>(0x10000, 4096);
+    // Unaligned start, crossing: 2 pieces; and starting in the second half.
+    CollectAndCheck<Diag>(0x10033, 3000);
+    CollectAndCheck<Diag>(0x107ff, 2);
+    CollectAndCheck<Diag>(0x10801, 3000);
+    // Short crossing.
+    CollectAndCheck<Diag>(0x107c0, 128);
+    // The cases of the table of 7.4.
+    CollectAndCheck<Diag>(0x10400, 2048);
+    CollectAndCheck<Diag>(0x10000, 3000);
+}
+
+} // namespace
+
+TEST_CASE("list diag D1: crossing and exact cases deliver the whole range, rounded to 64 bytes", "[list-diag][d1]") {
+    RunD1Cases<false>();
+    RunD1Cases<true>();
+}
+
+TEST_CASE("list diag D1: the short crossing is two ranges of 64 bytes", "[list-diag][d1]") {
+    SplitKey on{true};
+    Manager manager;
+    manager.CollectT<false>(0x107c0, 128);
+    std::vector<std::pair<u64, u64>> ranges;
+    Delivered<false>(manager, &ranges);
+    std::sort(ranges.begin(), ranges.end());
+    REQUIRE(ranges.size() == 2);
+    CHECK(ranges[0] == std::pair<u64, u64>{0x107c0, 64});
+    CHECK(ranges[1] == std::pair<u64, u64>{0x10800, 64});
+}
+
+TEST_CASE("list diag D1: random writes inside a 4 KiB page are covered, not more than the 64-byte rounding",
+          "[list-diag][d1]") {
+    SplitKey on{true};
+    std::mt19937 rng{777};
+    for (int i = 0; i < 20000; ++i) {
+        const u64 page = 0x40000 + (rng() % 4) * 4096;
+        const u64 off = rng() % 4096;
+        const u64 size = 1 + rng() % (4096 - off);
+        if (i % 2 == 0) {
+            CollectAndCheck<false>(page + off, size);
+        } else {
+            CollectAndCheck<true>(page + off, size);
+        }
+    }
+}
+
+TEST_CASE("list diag D1: several writes in one manager give the union", "[list-diag][d1]") {
+    SplitKey on{true};
+    std::mt19937 rng{4242};
+    for (int round = 0; round < 200; ++round) {
+        Manager manager;
+        Blocks expected;
+        for (int k = 0; k < 6; ++k) {
+            const u64 page = 0x50000 + (rng() % 3) * 4096;
+            const u64 off = rng() % 4096;
+            const u64 size = 1 + rng() % (4096 - off);
+            manager.CollectT<true, TestHooks>(page + off, size);
+            const Blocks b = ExpectedBlocks(page + off, size);
+            expected.insert(b.begin(), b.end());
+        }
+        CHECK(Delivered<true>(manager) == expected);
+    }
+}
+
+TEST_CASE("list diag D1: size zero changes nothing, with the switch on and off", "[list-diag][d1]") {
+    for (const bool key : {true, false}) {
+        SplitKey k{key};
+        for (const u64 addr : {u64{0x10000}, u64{0x107c0}, u64{0x107ff}, u64{0x10800}, u64{0x10fff}}) {
+            Manager manager;
+            manager.CollectT<false, TestHooks>(addr, 0);
+            manager.CollectT<true, TestHooks>(addr, 0);
+            CHECK(Delivered<false>(manager).empty());
+        }
+    }
+}
+
+TEST_CASE("list diag D1: switch off equals the manager of before for writes that do not cross 2 KiB",
+          "[list-diag][d1]") {
+    SplitKey off{false};
+    Legacy::GPUDirtyMemoryManager legacy;
+    Manager plain;
+    Manager diagnostic;
+    std::mt19937 rng{99};
+    using Out = std::vector<std::pair<u64, u64>>;
+    bool all_equal = true;
+    for (int step = 0; step < 20000; ++step) {
+        if (rng() % 7 == 0) {
+            Out a, b, c;
+            std::function<void(PAddr, size_t)> ca = [&](PAddr x, size_t y) { a.emplace_back(x, y); };
+            std::function<void(PAddr, size_t)> cb = [&](PAddr x, size_t y) { b.emplace_back(x, y); };
+            std::function<void(PAddr, size_t)> cc = [&](PAddr x, size_t y) { c.emplace_back(x, y); };
+            legacy.Gather(ca);
+            plain.Gather(cb);
+            Core::GatherLotState lots;
+            u64 lot = 0;
+            diagnostic.GatherT<true, TestHooks>(cc, &lots, &lot);
+            all_equal = all_equal && a == b && a == c;
+        } else {
+            const u64 addr0 = 0x10000 + (rng() % 6) * 4096 + (rng() % 2) * 2048;
+            const u64 off_in = (rng() % 480) * 4;
+            const u64 size = 1 + rng() % std::min<u64>(96, 2048 - off_in);
+            legacy.Collect(addr0 + off_in, size);
+            plain.Collect(addr0 + off_in, size);
+            diagnostic.CollectT<true, TestHooks>(addr0 + off_in, size);
+        }
+    }
+    CHECK(all_equal);
+}
+
+TEST_CASE("list diag D1: the switch is only read when the write crosses, and only changes with a store",
+          "[list-diag][d1]") {
+    CHECK(Core::ParseDirtySplit2K(nullptr) == 1);
+    CHECK(Core::ParseDirtySplit2K("0") == 0);
+    CHECK(Core::ParseDirtySplit2K("1") == 1);
+    CHECK(Core::ParseDirtySplit2K("") == 1);
+    CHECK(Core::ParseDirtySplit2K("00") == 1);
+    STATIC_REQUIRE(!Core::GPUDirtyMemoryManager::CrossesTransform(0x10000, 2048));
+    STATIC_REQUIRE(!Core::GPUDirtyMemoryManager::CrossesTransform(0x10800, 2048));
+    STATIC_REQUIRE(Core::GPUDirtyMemoryManager::CrossesTransform(0x107c0, 128));
+    STATIC_REQUIRE(Core::GPUDirtyMemoryManager::CrossesTransform(0x10000, 2049));
+    // A huge size cannot wrap the comparison.
+    STATIC_REQUIRE(Core::GPUDirtyMemoryManager::CrossesTransform(0x107ff, ~size_t{0}));
+}
+
+TEST_CASE("list diag D1: a Gather between the two pieces of a notice makes it ambiguous", "[list-diag][d1]") {
+    SplitKey on{true};
+    SECTION("Gather between the pieces") {
+        Fx f;
+        f.gates.Arm("c.between_pieces");
+        Proto::Claim c;
+        std::thread wt([&] { c = f.Collect(0, 0x107c0, 128); });
+        f.gates.WaitReached("c.between_pieces");
+        f.gpu_modified.Add(0x107c0, 128);
+        const Proto::Batch first = f.GatherAll(); // takes the first piece, lot 1
+        REQUIRE(first.pre.size() == 1);
+        CHECK(first.pre[0].addr == 0x107c0);
+        CHECK(first.pre[0].size == 64);
+        f.ApplyBatchRanges(first);
+        f.gates.Release("c.between_pieces");
+        wt.join();
+        CHECK(c.ambiguous);
+        CHECK(c.lot == 0); // never one lot for a notice split between lots
+        const Proto::Batch second = f.GatherAll(); // takes the second piece, lot 2
+        REQUIRE(second.pre.size() == 1);
+        CHECK(second.pre[0].addr == 0x10800);
+        f.ApplyBatchRanges(second);
+        // Neither lot retires or affirms it.
+        CHECK(f.C(f.c().notice_ambiguous) == 1);
+        CHECK(f.C(f.c().notice_applied) == 0);
+        CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);
+    }
+    SECTION("no Gather between the pieces: both pieces are of lot d + 1") {
+        Fx f;
+        const auto c = f.Collect(0, 0x107c0, 128);
+        CHECK(!c.ambiguous);
+        CHECK(c.lot == 1);
+        const Proto::Batch b = f.GatherAll();
+        CHECK(b.pre.size() == 2);
+        f.ApplyBatchRanges(b);
+        CHECK(f.C(f.c().notice_applied) == 1);
+    }
+}

@@ -319,7 +319,7 @@ struct Memory::Impl {
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
-                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount, VideoCommon::BackStats::DirtySource::WriteBlock);
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
         });
@@ -334,7 +334,7 @@ struct Memory::Impl {
             std::memset(ptr, 0, copy_amount);
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
-            HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+            HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount, VideoCommon::BackStats::DirtySource::ZeroBlock);
             std::memset(ptr, 0, copy_amount);
         });
     }
@@ -381,7 +381,7 @@ struct Memory::Impl {
         auto on_rasterizer = [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t block_size) {
             // dc cvac: Store to point of coherency
             // CPU flush -> GPU invalidate
-            HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            HandleRasterizerWrite(GetInteger(current_vaddr), block_size, VideoCommon::BackStats::DirtySource::CacheOp);
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -390,7 +390,7 @@ struct Memory::Impl {
         auto on_rasterizer = [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t block_size) {
             // dc civac: Store to point of coherency, and invalidate from cache
             // CPU flush -> GPU invalidate
-            HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            HandleRasterizerWrite(GetInteger(current_vaddr), block_size, VideoCommon::BackStats::DirtySource::CacheOp);
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -649,7 +649,7 @@ struct Memory::Impl {
         const u64 addr = GetInteger(vaddr);
         if (auto const ptr = GetPointerImpl(addr, [addr, data]() {
             LOG_ERROR(HW_Memory, "Unmapped Write{} @ {:#016x} = {:#016x}", sizeof(T) * 8, addr, u64(data));
-        }, [&]() { HandleRasterizerWrite(addr, sizeof(T)); }); ptr) [[likely]] {
+        }, [&]() { HandleRasterizerWrite(addr, sizeof(T), VideoCommon::BackStats::DirtySource::WriteT); }); ptr) [[likely]] {
             std::memcpy(ptr, &data, sizeof(T));
         }
     }
@@ -662,7 +662,7 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
+            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T), VideoCommon::BackStats::DirtySource::Exclusive); });
         if (ptr) {
             return Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
         }
@@ -676,7 +676,7 @@ struct Memory::Impl {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive128 @ {:#016x} = {:#016x}{:016X}",
                           GetInteger(vaddr), static_cast<u64>(data[1]), static_cast<u64>(data[0]));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
+            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128), VideoCommon::BackStats::DirtySource::Exclusive); });
         if (ptr) {
             return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
         }
@@ -701,7 +701,9 @@ struct Memory::Impl {
         });
     }
 
-    void HandleRasterizerWrite(VAddr v_address, size_t size) {
+    void HandleRasterizerWrite(VAddr v_address, size_t size,
+                               VideoCommon::BackStats::DirtySource src =
+                                   VideoCommon::BackStats::DirtySource::Other) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -765,6 +767,17 @@ struct Memory::Impl {
             }
             // EDEN_LIST_DIAG (parts pop, blk): the same Collect, with the lot of the notice observed
             // (video_core/list_diag.h). Off: the flag is read and the Collect is the one of always.
+            if (VideoCommon::BackStats::Enabled()) {
+                // Held pieces that cross the end of a 2 KiB transformation (the D1 split of
+                // GPUDirtyMemoryManager::CollectT; docs/gpu-contract-inventory.md, 7.4.1). Same form as there.
+                namespace BackStats = VideoCommon::BackStats;
+                BackStats::Add(BackStats::shared.dirty_held_calls, 1);
+                if (Core::GPUDirtyMemoryManager::CrossesTransform(address, size)) {
+                    BackStats::Add(BackStats::shared.dirty_cross_calls, 1);
+                    BackStats::Add(BackStats::shared.dirty_cross_bytes, size);
+                    BackStats::Add(BackStats::shared.dirty_cross_by_source[static_cast<size_t>(src)], 1);
+                }
+            }
             VideoCommon::ListDiag::CollectNotice(gpu_dirty_managers[core], static_cast<unsigned>(core),
                                                  address, size);
         });

@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -13,6 +15,18 @@
 #include "core/device_memory_manager.h"
 
 namespace Core {
+
+/// TEMPORARY switch, read once: EDEN_DIRTY_SPLIT_2K=0 turns the 2 KiB split of CollectT off (the old
+/// behaviour, which is undefined for a write that crosses 2 KiB: docs/gpu-contract-inventory.md,
+/// 7.4). It exists ONLY for the user's A/B of the fix and WILL BE DELETED after it, with the split
+/// left always on; it is not a permanent option. Tests change it with the system stopped.
+constexpr u8 ParseDirtySplit2K(const char* value) {
+    return (value != nullptr && value[0] == '0' && value[1] == '\0') ? 0 : 1;
+}
+inline std::atomic<u8> g_dirty_split_2k{ParseDirtySplit2K(std::getenv("EDEN_DIRTY_SPLIT_2K"))};
+[[nodiscard]] inline bool DirtySplit2K() {
+    return g_dirty_split_2k.load(std::memory_order_relaxed) != 0;
+}
 
 /// Stop points for the tests of the diagnostic (EDEN_LIST_DIAG, docs/list-diag-design.md). A test
 /// supplies a type with the same members whose `At` blocks on a named point; here nothing happens
@@ -56,8 +70,42 @@ public:
     /// `Diag = false` is the code of before the diagnostic, with its memory orders. `Diag = true`
     /// only changes the orders of the operations on `current` to seq_cst (docs/list-diag-design.md,
     /// 3.3); nothing else.
+    /// Whether [address, address + size) passes the end of the transformation that holds `address`
+    /// (2 KiB). By subtraction: `offset + size` could wrap. The statistics use the same function.
+    [[nodiscard]] static constexpr bool CrossesTransform(PAddr address, size_t size) {
+        return size > page_size - (address & page_mask);
+    }
+
     template <bool Diag, class Hooks = DirtyNoHooks>
     void CollectT(PAddr address, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        // One transformation covers `page_size` bytes (2 KiB); a write that crosses its end used to
+        // build a mask with a negative shift (docs/gpu-contract-inventory.md, 7.4). Subtraction, not
+        // `offset + size`, so that a huge size cannot wrap. A write that fits takes the old path
+        // without a loop and without reading the switch.
+        if (!CrossesTransform(address, size) || !DirtySplit2K()) {
+            CollectOne<Diag, Hooks>(address, size);
+            return;
+        }
+        for (;;) {
+            const size_t piece = (std::min)(size, page_size - (address & page_mask));
+            CollectOne<Diag, Hooks>(address, piece);
+            address += piece;
+            size -= piece;
+            if (size == 0) {
+                return;
+            }
+            Hooks::At("c.between_pieces");
+        }
+    }
+
+private:
+    /// The body of CollectT before the split, unchanged (same memory orders): `size` fits in one
+    /// transformation.
+    template <bool Diag, class Hooks>
+    void CollectOne(PAddr address, size_t size) {
         constexpr auto load_order = Diag ? std::memory_order_seq_cst : std::memory_order_acquire;
         constexpr auto exchange_order = Diag ? std::memory_order_seq_cst : std::memory_order_relaxed;
         constexpr auto cas_success = Diag ? std::memory_order_seq_cst : std::memory_order_release;
@@ -83,6 +131,8 @@ public:
             tmp.mask |= t.mask;
         } while (!current.compare_exchange_weak(original, tmp, cas_success, cas_failure));
     }
+
+public:
 
     /// Bumped by every Gather: what a writer remembered about pages it collected before is stale
     /// once their writes were applied (core/memory.cpp, EDEN_CPU_WRITE_PAGES).
