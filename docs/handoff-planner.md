@@ -230,7 +230,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão de A/B/C: o B (T4.1) foi aprovado. O A precisa de uma correção: staging não achado **cancela** a
   comparação, como descarte contado, sem ler os bytes e sem entrar em compared/equal/different/invalidated. No C, ajustar
   a redação: a asserção do tick detecta mudança de contexto durante a captura, não toda violação de exclusão. Depois
-  disso, o build único e as três rodadas (novo, `EDEN_USAGE_TRACKER_OLD=1`, `pop,blk,blkcmp`). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  disso, o build único e as três rodadas (novo, `EDEN_USAGE_TRACKER_OLD=1`, `pop,blk,blkcmp`).
+- `52e726b`: staging não achado cancela (`StagingState`, descarte `blkcmp_discard_staging`); o texto do Report e a nota
+  do scheduler estão corrigidos. Conferido pelo planejador (82 casos, 79 passam e 3 falham como esperado; mutantes 6 e
+  2). O build está liberado para o usuário. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
