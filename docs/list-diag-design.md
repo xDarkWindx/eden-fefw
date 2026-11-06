@@ -818,6 +818,20 @@ deslocamento de 64 bits com tamanho < 64 B (`:92`, que o UBSan acusa), preexiste
    (este upload perde a reordenação, e o reset do rastreador atrasa) e descartes desnecessários. Proposta: tirá-los da
    versão 1 e deixá-los escritos como requisito da assíncrona.
 
+
+**Conferência do planejador (`99328ab`, antes do revisor).** Os três builds foram reproduzidos (115 995 asserções, 61
+casos); mutantes: `coverage` 6, `open` 2. O diff dos arquivos que não compilam na nuvem foi lido:
+- `BlkcmpCapture` (`buffer_cache.h`): é a primeira coisa de `InlineMemoryImplementation`; busca o buffer só por
+  `page_table` + `IsInBounds`; faz a cópia com `runtime.CopyBuffer(staging, buffer, copies, true)`, como
+  `DownloadBufferMemory`, mas sem `MarkUsage`; depois o `Finish` e a comparação.
+- O pedido é `static thread_local` (`protocol.h:1123`) e só é tocado sob o `buffer_cache.mutex`.
+- O balde usa microfichas (taxa × µs) e limita na rajada.
+
+**Perturbação a declarar (verificado):** toda submissão zera o contador de oclusão. `SubmitExecution` chama
+`EndPendingOperations` (`vk_scheduler.cpp:384`), que faz `CounterReset(ZPassPixelCount64)` (`:448`). Cada `Finish` do
+`blkcmp` acrescenta uma submissão no meio do frame e, com ela, um zeramento: as queries de oclusão do jogo podem mudar
+numa rodada com `blkcmp`. Não afeta a comparação, mas a rodada não serve para julgar a imagem. É o defeito que o
+Lichii do Frizti corrigiu pausando em vez de zerar (zortos293#121); está em `docs/gpu-contract-inventory.md` 7.5.
 #### 3.8.1 Do `NoteApply` até `InlineMemoryImplementation` (implementado)
 
 Todos na **mesma thread** e dentro do mesmo `buffer_cache.mutex`: `RasterizerVulkan::OnCachedWrites` toma o mutex

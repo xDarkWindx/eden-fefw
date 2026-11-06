@@ -159,3 +159,28 @@ caminhos afetados e o teste correspondente. Cada uma atrás de chave própria, c
    é exatamente isso.
 3. Para a separação engine/rasterizador: quais leituras do rasterizador de volta para a engine acontecem por
    draw, e quantas por segundo no FE? Cada uma vira espera.
+
+## 9. Fontes externas a estudar (registrado em 2026-11-06)
+
+Só leitura; nada entra em bloco. Cada item é lido no código, portado como mudança própria e medido com A/B. Os
+números são dos autores, em outro jogo e em outro hardware.
+
+**Lichii do Frizti** (`https://github.com/Frizti/Lichii`, releases `frizti-v1` e `frizti-v2`, GPL-3.0; o alvo é o Ocarina
+of Time numa RTX 4080; o build depende do split):
+- **Contador de oclusão pausado, não zerado, a cada submissão** (zortos293#121, Kajcsi): é contrato de query, não
+  otimização. Está em `docs/gpu-contract-inventory.md` 7.5.
+- **As threads da GPU esperam menos uma pela outra e a de trás faz menos por draw:** de ~37-40 para ~44 fps em Kokiri,
+  pelo relato, sem o mecanismo. Ler os commits do perf-9 (zortos293, nyakuoff): métodos 3D e upload de constant
+  buffers mais baratos na trás, contabilidade de buffer mais barata, unswizzle de textura em paralelo.
+- **Bindings de storage buffer em cache e upload direto dos bancos de uniform** (zortos293#175 e #176, mja00): encaixa
+  na seção 3 (descriptor sets persistentes).
+- **Stutter de shader:** pipelines do cache que a partida pula são construídos em threads de fundo; pipelines de mesh
+  vão para o cache em disco.
+- **Diagnósticos desligados por padrão:** `EDEN_NX2_FLASH_WATCH` (flashes de 1 a 2 frames, com o render pass),
+  `EDEN_NX2_PENDING_WRITE_TRACE`, `EDEN_NX2_TABLE_POINTER_TRACE`.
+- **Cuidados:** o próprio Frizti deixou de fora o zortos293#161 (geometria errada) e tem um bug aberto de superexposição.
+
+**FEFW-Stable-with-60-FPS-Patch** (TheSneakyBadger, fork do release 1.12 deste projeto): a correção da pasta de save
+(`profile_manager.cpp:575-586`, assunto à parte) e a correção da AMD para registros de shader lidos antes de escritos
+(vinda do Eglantine).
+

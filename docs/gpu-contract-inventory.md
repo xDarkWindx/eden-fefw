@@ -654,6 +654,22 @@ possam mostrar cruzamentos. O D1 não explica nada medido até agora no FE ou no
 aviso recortado cobre as duas metades, e o `apply_partial` que o bug produzia deve cair (hipótese). Uma queda de
 desempenho no A/B seria custo de invalidações antes perdidas: investigar, não restaurar a perda.
 
+### 7.5 Possível bug preexistente: o contador de oclusão é zerado a cada submissão
+
+- **Código (verificado).** `Scheduler::SubmitExecution` chama `EndPendingOperations` (`vk_scheduler.cpp:383-384`), que
+  faz `query_cache->CounterReset(QueryType::ZPassPixelCount64)` (`:447-449`). Então qualquer submissão (`Flush`,
+  `Finish`, as esperas que os downloads fazem) zera o contador de amostras que passaram no teste de profundidade, no
+  meio de uma query que o jogo abriu.
+- **Referência externa (relatada, não lida no código):** o Lichii do Frizti (release `frizti-v1`, zortos293#121 de
+  Kajcsi, commits `e44ee5c` e `87203d5`) troca o zeramento por uma **pausa** e diz que isso acabou com flashes brancos de um
+  frame no Ocarina of Time.
+- **Efeito aqui (hipótese):** o resultado de uma query de oclusão depende de quantas submissões caíram dentro dela. Isso
+  pode mudar a imagem ou a lógica do jogo de forma intermitente. Não foi medido no FE nem no Bananza.
+- **Contrato:** é um contrato de query (`architecture-plan.md` 2.2): o valor que a GPU reportaria não pode depender
+  de quando o emulador decide submeter. Candidato a item próprio, lido no código do Lichii e portado com A/B.
+- **Para o diagnóstico:** o `blkcmp` faz um `Finish` por comparação, então numa rodada com ele há zeramentos a mais
+  (`docs/list-diag-design.md` 3.8).
+
 ### Pendências de localização
 
 **P1. Onde este fork produz os timestamps e as durações de GPU e de frame que o jogo lê.** Só localizado, com
