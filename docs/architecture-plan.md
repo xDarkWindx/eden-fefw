@@ -244,12 +244,35 @@ Uma tabela única (`video_core/policy.h`), lida uma vez no início, com sintaxe 
 1. Rodar, juntar o log e os dumps.
 2. Rejeições de shader → L0: implementar, fixture, sweep.
 3. Imagem errada sem rejeição → diagnóstico do consumidor suspeito (o build de diagnóstico de listas é o
-   modelo), e depois políticas em modo exato, uma por vez, com o resto constante.
-4. Se nenhuma política consertar, o jogo revelou uma regra do hardware que os contratos ainda não cobrem:
+   modelo), e depois políticas em modo exato, uma por vez, com o resto constante. **Sem rejeição de shader
+   não quer dizer shader correto** (revisão 4): uma tradução aceita pode dar resultado errado.
+4. Se nenhuma política consertar, **pode ser** que o jogo tenha revelado uma regra do hardware que os contratos ainda
+   não cobrem. Pode ser também implementação errada de uma regra conhecida, recurso errado, estado persistente,
+   shader, apresentação ou configuração (revisão 4). Antes de decidir, o roteiro do agente localiza a primeira
+   divergência (seção 4.1). Se for regra nova:
    ela entra como regra nova no contrato responsável (seção 2.2), com teste que reproduz o problema e a
    declaração de esperas, recursos retidos e custo sem uso. Se a regra não couber em nenhum contrato sem
    mudanças espalhadas, o contrato é que muda, explicitamente.
 5. Algo que só o jogo faz e que não vale emular → plugin.
+
+### 4.1 Roteiro do agente (revisão 4; o roteiro detalhado é um doc próprio, a escrever)
+
+O roteiro localiza a **primeira divergência**; não sai experimentando precisão.
+1. **Reprodução identificável:** build, driver, configurações **efetivas** (a resolução da L4), save ou cena, a imagem
+   esperada e o momento do defeito.
+2. **Localização:** o efeito não foi desenhado, foi desenhado errado, ou sumiu numa etapa posterior?
+3. **Inspeção:** draw ou dispatch, shader, recursos ligados, formatos, dimensões, conteúdo antes e depois, queries e
+   condição de execução.
+4. **Experimento controlado:** mudar **uma** política suportada, ou desligar um passe, registrando também a interferência
+   da ferramenta. Às vezes é preciso testar pares, porque as peças interagem.
+5. **Caso mínimo:** só então decidir entre bug de implementação, contrato incompleto ou substituto específico (L5).
+
+Cada sintoma tem o seu ponto de partida. Imagem borrada começa pela resolução dos alvos, mip/LOD, sampler e passes
+temporais. Objeto ausente começa pelo draw ou dispatch, pelos argumentos, pelo shader e pela oclusão. Nenhum dos dois
+começa pela coerência de command lists. A captura de frame (Vulkan, RenderDoc quando funcionar) tem valor imediato e o
+replay completo pode esperar; a captura localiza o passe, mas não prova que a ordem emulada estava certa. O servidor
+MCP do Lichii (#111) é um adaptador de operações de inspeção: o trabalho do renderer vai para a thread dona, com limites
+e resposta explícita quando não puder executar, nunca por outro caminho de acesso aos caches.
 
 ## 5. Ordem de implementação (revisada)
 
@@ -268,6 +291,61 @@ o padrão antes de medir.
 | 7 | Registro de políticas (sem mudar padrões) | nenhum |
 | 1b | Proteções da seção 12.2 que não dependem de nada: guardas no consumo, contenção de exceções, esperas com limite, relatório de saúde | baixo; entram cedo, junto do passo 1 |
 | 8 | Trabalhos separados, cada um com evidência própria: arrays de ids, plugins, BDA, heap bindless, replay | varia |
+
+### 5.1 Rumo revisado (2026-11-06, usuário e revisão 4)
+
+O próximo marco entrega **capacidade de extensão e de investigação**, sem esperar que todos os defeitos conhecidos
+estejam resolvidos. O endurecimento do núcleo (T3, D1, T4.0, T4.1 e O1) foi útil; continuar só nele deixaria o objetivo
+da seção 0 sempre para depois.
+
+**O marco:** um agente consegue reproduzir o defeito, consultar as políticas efetivas, fazer uma investigação curta e
+localizar a mudança num contrato ou num handler, sem precisar conhecer todos os caches.
+
+**Ordem:**
+1. Concluir o O1 experimental (`held_write_grain`), sem fazer dele requisito para declarar a memória correta.
+2. **L4 mínima**, mais o roteiro do agente e um resumo das configurações efetivas. As escolhas existentes são migradas
+   preservando o comportamento e os padrões. **Aceite:**
+   - reproduz o preset atual;
+   - mostra os valores efetivos;
+   - permite mudar uma escolha suportada sem editar código;
+   - é consumida pelos caminhos reais: uma tabela que só documenta os `getenv` não entrega a bissecção.
+3. **Protótipo 13.2 integrado a um consumidor real**, primeiro em diagnóstico. Outro modelo isolado no harness não basta.
+4. **L5 mínima**, migrando o reset indireto do Bananza (98b6de5) sem mudar de comportamento. Pode vir antes do 3 se for
+   pequena e bem delimitada; o sistema completo de plugins não é dependência do contrato de memória.
+
+**L4 mínima, desenho (revisão 4):**
+- **Registro:** nome estável, modos **implementados** (nada de anunciar modo que não existe: `exact-drain` não aparece
+  como garantia só porque o nome está na tabela), padrão, classificação (compatibilidade, experimental ou garantia
+  validada) e restrições entre modos.
+- **Resolução:** preset, configuração, apelidos e overrides, com precedência explícita e o resultado registrado.
+- **Uso:** campos tipados, resolvidos fora do caminho quente; nada de busca por string nem mapa por draw.
+- **Validação:** opção desconhecida ou combinação não suportada dá erro claro; nunca é ignorada nem executada pela
+  metade.
+- **Observação:** a configuração efetiva sempre identificável. Contadores de execução só quando necessários e ligados;
+  saber qual modo está ativo é diferente de contar cada uso.
+- **Accurate:** separar com cuidado, porque as peças interagem. Manter um preset equivalente ao comportamento atual e
+  liberar só combinações com contrato conhecido.
+- **Fronteiras:** ler tudo uma vez na partida só preserva o comportamento se a escolha já é fixa hoje. Onde há mudança
+  numa fronteira de execução, preservar a fronteira ou declarar que o override exige reinício.
+
+**Defeitos que não esperam a arquitetura inteira:**
+
+| Problema | Prioridade |
+| --- | --- |
+| 7.7, memória não coerente nos downloads | correção localizada **cedo**, antes de confiar nos downloads como referência de diagnóstico |
+| A e M | não bloqueiam a L4; bloqueiam chamar uma transferência de "exata" quando ela atravessa essas janelas. Tratados na integração do contrato de memória, com escopo explícito |
+| 7.5, queries de oclusão | item próprio e próximo; tem prioridade quando a investigação envolve objeto ausente, renderização condicional ou ferramenta que muda submissões |
+| W1 | mantém-se a precondição: handlers e ferramentas novos não podem pôr outro escritor no mesmo gerenciador |
+| G residual | continua declarado; o O1 não dá garantia exata a quem precisa dela |
+
+Uma política **seleciona** um comportamento; não substitui o conserto do mecanismo que promete executá-lo. E nem todo
+conserto precisa passar antes pelas interfaces novas: uma correção pequena e comprovada no cache pode entrar direto, com
+o contrato e o teste correspondentes.
+
+**O1 como política:** `held_write_grain`, com os modos `legacy-64` e `experimental-4`, nenhum chamado de "exato".
+A interface é `EDEN_POLICY=held_write_grain=experimental-4`, e `EDEN_DIRTY_GRAIN` fica como apelido temporário, com
+precedência definida. No O2, o consumidor pede "preservar as escritas exatas"; o grão e a representação são decisões
+internas.
 
 ## 6. O que não muda
 

@@ -260,7 +260,16 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão 5 do T4: **O1 de 4 B como mitigação experimental**, com o conserto do `Gather`, testes com o grão real e o custo
   medido (total, do escritor e da aplicação). Foram corrigidas três afirmações: "sem custo no escritor", "100%
   alinhadas" e "O2 herda o estouro do ledger". A revisão dos commits `d5e7158`, `1b0d10d`, `86aec48` e `5aab322` já
-  estava respondida e aprovada. G residual, A e M continuam abertos. Próximo: o O1 com o codador. O staging foi
+  estava respondida e aprovada. G residual, A e M continuam abertos. Próximo: o O1 com o codador.
+- **Rumo novo (usuário e revisão 4, `architecture-plan.md` 5.1 e 4.1):** o próximo marco é capacidade de extensão e de
+  investigação. A ordem é: O1 → **L4 mínima** com o roteiro do agente e o resumo das configurações efetivas → protótipo
+  13.2 num consumidor real → L5 mínima (o reset do Bananza). O 7.7 entra cedo, como correção localizada; o 7.5 é o
+  item próprio seguinte. O O1 vira a política `held_write_grain` (`legacy-64`, `experimental-4`).
+- `9cd24b6`: O1 entregue pelo codador (`EDEN_DIRTY_GRAIN=4`, duas instanciações escolhidas por um `const bool`, o laço do
+  `Gather` consertado, contador do `guard`, testes nos dois grãos). Ressalva: no microbenchmark, a escrita já coberta
+  no caminho de 64 B ficou +1,2 ns (+13%). Conferido pelo planejador: 97 casos, 94 passam e 3 falham como esperado, nos
+  três builds e nos dois grãos; mutantes 6 e 2; a condição antiga do laço derruba 2 casos no grão de 4 B. Com o revisor;
+  depois, o A/B do usuário. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
