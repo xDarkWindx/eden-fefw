@@ -21,6 +21,7 @@
 #include "video_core/gpu.h"
 #include "video_core/back_thread_stats.h"
 #include "video_core/gpu_split.h"
+#include "video_core/list_diag/thread_mark.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -61,7 +62,13 @@ void OnBack(const Func& func) {
 }
 
 void DrainBack(VideoCommon::BackStats::DrainSite site) {
-    VideoCommon::GpuSplit::Get().Drain(site);
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.Drain(site);
+    // EDEN_LIST_DIAG: with the split, the thread that drained is the front, and it may use the rasterizer from
+    // here (docs/list-diag-design.md, 3.8.6). Without the split there is no drain and no mark: other/unknown.
+    if (split.Active()) {
+        VideoCommon::ListDiag::MarkThread(VideoCommon::ListDiag::ThreadRole::Front);
+    }
 }
 
 } // Anonymous namespace

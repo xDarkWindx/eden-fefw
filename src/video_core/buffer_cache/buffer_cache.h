@@ -8,6 +8,7 @@
 
 #include <unordered_set>
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -145,6 +146,8 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     VideoCommon::ListDiag::NoteApplyHook(
         device_addr, size, gpu_modified_ranges, cpu_read_ranges, !AsyncBufferDownloads(),
         [this](u64 address, u8* out, size_t length) { device_memory.ReadBlockUnsafe(address, out, length); });
+    // EDEN_LIST_DIAG (part blkcmp): a drawn range that returns below before the upload is counted as "no upload".
+    const VideoCommon::ListDiag::BlkcmpScope blkcmp_scope;
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
         return;
@@ -2113,6 +2116,11 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
+    // EDEN_LIST_DIAG (part blkcmp): FIRST, before ClearDownload, FindBuffer and SynchronizeBuffer, which can
+    // overwrite the bytes to read (docs/list-diag-design.md, 3.8.1). Off: the flag, a branch.
+    if (VideoCommon::ListDiag::BlkcmpPending(dest_address, copy_size) != nullptr) {
+        BlkcmpCapture(dest_address, copy_size, inlined_buffer);
+    }
     ClearDownload(dest_address, copy_size);
     gpu_modified_ranges.Subtract(dest_address, copy_size);
 
@@ -2133,6 +2141,48 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {
         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
+    }
+}
+
+template <class P>
+void BufferCache<P>::BlkcmpCapture(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer) {
+    namespace Diag = VideoCommon::ListDiag;
+    if constexpr (!USE_MEMORY_MAPS) {
+        Diag::BlkcmpDiscard(Diag::BlkcmpReason::NoMemoryMaps);
+        return;
+    } else {
+        // The buffer by a pure query: the start of FindBuffer, never FindBuffer itself, which can synchronize
+        // writes (SynchronizeBufferWrites) and create a buffer. One buffer must hold the whole range.
+        const BufferId buffer_id = dest_address != 0 ? page_table[dest_address >> CACHING_PAGEBITS] : NULL_BUFFER_ID;
+        if (!buffer_id || !slot_buffers[buffer_id].IsInBounds(dest_address, static_cast<u32>(copy_size))) {
+            Diag::BlkcmpDiscard(Diag::BlkcmpReason::NoSingleBuffer);
+            return;
+        }
+        Buffer& buffer = slot_buffers[buffer_id];
+        const auto* const request = Diag::BlkcmpPending(dest_address, copy_size);
+        if (request == nullptr || !Diag::BlkcmpTakeToken()) {
+            return; // stale or without budget: already counted
+        }
+        std::array<u64, Diag::kBlkcmpParts> offsets{};
+        const u64 total = Diag::Impl::BlkcmpLayout(*request, offsets);
+        // Own staging buffer, sized by the sum of the parts with their alignment; not DownloadBufferMemory, which
+        // writes the guest and moves the tracking.
+        auto download_staging = runtime.DownloadStagingBuffer(total);
+        boost::container::small_vector<BufferCopy, Diag::kBlkcmpParts> copies;
+        for (unsigned i = 0; i < request->count; ++i) {
+            copies.push_back(BufferCopy{
+                .src_offset = buffer.Offset(request->parts[i].addr),
+                .dst_offset = download_staging.offset + offsets[i],
+                .size = request->parts[i].size,
+            });
+        }
+        const std::span<BufferCopy> copies_span(copies.data(), copies.data() + copies.size());
+        runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        const auto start = std::chrono::steady_clock::now();
+        runtime.Finish();
+        const auto finish_us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        Diag::BlkcmpCompare(download_staging.mapped_span.data(), offsets, inlined_buffer, finish_us);
     }
 }
 

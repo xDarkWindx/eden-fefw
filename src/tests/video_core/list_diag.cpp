@@ -2335,3 +2335,363 @@ TEST_CASE("T3a.1b: after an overflow the cursor skips the slots examined, so the
     CHECK(f.W().registered == 17);
     CHECK(f.Conserved());
 }
+
+// =============================================================================================
+// T3a.2 blkcmp (docs/list-diag-design.md, 3.8): what the harness can test. The copy in Vulkan, the Finish, the
+// capture in InlineMemoryImplementation and the BufferCache as a whole are NOT here (3.8.8).
+
+namespace {
+
+/// One affirmed range with at_risk bytes on a fresh page; the request left pending for this thread (or null).
+const Proto::BlkcmpRequest* AffirmedCycle(Fx& f, u64 page, u32 exact_off = 0, u32 exact_size = 4) {
+    f.gpu_modified.Add(page << 12, 64);
+    f.Collect(0, (page << 12) + exact_off, exact_size);
+    ApplyAll(f, f.GatherAll());
+    return f.proto.BlkcmpPending(page << 12, 64);
+}
+
+struct BlkcmpFx {
+    Fx f{64};
+    BlkcmpFx() {
+        f.proto.blkcmp_on = true;
+        f.proto.BlkcmpExpire(); // nothing left from an earlier test of this thread
+    }
+    ~BlkcmpFx() {
+        f.proto.BlkcmpExpire();
+    }
+};
+
+} // namespace
+
+TEST_CASE("blkcmp [1]: the draw is reproducible, uses its own seed and is 1/M", "[list-diag][blkcmp]") {
+    constexpr unsigned kRanges = 3000;
+    const auto run = [&](u64 seed, u64 odds) {
+        BlkcmpFx b;
+        b.f.proto.blkcmp_seed = seed;
+        b.f.proto.blkcmp_odds = odds;
+        b.f.proto.blkcmp_max_bytes = 4096;
+        std::vector<bool> drawn;
+        for (unsigned i = 0; i < kRanges; ++i) {
+            drawn.push_back(AffirmedCycle(b.f, 0xC000 + i) != nullptr);
+            b.f.proto.BlkcmpExpire();
+        }
+        CHECK(b.f.C(b.f.c().blkcmp_eligible) == kRanges);
+        return drawn;
+    };
+    const auto a = run(123, 4);
+    const auto again = run(123, 4);
+    const auto other = run(124, 4);
+    CHECK(a == again); // same seed, same sequence: same draw
+    CHECK(a != other); // another seed: another draw
+    // It is the formula: eligible number k is drawn iff SplitMix64(seed ^ k) % M == 0.
+    for (unsigned k = 0; k < kRanges; ++k) {
+        REQUIRE(static_cast<bool>(a[k]) == (Proto::SplitMix64(123 ^ k) % 4 == 0));
+    }
+    const double n = static_cast<double>(std::count(a.begin(), a.end(), true));
+    const double mean = kRanges / 4.0;
+    const double sigma = std::sqrt(kRanges * 0.25 * 0.75);
+    CHECK(std::abs(n - mean) < 4 * sigma);
+    // M = 1 draws everything.
+    const auto all = run(5, 1);
+    CHECK(std::count(all.begin(), all.end(), true) == kRanges);
+}
+
+TEST_CASE("blkcmp [2]: the bucket, sustained rate and burst", "[list-diag][blkcmp]") {
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    b.f.proto.blkcmp_rate = 5;
+    b.f.proto.blkcmp_burst = 5;
+    unsigned page = 0xD000;
+    const auto take = [&] {
+        REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+        const bool ok = b.f.proto.BlkcmpTakeToken();
+        b.f.proto.BlkcmpExpire();
+        return ok;
+    };
+    g_clock = 1'000'000;
+    for (int i = 0; i < 5; ++i) {
+        CHECK(take()); // the burst: 5 at once
+    }
+    CHECK(!take()); // empty
+    CHECK(b.f.C(b.f.c().blkcmp_discard_budget) == 1);
+    g_clock += 200'000; // 0.2 s at 5/s: exactly one token
+    CHECK(take());
+    CHECK(!take());
+    g_clock += 100'000; // half a token
+    CHECK(!take());
+    g_clock += 100'000; // together, one
+    CHECK(take());
+    g_clock += 60'000'000; // a long idle: the bucket holds the burst, no more
+    for (int i = 0; i < 5; ++i) {
+        CHECK(take());
+    }
+    CHECK(!take());
+    CHECK(b.f.C(b.f.c().blkcmp_discard_budget) == 4);
+}
+
+TEST_CASE("blkcmp [3]: the size cap and the number of parts", "[list-diag][blkcmp]") {
+    SECTION("the cap on the at_risk bytes") {
+        BlkcmpFx b;
+        b.f.proto.blkcmp_odds = 1;
+        b.f.proto.blkcmp_max_bytes = 32; // a 64-byte block with a 4-byte write has 60 at risk
+        CHECK(AffirmedCycle(b.f, 0xE000) == nullptr);
+        CHECK(b.f.C(b.f.c().blkcmp_discard_size) == 1);
+        b.f.proto.blkcmp_max_bytes = 60;
+        CHECK(AffirmedCycle(b.f, 0xE001) != nullptr); // exactly at the cap is accepted
+    }
+    SECTION("more parts than a request holds is discarded, not truncated") {
+        BlkcmpFx b;
+        b.f.proto.blkcmp_odds = 1;
+        // 17 separate GPU pieces in one block, no exact write in them (the write is in the one byte left).
+        const u64 page = 0xE100;
+        for (unsigned i = 0; i < 17; ++i) {
+            b.f.gpu_modified.Add((page << 12) + i * 3, 1);
+        }
+        b.f.Collect(0, (page << 12) + 60, 4);
+        ApplyAll(b.f, b.f.GatherAll());
+        CHECK(b.f.C(b.f.c().blkcmp_discard_ranges) == 1);
+        CHECK(b.f.proto.BlkcmpPending(page << 12, 64) == nullptr);
+    }
+}
+
+TEST_CASE("blkcmp [4]: the at_risk bytes of the request and the layout of the staging", "[list-diag][blkcmp]") {
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    // A 64-byte block, GPU bytes everywhere, the CPU wrote 4 bytes at +16: at risk are [0,16) and [20,64).
+    const u64 page = 0xE200;
+    const auto* request = AffirmedCycle(b.f, page, 16, 4);
+    REQUIRE(request != nullptr);
+    CHECK(request->addr == page << 12);
+    CHECK(request->size == 64);
+    REQUIRE(request->count == 2);
+    CHECK(request->parts[0].addr == (page << 12) + 0);
+    CHECK(request->parts[0].size == 16);
+    CHECK(request->parts[1].addr == (page << 12) + 20);
+    CHECK(request->parts[1].size == 44);
+    CHECK(request->total == 60);
+    CHECK(request->mask == 1u);
+    std::array<u64, kBlkcmpParts> offsets{};
+    const u64 total = Proto::BlkcmpLayout(*request, offsets);
+    CHECK(offsets[0] == 0);
+    CHECK(offsets[1] == 64); // each part aligned to 64 bytes
+    CHECK(total == 128);
+}
+
+TEST_CASE("blkcmp [5]: the comparison with a fake staging", "[list-diag][blkcmp]") {
+    const auto run = [&](const std::function<void(std::vector<u8>&)>& tweak, u64 expect_diff, u64 expect_first) {
+        BlkcmpFx b;
+        b.f.proto.blkcmp_odds = 1;
+        const u64 page = 0xE300;
+        const auto* request = AffirmedCycle(b.f, page, 16, 4);
+        REQUIRE(request != nullptr);
+        std::vector<u8> payload(64);
+        for (size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = static_cast<u8>(i + 1);
+        }
+        std::array<u64, kBlkcmpParts> offsets{};
+        const u64 total = Proto::BlkcmpLayout(*request, offsets);
+        std::vector<u8> staging(total, 0xAA);
+        for (unsigned i = 0; i < request->count; ++i) { // the old bytes equal the payload
+            for (u64 k = 0; k < request->parts[i].size; ++k) {
+                staging[offsets[i] + k] = payload[request->parts[i].addr - request->addr + k];
+            }
+        }
+        tweak(staging);
+        MarkThread(ThreadRole::Back);
+        const bool different = b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1234);
+        MarkThread(ThreadRole::Unknown);
+        CHECK(different == (expect_diff != 0));
+        CHECK(b.f.C(b.f.c().blkcmp_bytes_compared) == 60); // only the at_risk bytes
+        CHECK(b.f.C(b.f.c().blkcmp_bytes_different) == expect_diff);
+        CHECK(b.f.C(b.f.c().blkcmp_compared) == 1);
+        CHECK(b.f.C(b.f.c().blkcmp_compared_back) == 1);
+        CHECK(b.f.C(b.f.c().blkcmp_equal) == (expect_diff == 0 ? 1u : 0u));
+        CHECK(b.f.C(b.f.c().blkcmp_different) == (expect_diff == 0 ? 0u : 1u));
+        CHECK(b.f.C(b.f.c().blkcmp_finish_us_max) == 1234);
+        CHECK(b.f.proto.BlkcmpPending(page << 12, 64) == nullptr); // the request ended
+        if (expect_diff != 0) {
+            const auto lines = b.f.Lines();
+            REQUIRE(!lines.empty());
+            char want[40];
+            std::snprintf(want, sizeof(want), "first=0x%llx", static_cast<unsigned long long>((page << 12) + expect_first));
+            bool found = false;
+            for (const auto& line : lines) {
+                found = found || (line.find("[blkcmp] different") != std::string::npos && line.find(want) != std::string::npos);
+            }
+            CHECK(found);
+        }
+    };
+    run([](std::vector<u8>&) {}, 0, 0);
+    run([](std::vector<u8>& s) { s[0] ^= 0xFF; }, 1, 0);          // first byte of the first part
+    run([](std::vector<u8>& s) { s[64 + 43] ^= 0x01; }, 1, 20 + 43); // last byte of the last part
+    run([](std::vector<u8>& s) { s[3] ^= 1; s[64] ^= 1; s[70] ^= 1; }, 3, 3);
+    // Bytes outside the parts (the padding of the alignment) are not compared.
+    run([](std::vector<u8>& s) { s[16] ^= 0xFF; s[63] ^= 0xFF; s[64 + 44] ^= 0xFF; }, 0, 0);
+}
+
+TEST_CASE("blkcmp [6]: the discards by reason and the conservation", "[list-diag][blkcmp]") {
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    b.f.proto.blkcmp_burst = 100;
+    unsigned page = 0xE400;
+    std::array<u64, kBlkcmpParts> offsets{};
+    // no upload: the scope ends with the request pending
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    b.f.proto.BlkcmpExpire();
+    CHECK(b.f.C(b.f.c().blkcmp_discard_no_upload) == 1);
+    // stale: asked for another range
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    CHECK(b.f.proto.BlkcmpPending(0x1234000, 64) == nullptr);
+    CHECK(b.f.C(b.f.c().blkcmp_discard_stale) == 1);
+    CHECK(b.f.proto.BlkcmpPending(0x1234000, 64) == nullptr); // nothing left
+    // no memory maps, no single buffer
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    b.f.proto.BlkcmpDiscard(BlkcmpReason::NoMemoryMaps);
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    b.f.proto.BlkcmpDiscard(BlkcmpReason::NoSingleBuffer);
+    CHECK(b.f.C(b.f.c().blkcmp_discard_no_memory_maps) == 1);
+    CHECK(b.f.C(b.f.c().blkcmp_discard_no_single_buffer) == 1);
+    // two compared, one equal and one different
+    for (const bool diff : {false, true}) {
+        const auto* request = AffirmedCycle(b.f, page++);
+        REQUIRE(request != nullptr);
+        std::vector<u8> payload(64, 7);
+        std::vector<u8> staging(Proto::BlkcmpLayout(*request, offsets), 7);
+        if (diff) {
+            staging[0] = 8;
+        }
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 10);
+    }
+    // the size cap, and the budget
+    b.f.proto.blkcmp_max_bytes = 8;
+    CHECK(AffirmedCycle(b.f, page++) == nullptr);
+    b.f.proto.blkcmp_max_bytes = 4096;
+    b.f.proto.blkcmp_burst = 1;
+    b.f.proto.blkcmp_rate = 1;
+    g_clock += 10'000'000;
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    CHECK(b.f.proto.BlkcmpTakeToken());
+    b.f.proto.BlkcmpExpire(); // the request is still pending after a good token: no upload
+    REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+    CHECK(!b.f.proto.BlkcmpTakeToken());
+    // drawn = compared + every discard
+    const auto& c = b.f.c();
+    const u64 discards = Get(c.blkcmp_discard_ranges) + Get(c.blkcmp_discard_size) + Get(c.blkcmp_discard_no_upload) +
+                         Get(c.blkcmp_discard_no_memory_maps) + Get(c.blkcmp_discard_no_single_buffer) +
+                         Get(c.blkcmp_discard_budget) + Get(c.blkcmp_discard_stale);
+    CHECK(Get(c.blkcmp_drawn) == Get(c.blkcmp_compared) + discards);
+    CHECK(Get(c.blkcmp_compared) == Get(c.blkcmp_equal) + Get(c.blkcmp_different));
+    CHECK(Get(c.blkcmp_eligible) >= Get(c.blkcmp_drawn));
+    // the summary says what it is
+    const auto summary = b.f.proto.SummaryLines();
+    bool text = false, caveat = false, random = false;
+    for (const auto& line : summary) {
+        text = text || line.find("bytes antigos da GPU diferentes do payload que os substituiu") != std::string::npos;
+        caveat = caveat || line.find("nao prova corrupcao visivel nem exclui uma escrita legitima concorrente") != std::string::npos;
+        random = random || line.find("NAO sao amostra aleatoria") != std::string::npos;
+    }
+    CHECK(text);
+    CHECK(caveat);
+    CHECK(random);
+}
+
+TEST_CASE("blkcmp [7]: nothing without blk or with blkcmp off, and the other counters do not change", "[list-diag][blkcmp]") {
+    SECTION("blkcmp off: no request, no counter") {
+        Fx f(64);
+        f.proto.BlkcmpExpire();
+        CHECK(AffirmedCycle(f, 0xE500) == nullptr);
+        for (const FieldRef& field : Fields(f.c())) {
+            if (std::string{field.name}.rfind("blkcmp_", 0) == 0) {
+                INFO(field.name);
+                CHECK(Get(*field.counter) == 0);
+            }
+        }
+    }
+    SECTION("blkcmp on but blk off: AccountBlock does not run") {
+        Fx f(64);
+        f.proto.blkcmp_on = true;
+        f.proto.blk_on = false;
+        f.proto.blkcmp_odds = 1;
+        CHECK(AffirmedCycle(f, 0xE501) == nullptr);
+        CHECK(f.C(f.c().blkcmp_eligible) == 0);
+    }
+    SECTION("the same script with and without blkcmp gives the same blk and notice counters") {
+        std::map<std::string, u64> with, without;
+        for (const bool on : {true, false}) {
+            Script<Proto> sc(16);
+            sc.proto.blkcmp_on = on;
+            sc.proto.blkcmp_odds = 2;
+            sc.proto.ledger.expiry_us = 1'500'000;
+            g_clock = 0;
+            RunScript<Proto, Proto::Gathered, Proto::Batch>(sc.proto, sc, 7);
+            sc.proto.BlkcmpExpire();
+            auto& target = on ? with : without;
+            for (const auto& v : sc.proto.Snapshot()) {
+                target[v.name] = v.value;
+            }
+        }
+        unsigned compared = 0;
+        for (const auto& [name, value] : without) {
+            if (name.rfind("blkcmp_", 0) == 0) {
+                continue;
+            }
+            INFO(name);
+            CHECK(with.at(name) == value);
+            ++compared;
+        }
+        CHECK(compared > 20);
+        CHECK(with.at("blkcmp_eligible") > 0);
+    }
+}
+
+TEST_CASE("blkcmp [8]: the part, its configuration and the thread mark", "[list-diag][blkcmp]") {
+    using namespace VideoCommon::ListDiag;
+    CHECK((ParseParts("blkcmp") & PartBlkcmp) != 0);
+    CHECK((ParseParts("pop,blk,blkcmp") & (PartPop | PartBlk | PartBlkcmp)) == (PartPop | PartBlk | PartBlkcmp));
+    CHECK((ParseParts("1") & PartBlkcmp) == 0); // never in "1": it perturbs
+    const auto d = ParseBlkcmpConfig(1, nullptr, nullptr, nullptr, nullptr, nullptr);
+    CHECK(d.odds == 4);
+    CHECK(d.rate == 5);
+    CHECK(d.burst == 5);
+    CHECK(d.max_bytes == 4096);
+    CHECK(d.invalid.empty());
+    CHECK(d.seed == Proto::SplitMix64(1 ^ 0x626c6b636d70ull)); // derived from the sample seed
+    CHECK(ParseBlkcmpConfig(2, nullptr, nullptr, nullptr, nullptr, nullptr).seed != d.seed);
+    const auto over = ParseBlkcmpConfig(1, "99", "2", "10", "3", "1024");
+    CHECK(over.seed == 99);
+    CHECK(over.odds == 2);
+    CHECK(over.rate == 10);
+    CHECK(over.burst == 3);
+    CHECK(over.max_bytes == 1024);
+    const auto bad = ParseBlkcmpConfig(1, "x", "0", "-1", "", "9999999999");
+    CHECK(bad.odds == 4);
+    CHECK(bad.max_bytes == 4096);
+    CHECK(bad.invalid == "SEED,ODDS,BUDGET,BURST,MAXBYTES");
+    // The mark: unmarked is other/unknown, never the front.
+    CHECK(t_role == ThreadRole::Unknown);
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    const auto compare_with = [&](ThreadRole role) {
+        const auto* request = AffirmedCycle(b.f, 0xE600 + static_cast<unsigned>(role) * 7 + b.f.C(b.f.c().blkcmp_compared));
+        REQUIRE(request != nullptr);
+        std::array<u64, kBlkcmpParts> offsets{};
+        std::vector<u8> payload(64, 1), staging(Proto::BlkcmpLayout(*request, offsets), 1);
+        MarkThread(role);
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1);
+        MarkThread(ThreadRole::Unknown);
+    };
+    compare_with(ThreadRole::Unknown);
+    compare_with(ThreadRole::Back);
+    compare_with(ThreadRole::Front);
+    compare_with(ThreadRole::Unknown);
+    CHECK(b.f.C(b.f.c().blkcmp_compared_other) == 2);
+    CHECK(b.f.C(b.f.c().blkcmp_compared_back) == 1);
+    CHECK(b.f.C(b.f.c().blkcmp_compared_front) == 1);
+    // A thread does not see the request of another.
+    const auto* mine = AffirmedCycle(b.f, 0xE700);
+    REQUIRE(mine != nullptr);
+    bool other_sees = true;
+    std::thread t([&] { other_sees = b.f.proto.BlkcmpPending(0xE700 << 12, 64) != nullptr; });
+    t.join();
+    CHECK(!other_sees);
+}

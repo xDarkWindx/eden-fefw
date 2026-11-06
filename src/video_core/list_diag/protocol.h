@@ -27,6 +27,7 @@
 #include "video_core/list_diag/counters.h"
 #include "video_core/list_diag/hooks.h"
 #include "video_core/list_diag/ledger.h"
+#include "video_core/list_diag/thread_mark.h"
 
 namespace VideoCommon::ListDiag {
 
@@ -38,8 +39,14 @@ struct Range {
 
 enum class Sample : u8 { None, Equal, Different, Unverified };
 
-enum class EventKind : u8 { PopHit, PopApplied, PopNever, Blk, P0Violated };
-constexpr unsigned kEventKinds = 5;
+enum class EventKind : u8 { PopHit, PopApplied, PopNever, Blk, P0Violated, Blkcmp };
+constexpr unsigned kEventKinds = 6;
+
+/// blkcmp: the at_risk parts of one request (3.8.1); more than this and the range is discarded, not truncated.
+constexpr unsigned kBlkcmpParts = 16;
+constexpr u64 kBlkcmpAlign = 64;
+
+enum class BlkcmpReason : u8 { NoUpload, NoMemoryMaps, NoSingleBuffer, Stale };
 
 struct Event {
     EventKind kind = EventKind::PopHit;
@@ -103,6 +110,177 @@ public:
     /// False when EDEN_HELD_WRITE_MERGE=0: the final ranges of a lot may overlap, premise pi2 of
     /// 3.7.3 fails, and every range is declared incomplete (blk_incomplete_nomerge).
     bool merge_on = true;
+
+    // ---------------------------------------------------------------------------------------
+    // T3a.2 blkcmp (docs/list-diag-design.md, 3.8): configuration, fixed for the session.
+    bool blkcmp_on = false;        ///< requires blk
+    u64 blkcmp_seed = 0;
+    u64 blkcmp_odds = 4;           ///< a range is drawn with probability 1/odds
+    u64 blkcmp_rate = 5;           ///< sustained comparisons per second
+    u64 blkcmp_burst = 5;          ///< bucket capacity
+    u64 blkcmp_max_bytes = 4096;   ///< cap of at_risk bytes per range
+
+    struct BlkcmpPart {
+        u64 addr = 0;
+        u64 size = 0;
+    };
+    /// What the decision (AccountBlock, an affirmed range with at_risk > 0, drawn) hands to the Inline
+    /// of the same range: the bytes to read from the buffer. Thread-local, like current_batch_.
+    struct BlkcmpRequest {
+        bool valid = false;
+        u64 addr = 0;
+        u64 size = 0;
+        u32 mask = 0;
+        std::array<u64, N> lots{};
+        std::array<BlkcmpPart, kBlkcmpParts> parts{};
+        unsigned count = 0;
+        u64 total = 0; ///< at_risk bytes
+    };
+
+    static constexpr u64 AlignUp(u64 value) {
+        return (value + kBlkcmpAlign - 1) / kBlkcmpAlign * kBlkcmpAlign;
+    }
+    /// Offsets of each part in the staging buffer, each aligned to 64 B; returns the size to request.
+    static u64 BlkcmpLayout(const BlkcmpRequest& request, std::array<u64, kBlkcmpParts>& offsets) {
+        u64 cursor = 0;
+        for (unsigned i = 0; i < request.count; ++i) {
+            offsets[i] = cursor;
+            cursor += AlignUp(request.parts[i].size);
+        }
+        return cursor;
+    }
+
+    /// The request of this thread if it is for [addr, addr + size); a request for another range is stale
+    /// (counted, dropped). Null when there is none.
+    const BlkcmpRequest* BlkcmpPending(u64 addr, u64 size) {
+        BlkcmpRequest& request = blkcmp_request_;
+        if (!request.valid) {
+            return nullptr;
+        }
+        if (request.addr != addr || request.size != size) {
+            Inc(counters.blkcmp_discard_stale);
+            request.valid = false;
+            return nullptr;
+        }
+        return &request;
+    }
+
+    /// The pending request ends without a comparison.
+    void BlkcmpDiscard(BlkcmpReason reason) {
+        BlkcmpRequest& request = blkcmp_request_;
+        if (!request.valid) {
+            return;
+        }
+        switch (reason) {
+        case BlkcmpReason::NoUpload: Inc(counters.blkcmp_discard_no_upload); break;
+        case BlkcmpReason::NoMemoryMaps: Inc(counters.blkcmp_discard_no_memory_maps); break;
+        case BlkcmpReason::NoSingleBuffer: Inc(counters.blkcmp_discard_no_single_buffer); break;
+        case BlkcmpReason::Stale: Inc(counters.blkcmp_discard_stale); break;
+        }
+        request.valid = false;
+    }
+
+    /// Takes a token of the bucket (sustained `blkcmp_rate` per second, bursts up to `blkcmp_burst`).
+    /// None: the request is discarded as budget. The token is taken at the consumption, not at the draw.
+    bool BlkcmpTakeToken() {
+        BlkcmpRequest& request = blkcmp_request_;
+        const u64 now = Hooks::NowUs();
+        constexpr u64 kToken = 1'000'000; // micro-tokens
+        if (!bucket_started_) {
+            bucket_started_ = true;
+            bucket_tokens_ = blkcmp_burst * kToken;
+            bucket_last_us_ = now;
+        } else if (now > bucket_last_us_) {
+            // rate tokens per second = rate micro-tokens per microsecond
+            bucket_tokens_ = std::min<u64>(blkcmp_burst * kToken, bucket_tokens_ + (now - bucket_last_us_) * blkcmp_rate);
+            bucket_last_us_ = now;
+        }
+        if (bucket_tokens_ < kToken) {
+            Inc(counters.blkcmp_discard_budget);
+            request.valid = false;
+            return false;
+        }
+        bucket_tokens_ -= kToken;
+        return true;
+    }
+
+    /// Compares the old bytes of the GPU (`old_bytes`, the parts one after the other at `offsets`) with the payload
+    /// the upload sends (`payload` covers [request.addr, request.addr + request.size)). Ends the request.
+    /// Returns whether any byte differs. `finish_us` is the time of the Finish. The guest is not read.
+    bool BlkcmpCompare(const u8* old_bytes, const std::array<u64, kBlkcmpParts>& offsets,
+                       std::span<const u8> payload, u64 finish_us) {
+        BlkcmpRequest& request = blkcmp_request_;
+        if (!request.valid || payload.size() < request.size) {
+            BlkcmpDiscard(BlkcmpReason::Stale);
+            return false;
+        }
+        u64 compared = 0, different = 0;
+        bool have_first = false;
+        u64 first_addr = 0, first_old = 0, first_new = 0;
+        for (unsigned i = 0; i < request.count; ++i) {
+            const BlkcmpPart& part = request.parts[i];
+            const u8* gpu = old_bytes + offsets[i];
+            const u8* upload = payload.data() + (part.addr - request.addr);
+            compared += part.size;
+            for (u64 b = 0; b < part.size; ++b) {
+                if (gpu[b] != upload[b]) {
+                    ++different;
+                    if (!have_first) {
+                        have_first = true;
+                        first_addr = part.addr + b;
+                        const u64 left = std::min<u64>(8, part.size - b);
+                        for (u64 k = 0; k < left; ++k) {
+                            first_old |= u64{gpu[b + k]} << (8 * k);
+                            first_new |= u64{upload[b + k]} << (8 * k);
+                        }
+                    }
+                }
+            }
+        }
+        Inc(counters.blkcmp_compared);
+        switch (t_role) {
+        case ThreadRole::Back: Inc(counters.blkcmp_compared_back); break;
+        case ThreadRole::Front: Inc(counters.blkcmp_compared_front); break;
+        default: Inc(counters.blkcmp_compared_other); break;
+        }
+        Inc(counters.blkcmp_bytes_compared, compared);
+        Inc(counters.blkcmp_bytes_different, different);
+        Inc(counters.blkcmp_finish_n);
+        Inc(counters.blkcmp_finish_us_sum, finish_us);
+        Max(counters.blkcmp_finish_us_max, finish_us);
+        if (different == 0) {
+            Inc(counters.blkcmp_equal);
+        } else {
+            Inc(counters.blkcmp_different);
+            Event ev;
+            ev.kind = EventKind::Blkcmp;
+            ev.core = request.mask;
+            for (unsigned c = 0; c < N; ++c) {
+                if (((request.mask >> c) & 1) != 0) {
+                    ev.lot = request.lots[c];
+                    break;
+                }
+            }
+            ev.v[0] = request.addr;
+            ev.v[1] = request.size;
+            ev.v[2] = request.count;
+            ev.v[3] = compared;
+            ev.v[4] = different;
+            ev.v[5] = first_addr;
+            ev.v[6] = first_old;
+            ev.v[7] = first_new;
+            ev.v[8] = static_cast<u64>(t_role);
+            ev.v[9] = finish_us;
+            Push(ev);
+        }
+        request.valid = false;
+        return different != 0;
+    }
+
+    /// The end of CachedWriteMemory: a request that is still pending never reached the upload.
+    void BlkcmpExpire() {
+        BlkcmpDiscard(BlkcmpReason::NoUpload);
+    }
 
     static constexpr u64 SplitMix64(u64 x) {
         x += 0x9e3779b97f4a7c15ull;
@@ -636,10 +814,10 @@ public:
         // The sums of the cores are read while the game runs: not a consistent cut (3.7.5).
         const char* prefix = P0Violated() ? "[ListDiag][P0 VIOLATED: results after this are not reliable] (aprox.) "
                                           : "[ListDiag] (aprox.) ";
-        const Group groups[] = {Group::Notices, Group::Sample, Group::Pop, Group::Apply,
-                                Group::Blk,     Group::Calls,  Group::Log};
-        const char* names[] = {"notices", "sample", "pop", "apply", "blk", "calls", "log"};
-        for (size_t g = 0; g < 7; ++g) {
+        const Group groups[] = {Group::Notices, Group::Sample, Group::Pop,   Group::Apply,
+                                Group::Blk,     Group::Blkcmp, Group::Calls, Group::Log};
+        const char* names[] = {"notices", "sample", "pop", "apply", "blk", "blkcmp", "calls", "log"};
+        for (size_t g = 0; g < 8; ++g) {
             std::string line = std::string{prefix} + names[g] + ":";
             bool any = false;
             for (size_t i = 0; i < fields.size(); ++i) {
@@ -653,7 +831,7 @@ public:
                 line += buffer;
                 any = true;
             }
-            if (g == 5) {
+            if (groups[g] == Group::Calls) {
                 for (unsigned core = 0; core < N; ++core) {
                     const u64 calls = Get(counters.gather_calls[core]);
                     if (calls != 0) {
@@ -724,6 +902,30 @@ public:
                           static_cast<unsigned long long>(Get(counters.blk_affirmed)));
             lines.push_back(b);
         }
+        if (blkcmp_on) {
+            char b[900];
+            const auto n = [&](const Counter& c) { return static_cast<unsigned long long>(Get(c)); };
+            std::snprintf(b, sizeof(b),
+                          "[ListDiag][%s]%s blkcmp: bytes antigos da GPU diferentes do payload que os substituiu: %llu de %llu "
+                          "bytes comparados (%llu de %llu faixas); sorteadas %llu de %llu elegiveis (as afirmadas com at_risk>0, "
+                          "1/%llu, semente=0x%llx; NAO sao amostra aleatoria de todas as aplicacoes); descartadas: faixa=%llu "
+                          "tamanho=%llu sem_upload=%llu sem_mapas=%llu sem_buffer_unico=%llu orcamento=%llu obsoleto=%llu; "
+                          "balde %llu/s rajada %llu, teto %llu B; por thread: back=%llu front=%llu other/unknown=%llu; "
+                          "Finish n=%llu soma=%lluus max=%lluus (perturbacao: um Finish sob o buffer_cache.mutex por comparacao). "
+                          "Isso nao prova corrupcao visivel nem exclui uma escrita legitima concorrente.",
+                          tag, approx.c_str(), n(counters.blkcmp_bytes_different), n(counters.blkcmp_bytes_compared),
+                          n(counters.blkcmp_different), n(counters.blkcmp_compared), n(counters.blkcmp_drawn),
+                          n(counters.blkcmp_eligible), static_cast<unsigned long long>(blkcmp_odds),
+                          static_cast<unsigned long long>(blkcmp_seed), n(counters.blkcmp_discard_ranges),
+                          n(counters.blkcmp_discard_size), n(counters.blkcmp_discard_no_upload),
+                          n(counters.blkcmp_discard_no_memory_maps), n(counters.blkcmp_discard_no_single_buffer),
+                          n(counters.blkcmp_discard_budget), n(counters.blkcmp_discard_stale),
+                          static_cast<unsigned long long>(blkcmp_rate), static_cast<unsigned long long>(blkcmp_burst),
+                          static_cast<unsigned long long>(blkcmp_max_bytes), n(counters.blkcmp_compared_back),
+                          n(counters.blkcmp_compared_front), n(counters.blkcmp_compared_other), n(counters.blkcmp_finish_n),
+                          n(counters.blkcmp_finish_us_sum), n(counters.blkcmp_finish_us_max));
+            lines.push_back(b);
+        }
         if (is_final) {
             // Conservation: valid only because the execution is stopped. Both sides and the residual.
             const auto identity = [&](const char* name, u64 left, u64 right) {
@@ -741,6 +943,18 @@ public:
                          Get(counters.apply_ranges_selected));
                 identity("blk_applies_over_gpu = ambiguous + incomplete + affirmed", Get(counters.blk_applies_over_gpu),
                          Get(counters.blk_ambiguous) + Get(counters.blk_incomplete) + Get(counters.blk_affirmed));
+            }
+            if (blkcmp_on) {
+                identity("blkcmp_eligible >= blkcmp_drawn (0 = ok)",
+                         Get(counters.blkcmp_eligible) >= Get(counters.blkcmp_drawn) ? 0 : 1, 0);
+                identity("blkcmp_drawn = compared + descartes", Get(counters.blkcmp_drawn),
+                         Get(counters.blkcmp_compared) + Get(counters.blkcmp_discard_ranges) +
+                             Get(counters.blkcmp_discard_size) + Get(counters.blkcmp_discard_no_upload) +
+                             Get(counters.blkcmp_discard_no_memory_maps) +
+                             Get(counters.blkcmp_discard_no_single_buffer) + Get(counters.blkcmp_discard_budget) +
+                             Get(counters.blkcmp_discard_stale));
+                identity("blkcmp_compared = equal + different", Get(counters.blkcmp_compared),
+                         Get(counters.blkcmp_equal) + Get(counters.blkcmp_different));
             }
             if (pop_on) {
                 char b[200];
@@ -833,6 +1047,18 @@ public:
                           hex(ev.v[2]), at_risk, hex(ev.v[4]), hex(ev.v[5]), hex(ev.v[6]));
             break;
         }
+        case EventKind::Blkcmp: {
+            const char* thread = ev.v[8] == static_cast<u64>(ThreadRole::Back)    ? "back"
+                                 : ev.v[8] == static_cast<u64>(ThreadRole::Front) ? "front"
+                                                                                  : "other/unknown";
+            std::snprintf(b, sizeof(b),
+                          "[ListDiag][blkcmp] different: range=[0x%llx,+%llu) cores=0x%x lot=%llu parts=%llu bytes=%llu "
+                          "diff_bytes=%llu first=0x%llx gpu_old=0x%016llx payload=0x%016llx (8 bytes, little endian) "
+                          "thread=%s finish=%lluus",
+                          hex(ev.v[0]), hex(ev.v[1]), ev.core, hex(ev.lot), hex(ev.v[2]), hex(ev.v[3]), hex(ev.v[4]),
+                          hex(ev.v[5]), hex(ev.v[6]), hex(ev.v[7]), thread, hex(ev.v[9]));
+            break;
+        }
         case EventKind::P0Violated:
             std::snprintf(b, sizeof(b),
                           "[ListDiag] *** precondicao P0 violada: os resultados do diagnostico a partir daqui nao sao "
@@ -844,6 +1070,58 @@ public:
     }
 
 private:
+    struct Cover {
+        bool open = false;
+        bool floor = false;
+        bool nomerge = false;
+        u32 mask = 0;                  ///< Cores of the range (test hook only)
+        const u64* lots = nullptr;     ///< Lots taken for them (test hook only)
+        [[nodiscard]] bool Incomplete() const {
+            return open || floor || nomerge;
+        }
+    };
+
+    /// An affirmed range with at_risk > 0 (3.8.1): eligible; drawn with probability 1/odds from the own seed and the
+    /// number of order of the eligible (the applications are serialised, so the sequence is one); then the cap and
+    /// the parts. What survives becomes the request of this thread.
+    void BlkcmpOffer(u64 addr, u64 size, const Cover& cover, const std::array<BlkcmpPart, kBlkcmpParts>& parts,
+                     unsigned count, bool overflow, u64 at_risk) {
+        Inc(counters.blkcmp_eligible);
+        const u64 k = blkcmp_k_++;
+        if (blkcmp_odds > 1 && SplitMix64(blkcmp_seed ^ k) % blkcmp_odds != 0) {
+            return;
+        }
+        Inc(counters.blkcmp_drawn);
+        if (overflow) {
+            Inc(counters.blkcmp_discard_ranges);
+            return;
+        }
+        if (at_risk > blkcmp_max_bytes) {
+            Inc(counters.blkcmp_discard_size);
+            return;
+        }
+        BlkcmpRequest& request = blkcmp_request_;
+        if (request.valid) {
+            Inc(counters.blkcmp_discard_stale); // an older request that nobody ended
+        }
+        request.valid = true;
+        request.addr = addr;
+        request.size = size;
+        request.mask = cover.mask;
+        for (unsigned c = 0; c < N; ++c) {
+            request.lots[c] = cover.lots != nullptr ? cover.lots[c] : 0;
+        }
+        request.parts = parts;
+        request.count = count;
+        request.total = at_risk;
+    }
+
+    u64 blkcmp_k_ = 0;
+    bool bucket_started_ = false;
+    u64 bucket_tokens_ = 0;
+    u64 bucket_last_us_ = 0;
+    static inline thread_local BlkcmpRequest blkcmp_request_{};
+
     /// Test-only mutants (the tests prove they can see the failure): coverage never declared, and the
     /// `open` flag never set. Constant false in the emulator.
     static bool NoCoverage() {
@@ -911,17 +1189,6 @@ private:
         ledger.Free(v.core, slot, v.gen);
     }
 
-    struct Cover {
-        bool open = false;
-        bool floor = false;
-        bool nomerge = false;
-        u32 mask = 0;                  ///< Cores of the range (test hook only)
-        const u64* lots = nullptr;     ///< Lots taken for them (test hook only)
-        [[nodiscard]] bool Incomplete() const {
-            return open || floor || nomerge;
-        }
-    };
-
     template <class RangeSet>
     void AccountBlock(u64 addr, u64 size, std::vector<std::pair<u64, u64>>& exact, bool ambiguous,
                       const Cover& cover, const RangeSet& gpu_modified, const RangeSet& cpu_read, bool track_cpu_reads) {
@@ -983,6 +1250,9 @@ private:
         }
         // at_risk = the GPU bytes of the range that the CPU did not write.
         u64 at_risk = 0, cpu_read_bytes = 0;
+        std::array<BlkcmpPart, kBlkcmpParts> risk_parts{};
+        unsigned risk_count = 0;
+        bool risk_overflow = false;
         for (const auto& [gs, ge] : gpu) {
             u64 cursor = gs;
             const auto account = [&](u64 s, u64 e) {
@@ -990,6 +1260,13 @@ private:
                     return;
                 }
                 at_risk += e - s;
+                if (blkcmp_on) {
+                    if (risk_count < kBlkcmpParts) {
+                        risk_parts[risk_count++] = BlkcmpPart{s, e - s};
+                    } else {
+                        risk_overflow = true;
+                    }
+                }
                 if (track_cpu_reads) {
                     cpu_read.ForEachInRange(s, e - s, [&](u64 rs, u64 re) {
                         rs = std::max(rs, s);
@@ -1029,6 +1306,9 @@ private:
         Inc(counters.blk_affirmed);
         if constexpr (Hooks::kTest) {
             Hooks::OnAffirmed(addr, size, cover.mask, cover.lots, merged_exact);
+        }
+        if (blkcmp_on && at_risk > 0) {
+            BlkcmpOffer(addr, size, cover, risk_parts, risk_count, risk_overflow, at_risk);
         }
         Inc(counters.blk_gpu_bytes_at_risk, at_risk);
         ev.v[3] = at_risk;

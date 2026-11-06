@@ -113,6 +113,27 @@ struct Counters {
     Counter blk_incomplete_nomerge{};  ///< ... the join of ranges is off: ranges may overlap
     Counter blk_incomplete_gpu_bytes{}; ///< what T3a would have claimed as at_risk in those ranges
     Counter blk_affirmed{};            ///< complete coverage: at_risk is claimed
+    // T3a.2 blkcmp (docs/list-diag-design.md, 3.8): the old bytes of the GPU against the upload payload.
+    Counter blkcmp_eligible{};         ///< affirmed ranges with at_risk > 0
+    Counter blkcmp_drawn{};            ///< ... drawn (1/M)
+    Counter blkcmp_discard_ranges{};   ///< ... more at_risk parts than the request holds
+    Counter blkcmp_discard_size{};     ///< ... at_risk bytes above the cap
+    Counter blkcmp_discard_no_upload{};        ///< CachedWriteMemory returned before the upload
+    Counter blkcmp_discard_no_memory_maps{};   ///< the backend has no memory maps (USE_MEMORY_MAPS false)
+    Counter blkcmp_discard_no_single_buffer{}; ///< no one buffer holds the range
+    Counter blkcmp_discard_budget{};   ///< no token in the bucket
+    Counter blkcmp_discard_stale{};    ///< the request was not of this call (should not happen)
+    Counter blkcmp_compared{};
+    Counter blkcmp_compared_back{};    ///< ... on the thread marked back
+    Counter blkcmp_compared_front{};   ///< ... on the thread marked front
+    Counter blkcmp_compared_other{};   ///< ... on a thread with no mark (other/unknown)
+    Counter blkcmp_equal{};
+    Counter blkcmp_different{};
+    Counter blkcmp_bytes_compared{};
+    Counter blkcmp_bytes_different{};
+    Counter blkcmp_finish_n{};
+    Counter blkcmp_finish_us_sum{};
+    Counter blkcmp_finish_us_max{};
     // The calls that apply notices, counted for real (no assumption of one per list or fence).
     Counter invalidate_calls{};
     Counter invalidate_empty{};
@@ -126,7 +147,7 @@ struct Counters {
     Counter log_dropped{};
 };
 
-enum class Group { Notices, Sample, Pop, Apply, Blk, Calls, Log };
+enum class Group { Notices, Sample, Pop, Apply, Blk, Blkcmp, Calls, Log };
 
 struct FieldRef {
     const char* name;
@@ -182,6 +203,26 @@ inline std::vector<FieldRef> Fields(Counters& c) {
     LD_FIELD(Blk, blk_incomplete_nomerge);
     LD_FIELD(Blk, blk_incomplete_gpu_bytes);
     LD_FIELD(Blk, blk_affirmed);
+    LD_FIELD(Blkcmp, blkcmp_eligible);
+    LD_FIELD(Blkcmp, blkcmp_drawn);
+    LD_FIELD(Blkcmp, blkcmp_discard_ranges);
+    LD_FIELD(Blkcmp, blkcmp_discard_size);
+    LD_FIELD(Blkcmp, blkcmp_discard_no_upload);
+    LD_FIELD(Blkcmp, blkcmp_discard_no_memory_maps);
+    LD_FIELD(Blkcmp, blkcmp_discard_no_single_buffer);
+    LD_FIELD(Blkcmp, blkcmp_discard_budget);
+    LD_FIELD(Blkcmp, blkcmp_discard_stale);
+    LD_FIELD(Blkcmp, blkcmp_compared);
+    LD_FIELD(Blkcmp, blkcmp_compared_back);
+    LD_FIELD(Blkcmp, blkcmp_compared_front);
+    LD_FIELD(Blkcmp, blkcmp_compared_other);
+    LD_FIELD(Blkcmp, blkcmp_equal);
+    LD_FIELD(Blkcmp, blkcmp_different);
+    LD_FIELD(Blkcmp, blkcmp_bytes_compared);
+    LD_FIELD(Blkcmp, blkcmp_bytes_different);
+    LD_FIELD(Blkcmp, blkcmp_finish_n);
+    LD_FIELD(Blkcmp, blkcmp_finish_us_sum);
+    LD_FIELD(Blkcmp, blkcmp_finish_us_max);
     LD_FIELD(Calls, invalidate_calls);
     LD_FIELD(Calls, invalidate_empty);
     LD_FIELD(Calls, gather_overlapped);

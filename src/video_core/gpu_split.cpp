@@ -17,6 +17,7 @@
 #include "video_core/accuracy_parts.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
+#include "video_core/list_diag/thread_mark.h"
 
 namespace VideoCommon {
 
@@ -365,6 +366,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
     system->RegisterHostThread();
+    // EDEN_LIST_DIAG: this thread uses the rasterizer as the back (3.8.6).
+    VideoCommon::ListDiag::MarkThread(VideoCommon::ListDiag::ThreadRole::Back);
     namespace BackStats = VideoCommon::BackStats;
     u64 read_position = 0;
     u64 idle_start = BackStats::Enabled() ? BackStats::Stamp() : 0;

@@ -797,9 +797,9 @@ Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto dei
   (e) `EDEN_HELD_WRITE_MERGE=0` torna toda cobertura incompleta, por premissa.
 
 
-### 3.8 T3a.2: `blkcmp`, o que a GPU tinha contra o que o upload manda (desenho, sem código)
+### 3.8 T3a.2: `blkcmp`, o que a GPU tinha contra o que o upload manda (implementado)
 
-Escopo: o bloco "T3a.2" da seção 11 (revisão 5). **Nada foi escrito.** Não muda: o protocolo dos slots e dos lotes, a P0, a
+Escopo: o bloco "T3a.2" da seção 11 (revisões 5 e 6). **Implementado em `T32HASH`, versão síncrona, aguardando o build do usuário; a revisão 6 manda sobre este texto onde divergiam, e a seção abaixo descreve o que foi implementado.** Não muda: o protocolo dos slots e dos lotes, a P0, a
 cobertura da 3.7, nem o que o emulador faz com o guest, `gpu_modified_ranges`, `ClearDownload` e o rastreio de downloads.
 Muda, **só para as faixas sorteadas**, o que acontece entre a sincronização do buffer e o upload: uma cópia diagnóstica
 do que a GPU tem, com um `Finish`. Graus de certeza como no resto; números de linha são os de `47e4a8a`.
@@ -818,174 +818,130 @@ deslocamento de 64 bits com tamanho < 64 B (`:92`, que o UBSan acusa), preexiste
    (este upload perde a reordenação, e o reset do rastreador atrasa) e descartes desnecessários. Proposta: tirá-los da
    versão 1 e deixá-los escritos como requisito da assíncrona.
 
-#### 3.8.1 Do `NoteApply` até `InlineMemoryImplementation`
+#### 3.8.1 Do `NoteApply` até `InlineMemoryImplementation` (implementado)
 
 Todos na **mesma thread** e dentro do mesmo `buffer_cache.mutex`: `RasterizerVulkan::OnCachedWrites` toma o mutex
 (`vk_rasterizer.cpp:974`) e chama `CachedWriteMemory(addr, size)` por faixa (`:976-980`); o primeiro comando de
-`CachedWriteMemory` é o `NoteApplyHook` (`buffer_cache.h:145`), e o `InlineMemoryImplementation` vem dele (`:162`).
+`CachedWriteMemory` é o `NoteApplyHook`, e o `InlineMemoryImplementation` vem dele.
 
-1. **Decisão (em `AccountBlock`, ramo "afirmada", `protocol.h`).** Hoje o ramo `blk_affirmed` calcula o `at_risk` somando as
-   partes da GPU fora de `merged_exact`. Passa a guardar também **a lista** dessas partes, `(início, comprimento)`, até
-   `kBlkcmpRanges = 16` (mais que isso: `blkcmp_discard_ranges`, a faixa é descartada, não truncada em silêncio). Se
-   `blkcmp_on` e `at_risk > 0`: conta `blkcmp_eligible` e sorteia (3.8.5). Sorteada: grava um `BlkcmpRequest` num
-   `thread_local` (como o `current_batch_`): `{addr, size, mask, lots, ranges[], total_bytes, thread}`. Não sorteada ou
-   fora de `blkcmp_on`: nada.
-2. **Escopo (em `CachedWriteMemory`, logo depois do `NoteApplyHook`, `:145`).** Um objeto `ListDiag::BlkcmpScope` cujo
-   destrutor, se o `BlkcmpRequest` ainda existe, conta `blkcmp_discard_no_upload` e o apaga. Isso cobre **todos** os
-   retornos antes do upload: `!is_dirty` (`:148-150`), `!IsRegionGpuModified` → `WriteMemory` (`:154-156`) e qualquer outro.
-   (O revisor pediu o contador nos dois retornos; o destrutor é o mesmo efeito sem tocar em cada retorno e sem esquecer um
-   futuro.) Desligado: o construtor lê a flag e nada mais.
-3. **Consumo (em `InlineMemoryImplementation`, depois de `SynchronizeBuffer`, `:2121`, antes do `if constexpr`, `:2123`).**
-   `ListDiag::BlkcmpTake(dest_address, copy_size)` devolve o pedido **só se** `(addr, size)` for o da faixa sorteada; o outro
-   chamador do método, `:2108` (escrita inline do motor), não tem pedido e cai em "nenhum". Pedido com outro `(addr,size)`
-   conta `blkcmp_discard_stale` (não deveria ocorrer) e é apagado.
+1. **Decisão (`AccountBlock`, ramo "afirmada", `protocol.h`; `BlkcmpOffer`).** O laço do `at_risk` guarda também a lista das
+   partes `(início, comprimento)`, até `kBlkcmpParts = 16`. Se `blkcmp_on` e `at_risk > 0`: conta `blkcmp_eligible` e sorteia
+   (3.8.5). Sorteada: mais de 16 partes → `blkcmp_discard_ranges` (descartada, não truncada); `at_risk` acima do teto →
+   `blkcmp_discard_size`; senão grava o `BlkcmpRequest` num `thread_local` `{addr, size, mask, lots, parts[], count, total}`.
+2. **Escopo (`CachedWriteMemory`, `BlkcmpScope` logo depois do `NoteApplyHook`).** O destrutor, se o pedido ainda existe,
+   conta `blkcmp_discard_no_upload`. Cobre **todos** os retornos antes do upload: `!is_dirty`, `!IsRegionGpuModified` →
+   `WriteMemory` e qualquer outro. Desligado: a flag e nada mais.
+3. **Captura (`InlineMemoryImplementation`, a PRIMEIRA linha, antes de `ClearDownload`).** `BlkcmpPending(dest_address,
+   copy_size)` devolve o pedido só se `(addr, size)` for o da faixa sorteada (outro `(addr, size)`: `blkcmp_discard_stale`);
+   o outro chamador do método (a escrita inline do motor) não tem pedido. Se há pedido, `BlkcmpCapture` roda **antes** de
+   qualquer outra coisa do método.
 
-O `BlkcmpTake` roda **depois** de `ClearDownload` e `gpu_modified_ranges.Subtract` (`:2116-2117`): não importa, porque o
-mapeamento dos bytes `at_risk` foi calculado no `NoteApply`, antes de qualquer subtração.
+**Por que a captura é a primeira linha (revisão 6).** O `InlineMemoryImplementation` faz `ClearDownload`, subtrai a faixa
+de `gpu_modified_ranges`, `FindBuffer` e `SynchronizeBuffer`, e este sobe as faixas da CPU fora de `gpu_modified_ranges`,
+então pode sobrescrever os bytes `at_risk` antes de uma cópia diagnóstica tardia. A frase "a posição não importa" da versão
+anterior desta seção estava **errada** (guardar endereços não guarda valores). O que o upload desta aplicação sobrescreve
+(`SynchronizeBuffer`, o próprio upload) é gravado **depois** do `Finish` da captura; o que veio antes já está na fila e é de um
+produtor anterior.
 
-#### 3.8.2 Os passos do lado do Vulkan (síncrono)
+#### 3.8.2 Os passos do lado do Vulkan (síncrono; `BufferCache::BlkcmpCapture`, `buffer_cache.h`)
 
-Dentro de `if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS)` (`:2123`; Vulkan `vk_buffer_cache.h:312` = `true`, OpenGL
-`gl_buffer_cache.h:264` = `false`). No `else` (`:2134`) o pedido conta `blkcmp_discard_no_memory_maps`: **OpenGL fica fora e
-é contado**. Com o pedido em mãos, **antes** de `UploadStagingBuffer` (`:2124`):
-
-| # | Passo | Chamada (arquivo:linha) |
+| # | Passo | Chamada |
 | --- | --- | --- |
-| 1 | Orçamento e teto (3.8.5). Sem ficha: `blkcmp_discard_budget`, segue o upload de hoje | só diagnóstico |
-| 2 | **Marca a região que o upload vai testar**: `buffer.MarkUsage(buffer.Offset(dest_address), copy_size)` | `vk_buffer_cache.cpp:125-128`, `usage_tracker.h:40` |
-| 3 | **Confere** `buffer.IsRegionUsed(buffer.Offset(dest_address), copy_size)`. Falso: `blkcmp_discard_reorder_unprotected`, segue o upload de hoje | `vk_buffer_cache.h:58` |
-| 4 | Staging **próprio**: `runtime.DownloadStagingBuffer(total)` (não diferido), `total` = soma das partes `at_risk` com cada uma alinhada a 64 B | `vk_buffer_cache.cpp:392`, `vk_staging_buffer_pool.cpp:103` |
-| 5 | Cópias `{src_offset = buffer.Offset(início), dst_offset = staging.offset + deslocamento, size}` por parte `at_risk` e `runtime.CopyBuffer(staging.buffer, buffer, copies, true)` (com barreira) | `vk_buffer_cache.cpp:460-500`, assinatura `vk_buffer_cache.h:142` |
-| 6 | `runtime.Finish()` (submete e espera) | `vk_buffer_cache.cpp:444`, `vk_scheduler.cpp:67-75` |
-| 7 | Lê `staging.mapped_span` (como `:2178-2185`) para uma cópia local (`std::array`/`small_vector`, ≤ teto) e **compara** (3.8.3) | `buffer_cache.h:2176-2190` como modelo |
-| 8 | Segue o upload **de hoje**, sem mudança: `UploadStagingBuffer`, `memcpy` do `inlined_buffer`, `CanReorderUpload`, `CopyBuffer` | `:2124-2133` |
+| 1 | `USE_MEMORY_MAPS` falso (a constante do backend): `blkcmp_discard_no_memory_maps` e segue o código de hoje | `if constexpr` |
+| 2 | **Buffer por consulta pura:** `page_table[dest_address >> CACHING_PAGEBITS]` e `IsInBounds(dest_address, copy_size)`. **Nunca `FindBuffer`**, que pode chamar `SynchronizeBufferWrites` e criar buffer (`buffer_cache.h:1745-1775`). Sem um buffer único que contenha a faixa: `blkcmp_discard_no_single_buffer` | `page_table`, `IsInBounds` |
+| 3 | Ficha do balde (3.8.5). Sem ficha: `blkcmp_discard_budget` | `BlkcmpTakeToken` |
+| 4 | Staging **próprio** de download, `DownloadStagingBuffer(total)`, `total` = a soma das partes `at_risk`, cada uma alinhada a 64 B (`BlkcmpLayout`) | `vk_buffer_cache.cpp:392` |
+| 5 | Cópias `{src_offset = buffer.Offset(parte), dst_offset = staging.offset + desloc, size}` e `runtime.CopyBuffer(staging.buffer, buffer, copies, true)` (com barreira) | `vk_buffer_cache.h:142` |
+| 6 | `runtime.Finish()`, cronometrado (`steady_clock`) | `vk_scheduler.cpp:67-75` |
+| 7 | `BlkcmpCompare(mapped_span.data(), desloc, inlined_buffer, finish_us)` | 3.8.3 |
+| 8 | O código de hoje de `InlineMemoryImplementation`, **sem nenhuma mudança** | `ClearDownload` em diante |
 
-**Por que o passo 2 impede a reordenação.** `CanReorderUpload` (`vk_buffer_cache.cpp:448-458`) devolve `false` se
-`disable_buffer_reorder`; senão `all_of(copies, !buffer.IsRegionUsed(dst_offset, size))` (`:455`). O upload testa
-`(buffer.Offset(dest_address), copy_size)` (`:2127-2128`). O `MarkUsage` do passo 2 usa **exatamente** esse par. O
-`UsageTracker` calcula os bits de `Track` e de `IsUsed` com as mesmas contas (`TrackPage` e `IsPageUsed`,
-`usage_tracker.h:90-107`), então o que um liga o outro enxerga, e `IsRegionUsed` volta `true`. Só voltaria o contrário em
-dois casos, e o passo 3 os pega em vez de supor: (a) `page_end >= pages.size()` (`Track` e `IsUsed` saem sem marcar nem
-testar, `:51-53` e `:71-73`: o buffer é maior que o rastreador); (b) `copy_size < 64`: `num_bits = 0` e
-`~0 >> 64` é deslocamento indefinido (`:93-94`, `:100-101`), preexistente. **Hipótese lida, não executada:** no x86-64 isso
-vira "página inteira", mas não dependo disso.
-A consequência de `CanReorderUpload == false` é o upload ir pelo `Record` do cmdbuf principal, **depois** da cópia
-diagnóstica (`:487-499`), em vez de pelo `upload_cmdbuf`, que executa antes (`:480-486`). Sem o passo 2, a cópia leria os bytes
-**novos**.
+**Fora desta versão: `MarkUsage` e `reorder_unprotected`. A versão assíncrona PRECISA deles.** Na síncrona, a ordem cópia →
+upload é garantida pelo `Finish`, que termina antes de o upload ser gravado; um upload reordenado (`CanReorderUpload`,
+`vk_buffer_cache.cpp:448-458`) vai para o contexto seguinte, depois de a cópia ter terminado. Sem `Finish` (cópia diferida por
+fence), a cópia diagnóstica ficaria no cmdbuf principal enquanto um upload reordenado executaria **antes** dela: a assíncrona
+tem de marcar a região (`MarkUsage` do par exato `(buffer.Offset(dest_address), copy_size)` que o upload testa), conferir
+`IsRegionUsed` (o `UsageTracker` não marca se o buffer passa do rastreador, e tem deslocamento indefinido para tamanho < 64 B:
+`usage_tracker.h`) e descartar como `reorder_unprotected` se a conferência falhar. Isso **não** está implementado.
 
-**O "em uso" pode ser limpo entre a cópia e o upload?** O único lugar que zera é `Buffer::ResetUsageTracking`, chamado de
-`BufferCacheRuntime::TickFrame` (`vk_buffer_cache.cpp:424-428`) quando `scheduler.IsFree(LastUsageTick())`, e esse vem de
-`BufferCache::TickFrame` (`buffer_cache.h:85-90`) dentro de `RasterizerVulkan::TickFrame` **sob o `buffer_cache.mutex`**
-(`vk_rasterizer.cpp:1194-1197`). Os passos 2 a 8 rodam sob o mesmo mutex (3.8.1), então o `TickFrame` não se intercala.
-Depois do `Finish` o tick do `MarkUsage` já é livre (`IsFree`, `vk_master_semaphore.h:42`), e portanto o **próximo** `TickFrame`
-zera a marca: só depois do upload. Nenhum outro chamador de `ResetUsageTracking` (`grep` em `src/video_core`).
+**Efeito sobre o resto:** a única mudança de estado do cache é a cópia (barreira, `Finish`, staging do pool). O guest
+(`WriteBlockUnsafe` nunca é chamado), `gpu_modified_ranges`, `ClearDownload` e o rastreio de downloads e de leituras da CPU não
+mudam, e `DownloadBufferMemory` (que escreve no guest e mexe no rastreio: `:2145-2191`) **não** é usado.
 
-**Efeito colateral declarado:** o `MarkUsage` do passo 2 é a única mudança de estado do cache além da cópia: bloqueia a
-reordenação **deste** upload e adia o reset do rastreador daquele buffer até o `TickFrame` seguinte. É perturbação, não mudança de
-conteúdo.
+#### 3.8.3 A comparação (`Protocol::BlkcmpCompare`, `protocol.h`)
 
-#### 3.8.3 A comparação
+A referência é o **`inlined_buffer`** que o chamador já preencheu (`tmp_buffer`, `buffer_cache.h:159-162`): o diagnóstico
+**não relê o guest**. Para cada parte `at_risk`: `antigo = staging[desloc]`, `novo = inlined_buffer[parte.addr - request.addr]`.
+Conta bytes comparados (só os `at_risk`; o preenchimento do alinhamento não entra) e diferentes, a primeira diferença
+(endereço e 8 bytes de cada lado, little endian), a thread, o tempo do `Finish`. A faixa conta `blkcmp_equal` ou
+`blkcmp_different`.
 
-A referência é o **`inlined_buffer` que o upload vai enviar**, o `tmp_buffer` lido do guest em `:159-162`; o diagnóstico
-**não relê o guest** depois (o revisor, item 3). Para cada parte `at_risk` `(início, comprimento)` de `BlkcmpRequest`:
-`antigo = staging[desloc ...]`, `novo = inlined_buffer[início - dest_address ...]` (o deslocamento dentro da faixa, que
-o mapeamento garante `< copy_size`). Conta bytes comparados e bytes diferentes, e a primeira diferença de cada parte
-(deslocamento e 8 bytes de cada lado). A faixa conta `blkcmp_equal` ou `blkcmp_different`. Nenhuma outra leitura do guest.
-
-**O que nunca muda:** o guest (`WriteBlockUnsafe` nunca é chamado), `gpu_modified_ranges`, `ClearDownload`, o rastreio de
-downloads e de leituras da CPU, `DownloadBufferMemory` (que faz tudo isso: `:2145-2191`, e por isso **não** é usado). O staging
-é próprio e volta ao pool pela rotina de sempre. O caminho sem `USE_MEMORY_MAPS_FOR_UPLOADS` fica fora e é contado.
-
-**O que o resultado diz:** "bytes antigos da GPU diferentes do payload que os substituiu". Não diz corrupção visível (os bytes da
-GPU podem ser lixo velho, ou a diferença pode ser uma escrita legítima concorrente do jogo entre o aviso e o upload), e não
-vale para as faixas não sorteadas, nem para as incompletas ou ambíguas (só as afirmadas entram).
+**O que o resultado diz:** "bytes antigos da GPU diferentes do payload que os substituiu". Não prova corrupção visível (os
+bytes da GPU podem ser lixo velho, ou a diferença pode ser uma escrita legítima concorrente do jogo entre o aviso e o upload),
+e não vale para as faixas não sorteadas, incompletas ou ambíguas. As afirmadas **não são uma amostra aleatória** de todas as
+aplicações (8.5). O resumo e o log dizem isso.
 
 #### 3.8.4 O que fica fora
 
-Versão assíncrona (por fence), T3a.3 (juntar registros por bloco), taxas separadas por parte, qualquer ligação por ID de jogo,
-OpenGL (`USE_MEMORY_MAPS_FOR_UPLOADS == false`), o ramo Android do upload (`buffer_cache.h:2008-2028`).
+Versão assíncrona (por fence) e o que ela exige (3.8.2), T3a.3 (juntar registros por bloco), taxas separadas por parte, ligar
+por ID de jogo, o ramo Android do upload (`buffer_cache.h:2008-2028`). Backend sem `USE_MEMORY_MAPS`: descartado e contado.
 
-#### 3.8.5 Sorteio, orçamento, teto e perturbação
+#### 3.8.5 Sorteio, balde, teto e perturbação (implementado)
 
-- **Chave:** `EDEN_LIST_DIAG=...,blkcmp` (exige `blk`; sem `blk`, a linha "ligado" diz que `blkcmp` foi ignorado).
-- **Sorteio, com semente própria.** `EDEN_LIST_DIAG_BLKCMP_SEED`; **padrão derivado**:
-  `SplitMix64(sample_seed ^ 0x626c6b636d70)`. Decisão: uma única semente de sessão (a da amostra) reproduz tudo, e a constante
-  tira a correlação com o predicado das páginas (que usa `seed ^ (endereço >> 12)`); quem quiser sorteios diferentes sobre as
-  mesmas páginas muda só esta. Probabilidade `1/M`, `EDEN_LIST_DIAG_BLKCMP_ODDS` (`M`, padrão **4**): sorteada se
-  `SplitMix64(blkcmp_seed ^ k) % M == 0`, com `k` o número de ordem da faixa elegível. As aplicações de um gerenciador são
-  serializadas (P0 e `buffer_cache.mutex`), então `k` é uma sequência única: a mesma semente e a mesma ordem dão o mesmo
-  sorteio. **Não é "1 de cada M"**, e as sorteadas **não são amostra aleatória de todas as aplicações**: as elegíveis já são
-  as afirmadas (8.5, revisão 5).
-- **Orçamento:** `EDEN_LIST_DIAG_BLKCMP_BUDGET` comparações por segundo (padrão **5**), um balde com recarga contínua pelo
-  relógio de microssegundos do diagnóstico, capacidade de 1 s. A ficha é tomada no passo 1, **no consumo** (não no sorteio):
-  descartar por orçamento não gasta ficha.
-- **Teto:** `EDEN_LIST_DIAG_BLKCMP_MAXBYTES` (padrão **4096**) para o total `at_risk` da faixa; acima, `blkcmp_discard_size`
-  (decidido no sorteio, antes de pedir ficha).
-- **Perturbação esperada (hipótese, a medir):** por comparação, um `Finish` sob o `buffer_cache.mutex`, mais a cópia, mais a
-  perda da reordenação **daquele** upload. O `Finish` espera todo o trabalho já submetido, então o custo cresce com a fila da
-  GPU. Com o padrão (≤ 5/s) o teto é 5 esperas por segundo; a estimativa só vale depois de medir o `blkcmp_finish_us_*`. O
-  relatório declara: `blkcmp_finish_us_sum`, `_max`, número de `Finish`. A rodada de `blkcmp` **não** serve para medir
-  draws/s: serve para achar ocorrência.
+- **Chave:** `EDEN_LIST_DIAG=...,blkcmp`. Exige `blk` (sem ele a linha "ligado" diz `blkcmp IGNORADO: exige blk`). **Não entra
+  em `1`**: perturba.
+- **Sorteio com semente própria.** `EDEN_LIST_DIAG_BLKCMP_SEED`; padrão `SplitMix64(sample_seed ^ 0x626c6b636d70)`: uma
+  semente de sessão reproduz tudo e a constante tira a correlação com o predicado das páginas. Probabilidade `1/M`
+  (`EDEN_LIST_DIAG_BLKCMP_ODDS`, **M = 4**): a faixa elegível de ordem `k` é sorteada sse `SplitMix64(seed ^ k) % M == 0`. As
+  aplicações são serializadas (P0 e `buffer_cache.mutex`), então `k` é uma sequência única e a mesma semente dá o mesmo sorteio.
+- **Balde:** taxa sustentada de `EDEN_LIST_DIAG_BLKCMP_BUDGET` (**5/s**) e rajada de `EDEN_LIST_DIAG_BLKCMP_BURST`
+  (**5**); começa cheio, recarrega continuamente pelo relógio de microssegundos do diagnóstico, não passa da rajada. A ficha é
+  tomada no **consumo** (passo 3 da 3.8.2), não no sorteio: descartar por tamanho, mapas, buffer ou "sem upload" não gasta ficha.
+- **Teto:** `EDEN_LIST_DIAG_BLKCMP_MAXBYTES` (**4096**) de bytes `at_risk` por faixa.
+- Valor inválido (não numérico, zero, negativo, fora do limite) volta ao padrão e a linha "ligado" lista quais.
+- **Perturbação (declarada):** por comparação, um `Finish` sob o `buffer_cache.mutex`, mais a cópia. O `Finish` espera todo o
+  trabalho já submetido, então o custo cresce com a fila da GPU; o teto é 5 esperas por segundo em regime. Medido só pelo
+  `blkcmp_finish_us_*`. A rodada de `blkcmp` serve para achar ocorrência, **não** para medir draws/s.
 
-#### 3.8.6 A thread
+#### 3.8.6 A thread (implementado)
 
-A mesma que hoje grava o upload: a de trás (com o split), ou a da frente **depois de um `DrainBack` completo**
-(`puller.cpp:179-180`: "from here on the back is idle, and the front may use the rasterizer"; os chamadores da frente
-estão na 3.3). `Finish` pela frente é o mesmo que o upload faz pela frente, e a trás está ociosa. As comparações são contadas
-**separadamente**: `blkcmp_compared_draw_thread` quando `BackStats::is_draw_thread` (a thread que prepara draws), senão
-`blkcmp_compared_other_thread`. **A conferir na implementação:** se `is_draw_thread` é mantida fora das estatísticas
-(`back_thread_stats.h:302`); senão, o número de ordem da thread pelo `std::hash<thread::id>`, como as `invalidate_thread_switches`.
+A que grava o upload: a de trás (com o split), ou a da frente depois de um `DrainBack` completo (`puller.cpp:179-180`). **Marca
+`thread_local` própria do diagnóstico** (`list_diag/thread_mark.h`, independente de `BackStats` e de `is_draw_thread`, que só é
+ligado com as estatísticas): `GpuSplit::BackLoop` marca **Back** no começo da thread; `DrainBack` (`puller.cpp`) marca **Front**
+na thread que drenou, e só com o split ativo. Sem marca (por exemplo sem o split, onde não há `DrainBack`), a comparação conta
+`blkcmp_compared_other` (other/unknown), **nunca** como frente. Os três são contados separadamente.
 
-#### 3.8.7 Contadores, log e resumo
+#### 3.8.7 Contadores, log e resumo (implementado)
 
-| Contador | O que conta |
-| --- | --- |
-| `blkcmp_eligible` | faixas afirmadas com `at_risk > 0` |
-| `blkcmp_drawn` | ... sorteadas |
-| `blkcmp_discard_ranges`, `_size` | tinha mais de 16 partes; `at_risk` acima do teto |
-| `blkcmp_discard_no_upload` | o `CachedWriteMemory` voltou antes do upload (3.8.1, passo 2) |
-| `blkcmp_discard_no_memory_maps` | OpenGL (ou `USE_MEMORY_MAPS_FOR_UPLOADS == false`) |
-| `blkcmp_discard_budget` | sem ficha |
-| `blkcmp_discard_reorder_unprotected` | `IsRegionUsed` falso depois do `MarkUsage` (3.8.2, passo 3) |
-| `blkcmp_discard_stale` | o pedido não era desta chamada (não deveria ocorrer) |
-| `blkcmp_compared`, `_draw_thread`, `_other_thread` | faixas comparadas, por thread |
-| `blkcmp_equal`, `blkcmp_different` | faixas sem e com diferença |
-| `blkcmp_bytes_compared`, `blkcmp_bytes_different` | bytes |
-| `blkcmp_finish_n`, `_us_sum`, `_us_max` | a perturbação |
+`blkcmp_eligible`, `_drawn`, `_discard_ranges`, `_discard_size`, `_discard_no_upload`, `_discard_no_memory_maps`,
+`_discard_no_single_buffer`, `_discard_budget`, `_discard_stale`, `_compared` (`_back`, `_front`, `_other`), `_equal`,
+`_different`, `_bytes_compared`, `_bytes_different`, `_finish_n`, `_finish_us_sum`, `_finish_us_max`. Identidades no resumo
+final: `eligible >= drawn`; `drawn = compared + todos os descartes`; `compared = equal + different`.
 
-**Identidades (só no resumo final):** `eligible >= drawn`; `drawn = compared + todos os descartes`; `compared = equal +
-different`. Cada uma com os dois lados e o resíduo, como as da 3.7.6.
-
-**Log** (`[ListDiag][blkcmp]`, as primeiras 32 diferenças e depois uma a cada 64, dentro dos 512 do diagnóstico):
-`different: range=[0x..,+N) core:lot=... parts=K bytes=B diff_bytes=D first=[+off,len] gpu_old=<8 B hex> payload=<8 B hex>
-thread=draw|other`. Linha `ligado`: `blkcmp=odds 1/M seed=0x.. budget=B/s maxbytes=T`. Resumo: `blkcmp: bytes antigos da GPU
-diferentes do payload que os substituiu: D de B bytes comparados (F de C faixas); sorteadas S de E elegíveis (as afirmadas,
-nao uma amostra aleatoria de todas as aplicacoes); descartadas ...; Finish n=.. soma=.. max=..us. Nao prova corrupcao visivel
-nem exclui escrita legitima concorrente.`
+**Log** (`[ListDiag][blkcmp] different:`, as 32 primeiras e depois 1 a cada 64, dentro dos 512 do diagnóstico): `range=[0x..,+N)
+cores=0x.. lot=.. parts=K bytes=B diff_bytes=D first=0x.. gpu_old=0x.. payload=0x.. thread=back|front|other/unknown
+finish=..us`. **Linha "ligado":** sorteio, semente, balde, teto e "um Finish por comparação, sob o buffer_cache.mutex".
+**Resumo:** "blkcmp: bytes antigos da GPU diferentes do payload que os substituiu: D de B bytes comparados (F de C faixas);
+sorteadas S de E elegíveis (as afirmadas com at_risk>0 ... NAO sao amostra aleatoria de todas as aplicacoes); descartadas ...;
+Finish n=.. soma=.. max=.. Isso nao prova corrupcao visivel nem exclui uma escrita legitima concorrente."
 
 #### 3.8.8 Testes
 
-**No harness (`tools/list-diag-harness/`, código real de `list_diag/*.h`):**
-1. O **sorteio**: mesma semente e mesma sequência dão o mesmo conjunto; semente diferente dá outro; a fração fica a menos de
-   4σ de `1/M` em sequências longas; `M = 1` sorteia tudo.
-2. O **orçamento** com o relógio manual: balde cheio, esgotado, recarga; descartar por orçamento não gasta ficha.
-3. O **mapeamento** dos bytes `at_risk`: a lista de partes de `AccountBlock` para faixas com escritas exatas e bytes da GPU
-   conhecidos (início, comprimento, deslocamento dentro da faixa e no staging, alinhamento de 64 B); mais de 16 partes → descarte.
-4. A **comparação**: uma função pura `Compare(request, staging, payload)` com um "staging" falso: iguais, uma diferença, várias partes,
-   diferença na primeira e na última posição; contadores de bytes; a primeira diferença certa.
-5. A **contagem de descartes** e a conservação: `BlkcmpScope` sem consumo → `no_upload`; consumo com outro `(addr, size)` →
-   `stale`; teto → `size`; `IsRegionUsed` falso (injetado) → `reorder_unprotected`; sem mapas → `no_memory_maps`;
-   `drawn = compared + descartes`.
-6. Nada de `blkcmp` quando `blk` está desligado, ou quando o diagnóstico está desligado (nenhum pedido, nenhum contador).
-7. **N = 1 e as identidades da 3.7 não mudam** com `blkcmp` ligado ou desligado (os mesmos contadores de `blk`).
+**No harness (`tools/list-diag-harness/`, código real de `list_diag/*.h`), casos `blkcmp [1]` a `[8]`:** o sorteio (reproduzível,
+semente própria, é a fórmula, 1/M a menos de 4σ, M = 1 sorteia tudo); o balde (rajada, taxa sustentada, recarga fracionada, teto
+da rajada depois de ociosidade longa, descarte por orçamento); o teto de bytes e o de partes; o mapeamento dos bytes `at_risk`
+(partes, deslocamentos alinhados a 64 B); a comparação com um **staging falso** (iguais, uma diferença na primeira e na última
+posição, várias partes, preenchimento do alinhamento ignorado, a primeira diferença no log); cada descarte por motivo e a
+identidade `drawn = compared + descartes`; o texto do resumo; nada sem `blk` ou com `blkcmp` desligado, e os mesmos contadores
+de `blk` e de avisos com e sem `blkcmp`; a configuração e a marca de thread (sem marca → other/unknown, nunca frente; uma thread
+não vê o pedido de outra).
 
-**O que o harness NÃO cobre, e só se confere por leitura e no build do usuário:** a cópia no Vulkan (`DownloadStagingBuffer`,
-`CopyBuffer` com barreira, `Finish`, a leitura do `mapped_span`); que o `MarkUsage` realmente impede a reordenação (o harness
-não tem `Scheduler` nem `Buffer`); a ordem dos comandos entre a cópia diagnóstica e o upload; o custo do `Finish`; o
-`BufferCache<P>` inteiro (o harness nunca o instancia). Esses pontos são **por leitura** (3.8.2) e a confirmação é o log do
-usuário: `blkcmp_discard_reorder_unprotected` perto de zero, `blkcmp_finish_us_max` coerente, e, com o par "diferente" sempre
-acompanhado de bytes plausíveis, não de zeros de um staging que a cópia não preencheu (um teste de sanidade no build do
-usuário: com `blkcmp` ligado, a taxa de "diferente" não pode ser 100% das comparadas **e** `gpu_old` todo zero).
+**O que o harness NÃO cobre, e só se confere por leitura e no build do usuário:** `BufferCache::BlkcmpCapture` e a captura na primeira
+linha de `InlineMemoryImplementation` (o harness nunca instancia o `BufferCache`); a consulta `page_table`/`IsInBounds`; a cópia
+no Vulkan (`DownloadStagingBuffer`, `CopyBuffer` com barreira, `Finish`, a leitura do `mapped_span`); a ordem real dos comandos; o
+custo do `Finish`; as marcas de thread em `gpu_split.cpp` e `puller.cpp`. A confirmação é o log do usuário
+(`blkcmp_discard_no_single_buffer` e `_stale` baixos, `blkcmp_finish_us_max` coerente, `compared_back`/`front`/`other` coerentes
+com o split). **O teste de sanidade "100% de diferenças com `gpu_old` zerado" foi retirado (revisão 6).**
 
 ## 4. Problema A: janela do pop (contadores e logs próprios)
 

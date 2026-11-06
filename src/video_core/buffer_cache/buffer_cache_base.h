@@ -514,6 +514,10 @@ private:
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
+    /// EDEN_LIST_DIAG part blkcmp (docs/list-diag-design.md, 3.8): reads the old bytes of the GPU of a drawn range
+    /// before anything of InlineMemoryImplementation runs. Diagnostic only.
+    void BlkcmpCapture(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     Common::SlotVector<Buffer> slot_buffers;
