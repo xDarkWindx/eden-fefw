@@ -1,6 +1,6 @@
 # T4: corrigir a aplicação de escritas seguradas sobre bytes da GPU (rascunho do planejador)
 
-**Estado: rascunho para o revisor, sem código.** Escrito em 2026-11-06 sobre `975a068`. Graus de certeza como nos
+**Estado: rascunho revisado (seção 8, revisão 1), sem código. O1 é candidata a mitigação, não correção completa de G.** Escrito em 2026-11-06 sobre `975a068`. Graus de certeza como nos
 outros docs: **verificado** (lido no código, com `arquivo:linha`), **medido** (de quem), **hipótese**. Caminhos
 relativos a `src/`.
 
@@ -112,3 +112,25 @@ Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Tam
    muda quantas vezes o `guard` é tomado?
 3. A reprodução dirigida descrita na seção 5 basta como "reprodução" para validar opções, ou deve incluir também A e M,
    para mostrar que O1 não os resolve?
+
+## 8. Revisões
+
+### Revisão 1 (sobre `5b88e88`), conferida pelo planejador
+
+| # | O que a crítica disse | Procede no código? | O que muda |
+| --- | --- | --- | --- |
+| 1 | **Bloqueador:** só mudar as constantes quebra o `Gather`. `mask = continuous_bits < align_size ? (mask >> continuous_bits) : 0` compara uma contagem de bits com o tamanho do grão em bytes. Com grão de 4 B, a máscara com os bits 0-3 e 8 perde o bit 8 | Sim (`gpu_dirty_memory_manager.h:195`). Hoje está certo **por coincidência**: a máscara tem 32 bits e `align_size` é 64, então a condição é sempre verdadeira e o deslocamento é feito num `u64` (`:186`). A condição certa depende da largura da máscara | O conserto do laço do `Gather` passa a ser dependência explícita de O1, com teste de duas sequências de bits na mesma transformação |
+| 2 | **Bloqueador de integração:** com O1, faixas pequenas viram comuns e chegam a `CanReorderUpload` → `UsageTracker::IsUsed`, onde `num_bits = min(size, 4096) >> 6` dá 0 abaixo de 64 B (deslocamento de 64: UB) e `size >> 6` não cobre faixa desalinhada que cruza dois blocos | Sim: a junção por página (`gpu.cpp:168-181`) não exige múltiplos de 64 B; o UB foi visto com UBSan (`usage_tracker.h:92`). Na leitura anterior concluí que o `IsUsed` é conservador numa página só no `-O2` e por causa do UB; isso não vale como garantia | Corrigir o rastreador para marcar, de forma conservadora, todos os blocos de 64 B que a faixa toca, sem UB. É pré-requisito de O1. O rastreio de dependências pode ser conservador; os bytes enviados continuam exatos |
+| 3 | O1 não cumpre C1 e C3 para toda escrita: uma escrita de 4 B desalinhada (`[1, 5)`) toca dois grãos e leva vizinhos (`[0, 8)`). O2 "só se o residual for relevante" é decisão de compatibilidade e desempenho, não garantia. C2 depende de A e M | Sim | O1 elimina G só para escritas com início e fim alinhados ao grão; nas outras, é mitigação. C2 passa a dizer que a garantia de G supõe payload válido, escrita concluída (M) e nenhuma sobrescrita por A. A escolha entre mitigação de 4 B e solução exata é do usuário, com a medição da seção 4 |
+| 4 | `IsValid`: corrigir antes de O1, mas **pela máscara** (`mask == 0` é vazio), não por `address != ~0U`. Com transformação de 128 B, a última abaixo de 2^39 tem endereço `0xffffffff` | Sim, e corrige a minha proposta: teste pelo endereço descartaria essa transformação, com máscara não nula, no `Gather` (`:168`) | **T4.0**, commit à parte, medido sozinho, com quatro testes: coleta com o gerenciador vazio e depois de `Gather`; `Gather` vazio; última transformação representável com máscara não nula; coleta e retirada intercaladas preservando as faixas |
+| 5 | A reprodução dirigida precisa de dois complementos: uma escrita pequena ou desalinhada que continua falhando com grão de 4 ou 8 B (o residual); duas sequências de bits na mesma transformação (a perda do `Gather`). Os negativos de A e M devem continuar mostrando os problemas com o grão novo | Sim | Entram na reprodução |
+| 6 | Medição: o número de pedaços depende da transformação `T = 32 × grão`: `pedaços = 1 + ((address % T) + size - 1) / T`. Grãos tocados e pedaços são custos diferentes. "`blkcmp` sem diferenças" não pode ser aceite absoluto | Sim | A seção 4 conta pedaços pela fórmula e grãos tocados à parte. O aceite principal passa a ser a reprodução dirigida, preservando os vizinhos dentro do escopo garantido, mais desempenho e validação nos jogos |
+
+**Sequência revisada:**
+1. **T4.0:** `IsValid` pela máscara (item 4), medido sozinho.
+2. **T4.1:** `UsageTracker` conservador e sem UB (item 2). Já é bug preexistente hoje, com uploads menores que 64 B.
+3. **Medição** de tamanhos e alinhamentos das escritas seguradas (seção 4, com a fórmula do item 6).
+4. **Decisão do usuário:** O1 como mitigação (grão de 4 ou 8 B, com o conserto do `Gather` e os testes) ou uma solução exata (O2).
+
+A reprodução dirigida e o `blkcmp` assíncrono seguem em paralelo, sem ampliar o diagnóstico.
+
