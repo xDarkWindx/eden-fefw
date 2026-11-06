@@ -221,7 +221,12 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão 3 do T4 (`t4-coherence-fix-plan.md` 8): os testes foram aprovados e o T4.1 entra com seis ajustes (laço
   limitado, oráculo como referência, contador de elegibilidade separado do de efeito, chave lida uma vez, `MarkUsage` com
   atenção especial). O A e o B estão liberados. A retenção da fonte no assíncrono fica para o desenho, antes do código
-  dele (nota na 3.8.10). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  dele (nota na 3.8.10).
+- Feitos `379a581` (A: contador de permissão e de efeito da reordenação; invalidação do staging no `blkcmp` síncrono),
+  `be1bbcb` (B: T4.1 com `EDEN_USAGE_TRACKER_OLD=1` temporária) e `d13579f` (C: 3.8.9). O planejador reproduziu o
+  harness (81 casos, 78 passam e 3 falham como esperado) e os mutantes. Tirar a última página do laço do `Track` derruba
+  7 casos. Ponto para o revisor: entrada do pool não achada conta como "invalidated". Com o revisor; depois, o build
+  do usuário. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
