@@ -1120,6 +1120,19 @@ incorporados acima (3.8.9, pontos 2, 3, 6 e 7, "Retenção da fonte" e o orçame
    continua dependendo da exclusão entre os produtores do scheduler.
 5. **20/s** é orçamento experimental. Tirar o `Finish` remove aquela espera, não toda a interferência: continuam as
    barreiras, as restrições de reordenação e a pressão na fila.
+**Revisão de `29ea216` (pendências da versão assíncrona, antes do código dela; o codador atualiza o texto acima):**
+- **A retenção da fonte pode destruir cedo demais.** O buffer pode ter usos depois da cópia (cópia no tick T, outro uso em
+  T+1, `DeleteBuffer`, T termina com T+1 ainda executando), e pode haver várias capturas pendentes da mesma fonte. Ajuste
+  mínimo:
+  - considerar todas as capturas da fonte e usar o maior tick;
+  - marcar todas as entradas contra o reuso do `buffer_id`;
+  - no fim da retenção, **devolver o objeto ao mecanismo normal de destruição adiada**, nunca destruí-lo direto.
+  A alternativa seria provar que todos os usos anteriores à remoção terminaram, o que exige uma garantia mais ampla.
+- **A exclusão entre os produtores do scheduler** não é só requisito do argumento do tick: o `Record` mexe em estado
+  compartilhado do scheduler, e um tick que só cresce não torna seguras chamadas concorrentes.
+- **`staging=coherent` numa rodada nova** vale para as alocações daquela rodada; não prova o tipo das alocações antigas. A
+  evidência que conta é a medição nova, com a invalidação certa.
+
 #### 3.8.10 Invalidação do staging, também no `blkcmp` síncrono (desenho, sem código)
 
 **O problema (inventário 7.7).** O `blkcmp` lê o `mapped_span` do staging de download sem invalidar, e o resultado da rodada 4 (8.6) **supõe

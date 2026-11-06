@@ -273,3 +273,37 @@ O `UsageTracker` é um header **sem Vulkan** (inclui só `<algorithm>`, `<array>
    passa com o novo.
 6. **Integração por leitura, no build do usuário:** o contador de reordenação antes e depois (9.4), e a conferência de
    `IsRegionUsed` do `blkcmp` assíncrono (`blkcmp_discard_reorder_unprotected` perto de zero).
+
+### Revisão 3 (sobre `29ea216`): testes aprovados, T4.1 com ajustes antes do código
+
+Conferida pelo planejador. **O corpo da seção 9 é atualizado pelo codador junto com a implementação, para não divergir disto.**
+1. **O laço é limitado antes de começar (9.3).**
+   - O caso vazio é tratado antes de calcular `size - 1`.
+   - `Track` percorre só a interseção com as páginas existentes. Sem interseção, retorna sem mexer em
+     `dirty_begin`/`dirty_end`.
+   - `IsUsed` devolve `true` na hora se uma faixa não vazia passa da extensão.
+   - Nunca usar `pages.size() - 1` sem garantir que há páginas.
+   - Assim, T-5 fecha também em custo, sem laço gigante com o último endereço saturado em `UINT64_MAX`.
+2. **A referência normativa dos testes é o oráculo de blocos (9.5).** Nada de `no_sanitize("shift")` no legado: isso
+   desliga a detecção, mas não define o resultado. O legado é comparado só onde as operações são definidas; os casos de
+   UB ficam à parte, como demonstração do defeito antigo.
+3. **9.4: eliminar falsos negativos é correção de ordem de execução**, não só desempenho. A precisão a mais é que
+   muda o desempenho.
+4. **Chave temporária aceita** (`EDEN_USAGE_TRACKER_OLD=1`):
+   - o rastreador novo é o padrão;
+   - a chave é lida uma vez na partida e vale para `Track` e `IsUsed` juntos, sem troca durante a execução;
+   - não vira opção permanente, porque o modo antigo conserva um UB conhecido;
+   - uma rodada por braço é triagem: se os números ficarem próximos, repete-se em ordem alternada.
+5. **O contador de reordenação separa permissão de efeito.** `CanReorderUpload == true` é só permissão; a reordenação
+   efetiva também exige `src_buffer == staging_pool.StreamBuf()` (`vk_buffer_cache.cpp:481`, verificado). Contar a
+   elegibilidade **e** o caminho escolhido em `CopyBuffer`, com nomes diferentes.
+6. **`MarkUsage` com atenção especial** (as unidades continuam deslocamento e tamanho em bytes):
+
+   | Chamadores | O que verificar |
+   | --- | --- |
+   | Uniforms gráficos e de compute (`buffer_cache.h:1073`, `:1384`) | faixas pequenas, possivelmente de tamanho zero: perdem os falsos positivos antigos, nunca os blocos tocados |
+   | Storage segmentado (`:1239`) | cada segmento marca o seu próprio deslocamento; as bordas parciais importam |
+   | Vértices (`:902`, `:945`) | faixas grandes e repetidas: manter o cache `recent` e o preenchimento de páginas inteiras, sem trabalho por bloco |
+   | `JoinOverlap` e criação (`:1905`, `:1927`) | cópias e clears continuam impedindo que uploads posteriores passem à frente; testar faixa que termina na borda |
+   | Downloads (`:692`, `:2232`) | são leituras da GPU que também impedem sobrescrita antecipada: "uso" não é só escrita |
+

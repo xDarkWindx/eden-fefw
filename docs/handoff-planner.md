@@ -217,7 +217,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   `t4-coherence-fix-plan.md` 9) e `ccc0c92` (3.8.9 e 3.8.10: retenção do buffer fonte, encerramento, invalidação do
   staging também no síncrono). O planejador reproduziu o harness (73 casos, 70 passam e 3 falham como esperado) e os
   mutantes. Com o revisor. Proposta para depois: um commit com o contador de reordenação e a invalidação no `blkcmp`
-  síncrono, e outro com o T4.1 atrás de uma chave temporária para o A/B, num build só. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  síncrono, e outro com o T4.1 atrás de uma chave temporária para o A/B, num build só.
+- Revisão 3 do T4 (`t4-coherence-fix-plan.md` 8): os testes foram aprovados e o T4.1 entra com seis ajustes (laço
+  limitado, oráculo como referência, contador de elegibilidade separado do de efeito, chave lida uma vez, `MarkUsage` com
+  atenção especial). O A e o B estão liberados. A retenção da fonte no assíncrono fica para o desenho, antes do código
+  dele (nota na 3.8.10). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
