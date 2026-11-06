@@ -2695,3 +2695,167 @@ TEST_CASE("blkcmp [8]: the part, its configuration and the thread mark", "[list-
     t.join();
     CHECK(!other_sees);
 }
+
+// =============================================================================================
+// [t4] Directed reproduction of problem B (docs/t4-coherence-fix-plan.md, 1 and 5): a held CPU write applied
+// at the 64-byte grain puts the guest's OLD values over bytes only the GPU wrote.
+//
+// The model, deliberately small: the REAL GPUDirtyMemoryManager, a Common::RangeSet as gpu_modified_ranges and
+// two byte vectors of one 4 KiB page, the host (what the GPU buffer holds) and the guest (what the CPU sees).
+// The "application" does what InlineMemoryImplementation does for each range the Gather delivers: subtract it
+// from gpu_modified and copy those bytes from the guest to the host.
+//
+// What these tests do NOT cover: BufferCache<P>, SynchronizeBuffer, the staging and the Vulkan copies, and
+// problems A (an old download published over a write not yet applied) and M (a notice published before the
+// memcpy finished). They keep their own cases (list diag [pop], 3.5; tools/gpu-contract-harness); this model
+// has no downloads and no concurrent memcpy, so it cannot show them.
+//
+// Every scenario has two cases. (a), WITHOUT the tag, assembles the script through the same function and checks
+// the preparation (the bytes written, the range the Gather delivers, the state of gpu_modified): an accident in
+// the assembly fails there and is never a successful reproduction. (b), WITH [!shouldfail], uses the same
+// assembly and makes only the assertion of the loss that is expected to be absent after the fix. Today (b)
+// fails, as the tag demands. When T4 fixes the problem (b) passes, the tag then ACCUSES (Catch2 reports a
+// [!shouldfail] test that passes as a failure), and whoever fixes it must remove the tag and keep the assertion.
+
+namespace {
+
+constexpr u64 kPageBase = 0x20000;
+constexpr u8 kOldGuest = 0x11; ///< what the guest holds for everything the CPU did not write (stale for GPU bytes)
+constexpr u8 kGpuByte = 0x77;  ///< what the GPU wrote into the host
+constexpr u8 kCpuByte = 0x99;  ///< what the CPU wrote
+
+struct T4World {
+    std::array<u8, 4096> host{};  ///< the buffer on the GPU
+    std::array<u8, 4096> guest{}; ///< guest memory
+    Common::RangeSet<u64> gpu_modified;
+    Manager manager;
+    std::vector<std::pair<u64, u64>> delivered; ///< the ranges of the Gather, in order
+    std::array<u8, 4096> host_before_apply{};
+    bool gpu_range_present_before = false;
+    bool gpu_range_empty_after = false;
+
+    T4World() {
+        host.fill(kOldGuest);
+        guest.fill(kOldGuest);
+    }
+    /// The GPU wrote [begin, end) of the host and marked it GPU-modified; the guest keeps the old values.
+    void GpuWrites(u64 begin, u64 end) {
+        std::fill(host.begin() + begin, host.begin() + end, kGpuByte);
+        gpu_modified.Add(kPageBase + begin, end - begin);
+    }
+    /// The CPU writes the guest and the held write is collected.
+    void CpuWrites(u64 offset, u64 size) {
+        std::fill(guest.begin() + offset, guest.begin() + offset + size, kCpuByte);
+        manager.Collect(kPageBase + offset, size);
+    }
+    /// Gather + application, as InlineMemoryImplementation does for each range.
+    void Apply() {
+        host_before_apply = host;
+        gpu_range_present_before = false;
+        gpu_modified.ForEachInRange(kPageBase, 4096, [&](u64, u64) { gpu_range_present_before = true; });
+        delivered.clear();
+        std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { delivered.emplace_back(a, s); };
+        manager.Gather(cb);
+        for (const auto& [a, s] : delivered) {
+            gpu_modified.Subtract(a, s);
+            std::memcpy(&host[a - kPageBase], &guest[a - kPageBase], s);
+        }
+        bool any = false;
+        gpu_modified.ForEachInRange(kPageBase, 4096, [&](u64, u64) { any = true; });
+        gpu_range_empty_after = !any;
+    }
+    /// C1: only the bytes the CPU wrote changed in the host, and they hold the CPU's values.
+    [[nodiscard]] bool OnlyCpuBytesChanged(u64 offset, u64 size) const {
+        for (u64 i = 0; i < 4096; ++i) {
+            const bool written = i >= offset && i < offset + size;
+            if (written ? host[i] != kCpuByte : host[i] != host_before_apply[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+/// The script of every scenario: the GPU writes [0, 32), the CPU writes [offset, offset + size).
+std::unique_ptr<T4World> AssembleB(u64 offset, u64 size) { // the manager is not movable
+    auto w = std::make_unique<T4World>();
+    w->GpuWrites(0, 32);
+    w->CpuWrites(offset, size);
+    w->Apply();
+    return w;
+}
+
+/// The preparation, common to (a) of each scenario. `lost` says the current behaviour: the host lost [0, 32).
+void CheckPreparation(const T4World& w, u64 offset, u64 size) {
+    // The bytes written: the guest holds the CPU's bytes and the old values elsewhere.
+    for (u64 i = 0; i < 64; ++i) {
+        const bool written = i >= offset && i < offset + size;
+        REQUIRE(w.guest[i] == (written ? kCpuByte : kOldGuest));
+    }
+    // The GPU's bytes were in the host before the application and gpu_modified held them.
+    for (u64 i = 0; i < 32; ++i) {
+        REQUIRE(w.host_before_apply[i] == kGpuByte);
+    }
+    REQUIRE(w.gpu_range_present_before);
+    // The Gather delivers the whole 64-byte block (the grain of the manager), and the application subtracted it.
+    REQUIRE(w.delivered.size() == 1);
+    REQUIRE(w.delivered[0] == std::pair<u64, u64>{kPageBase, 64});
+    REQUIRE(w.gpu_range_empty_after);
+    // The CPU's bytes arrived.
+    for (u64 i = offset; i < offset + size; ++i) {
+        REQUIRE(w.host[i] == kCpuByte);
+    }
+    // The current behaviour, the defect: the GPU's [0, 32) came back as the guest's old values.
+    for (u64 i = 0; i < 32; ++i) {
+        REQUIRE(w.host[i] == kOldGuest);
+    }
+}
+
+} // namespace
+
+TEST_CASE("t4 [a]: B, the main script: the Gather gives [0,64) and the host loses [0,32) (today)", "[list-diag][t4]") {
+    const auto w = AssembleB(40, 4);
+    CheckPreparation(*w, 40, 4);
+}
+
+// Fails today (the loss is real). Remove [!shouldfail] when T4 fixes the problem: this case then passes, and the
+// tag makes Catch2 report that as a failure, which is the signal to remove it.
+TEST_CASE("t4 [b]: B, the main script: C1, the host keeps [0,32) and receives [40,44)", "[list-diag][t4][!shouldfail]") {
+    const auto w = AssembleB(40, 4);
+    CHECK(w->OnlyCpuBytesChanged(40, 4));
+}
+
+// The residual. With the manager at 64 B this only shows the current defect. It will show the residual of O1
+// (a write smaller than or misaligned to the grain still takes its neighbours) only when it runs with the
+// candidate grain, after O1 exists.
+TEST_CASE("t4 [a]: residual, a misaligned 4-byte write [41,45) and a 1-byte write", "[list-diag][t4]") {
+    CheckPreparation(*AssembleB(41, 4), 41, 4);
+    CheckPreparation(*AssembleB(41, 1), 41, 1);
+}
+
+TEST_CASE("t4 [b]: residual, a misaligned 4-byte write [41,45): C1", "[list-diag][t4][!shouldfail]") {
+    const auto w = AssembleB(41, 4);
+    CHECK(w->OnlyCpuBytesChanged(41, 4));
+}
+
+TEST_CASE("t4 [b]: residual, a 1-byte write at 41: C1", "[list-diag][t4][!shouldfail]") {
+    const auto w = AssembleB(41, 1);
+    CHECK(w->OnlyCpuBytesChanged(41, 1));
+}
+
+// Two runs of bits in one transformation (bits 0-3 and 8 of the mask). This documents the CURRENT behaviour: both
+// ranges come out. It does NOT show the defect of the Gather loop (gpu_dirty_memory_manager.h:195,
+// "continuous_bits < align_size") with a smaller grain: with 64 B the mask has 32 bits, the condition is always
+// true and nothing is lost. The case has to run again with the candidate grain when O1 is implemented. The
+// manager is not changed here.
+TEST_CASE("t4: two runs of bits in one transformation give both ranges (current behaviour)", "[list-diag][t4]") {
+    Manager manager;
+    manager.Collect(kPageBase, 256);       // bits 0-3
+    manager.Collect(kPageBase + 512, 64);  // bit 8
+    std::vector<std::pair<u64, u64>> got;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
+    manager.Gather(cb);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0] == std::pair<u64, u64>{kPageBase, 256});
+    CHECK(got[1] == std::pair<u64, u64>{kPageBase + 512, 64});
+}
