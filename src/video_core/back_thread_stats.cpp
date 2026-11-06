@@ -379,7 +379,7 @@ void Report() {
         const u64 bytes = Take(hs.bytes);
         const u64 empty = Take(hs.empty);
         const u64 under_4 = Take(hs.under_4);
-        const auto pct = [pieces](u64 value) {
+        const auto pct_of_held = [pieces](u64 value) {
             return pieces != 0 ? static_cast<double>(value) * 100.0 / static_cast<double>(pieces) : 0.0;
         };
         std::array<std::array<u64, static_cast<size_t>(HeldShape::Align::Count)>, HeldShape::kGrains.size()> align{};
@@ -405,10 +405,10 @@ void Report() {
         const auto align_text = [&](size_t g) {
             const auto& a = align[g];
             return fmt::format("both {:.1f}% / address only {:.1f}% / size only {:.1f}% / neither {:.1f}%",
-                               pct(a[static_cast<size_t>(HeldShape::Align::Both)]),
-                               pct(a[static_cast<size_t>(HeldShape::Align::AddressOnly)]),
-                               pct(a[static_cast<size_t>(HeldShape::Align::SizeOnly)]),
-                               pct(a[static_cast<size_t>(HeldShape::Align::Neither)]));
+                               pct_of_held(a[static_cast<size_t>(HeldShape::Align::Both)]),
+                               pct_of_held(a[static_cast<size_t>(HeldShape::Align::AddressOnly)]),
+                               pct_of_held(a[static_cast<size_t>(HeldShape::Align::SizeOnly)]),
+                               pct_of_held(a[static_cast<size_t>(HeldShape::Align::Neither)]));
         };
         LOG_INFO(Render_Vulkan,
                  "Held pieces by size and alignment (sizes the writes outside the O1 guarantee; does not measure "
@@ -419,7 +419,7 @@ void Report() {
                  "touched/piece grain 4: {:.2f}, grain 8: {:.2f}, 64 B: {:.2f}",
                  per_s(pieces), per_s(bytes), per_s(empty), src_text(DirtySource::WriteT),
                  src_text(DirtySource::WriteBlock), src_text(DirtySource::ZeroBlock), src_text(DirtySource::CacheOp),
-                 src_text(DirtySource::Exclusive), src_text(DirtySource::Other), pct(under_4), align_text(0),
+                 src_text(DirtySource::Exclusive), src_text(DirtySource::Other), pct_of_held(under_4), align_text(0),
                  align_text(1), avg(cost_pieces[0], pieces), avg(cost_pieces[1], pieces),
                  avg(cost_pieces[2], pieces), avg(cost_grains[0], pieces), avg(cost_grains[1], pieces),
                  avg(cost_grains[2], pieces));
