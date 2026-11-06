@@ -970,6 +970,112 @@ custo do `Finish`; as marcas de thread em `gpu_split.cpp` e `puller.cpp`. A conf
 (`blkcmp_discard_no_single_buffer` e `_stale` baixos, `blkcmp_finish_us_max` coerente, `compared_back`/`front`/`other` coerentes
 com o split). **O teste de sanidade "100% de diferenças com `gpu_old` zerado" foi retirado (revisão 6).**
 
+#### 3.8.9 T3a.2b: `blkcmp` assíncrono (desenho, sem código)
+
+**Objetivo e o que continua sendo.** Confirmar as ocorrências nos jogos **sem `Finish` extra e sem submissões a mais**, para o
+resultado do `blkcmp` valer também para a execução normal de GPU. **Continua sendo execução instrumentada**: há uma cópia a
+mais, barreiras a mais e a reordenação do upload fica restrita nas faixas observadas (`MarkUsage`). O resumo diz isso. A versão
+síncrona (3.8.1 a 3.8.8) continua como modo padrão até a assíncrona ser verificada pelo usuário; a escolha é uma variável
+(`EDEN_LIST_DIAG_BLKCMP_MODE=sync|async`). **Nada disto está implementado. A IMPLEMENTAÇÃO espera o T4.1** (o `UsageTracker` sem UB
+e conservador; ponto 2): nada de contornar o rastreador com outro mecanismo (por exemplo, desligar a reordenação global).
+
+**1. Captura na posição de hoje.** A primeira linha de `InlineMemoryImplementation` (`buffer_cache.h:2114-2118`), antes de
+`ClearDownload`, nunca depois de `SynchronizeBuffer` (3.8.1: o `SynchronizeBuffer` sobe faixas da CPU, `:2002-2014`). Buffer por
+consulta (`page_table`, `IsInBounds`), sem `FindBuffer`. Tudo o que muda é **depois da captura**: em vez de `Finish`, a cópia fica
+pendente (ponto 4).
+
+**2. Proteção contra TODAS as sobrescritas relevantes, não só o upload final.** O que pode gravar nos bytes lidos entre o
+registro da cópia e a sua execução, e como cada um fica atrás da cópia:
+
+| Sobrescrita possível | Como é ordenada depois da cópia |
+| --- | --- |
+| O upload final (`InlineMemoryImplementation`, `:2123-2133`) | `CanReorderUpload` (`vk_buffer_cache.cpp:448-458`) devolve `false` se `IsRegionUsed(dst_offset, size)` (`:455`); o upload vai pelo `Record` do cmdbuf principal (`:487-499`), depois da cópia, e não pelo `upload_cmdbuf`, que executa antes (`:480-486`) |
+| Os uploads do `SynchronizeBuffer` (`MappedUploadMemory`, `:2093-2094`, `CanReorderUpload` por cópia) | o mesmo teste, cópia a cópia, contra as faixas marcadas |
+| Outras escritas em ordem de comando (`CopyBuffer` do cache, `ClearBuffer`, DMA) | gravadas no cmdbuf principal **depois** da cópia, em ordem de gravação; a ordem entre elas é a das barreiras (ponto 3) |
+| Substituição do buffer (`JoinOverlap`, `buffer_cache.h:1891-1912`, `DeleteBuffer`, `:2254`) | a cópia lê o `VkBuffer` antigo; o novo recebe a cópia do antigo **depois** dela, em ordem. O antigo só é destruído pelo `delayed_destruction_ring` (`buffer_cache_base.h:529`, `TICKS_TO_DESTROY` ticks de frame). **A confirmar na implementação:** que o anel cobre o tempo até a cópia terminar (mesma premissa de toda gravação que cita um buffer apagado) |
+
+**`MarkUsage` da região lida.** O mecanismo que alimenta `CanReorderUpload` é `Buffer::MarkUsage` (`vk_buffer_cache.cpp:125-128`,
+`usage_tracker.h:40`). A marca cobre **os bytes lidos (as partes `at_risk`)** e, para o upload final, o par exato
+`(buffer.Offset(dest_address), copy_size)` que ele testa (3.8.2, versão anterior desta seção). **Depende do T4.1**: o rastreador
+tem de ser conservador, sem UB: nenhum bloco tocado deixa de ser marcado nem reconhecido, **inclusive** faixas que cruzam 64 B,
+que cruzam a página do rastreador, que terminam exatamente no fim e de tamanho zero; hoje ele sai sem marcar quando o buffer passa
+do rastreador (`usage_tracker.h:51-53`, `:71-73`) e tem deslocamento indefinido para tamanho < 64 B (`:92-94`). A conferência
+`IsRegionUsed` logo depois do `MarkUsage` continua, como descarte contado (`blkcmp_discard_reorder_unprotected`): se o rastreador
+não reconhece a marca, **não se compara**.
+
+**3. Dependências Vulkan nos dois sentidos.** `MarkUsage` ordena só a reordenação do upload; **não substitui barreiras**.
+- *As escritas anteriores ficam visíveis à cópia:* `runtime.CopyBuffer(staging, buffer, copies, true)` grava a barreira anterior
+  (`READ_BARRIER`: escrita de memória → leitura/escrita de transferência, `vk_buffer_cache.cpp:466-471`, `:489-491`), a mesma
+  que o `DownloadBufferMemory` usa (`:2176-2189`).
+- *A cópia termina de ler antes das sobrescritas posteriores:* a barreira posterior (`WRITE_BARRIER`, de `TRANSFER` para
+  gráficos/compute, `:492-499`) dá a dependência de execução. Uma leitura seguida de escrita (WAR) precisa só de dependência de
+  execução, e ela existe no fim do `Record` da cópia; os `CopyBuffer` posteriores têm a barreira anterior própria.
+- *A escrita no staging fica visível à CPU:* não há barreira de host; vale a premissa do `DownloadBufferMemory` (lê o `mapped_span`
+  depois de esperar a GPU). **A confirmar:** que a memória `MemoryUsage::Download` do pool é coerente com o host ou que a espera
+  do tick a torna visível; se não for, a implementação precisa de uma invalidação e o desenho passa a pedi-la.
+
+**4. Staging reservado até a comparação na CPU terminar, com o mecanismo diferido.** `runtime.DownloadStagingBuffer(total, true)`
+(`vk_buffer_cache.cpp:392`, `vk_staging_buffer_pool.cpp:103-108`): o `TryGetReservedBuffer` marca a entrada com `tick = max` e
+`deferred = true` (`:200+`), e nenhuma outra requisição a reaproveita (`is_free` exige `!entry.deferred`, `:187-189`) até o
+`FreeDeferred` (`:110-120`), que grava `tick = CurrentTick()` e `deferred = false`. **Quem libera, e uma vez só:** a entrada da fila
+do `blkcmp` tem um estado (`em voo` → `comparando` → `liberada`) e é a **única dona** do `StagingBufferRef`; a liberação
+(`runtime.FreeDeferredStagingBuffer`) acontece no mesmo passo que tira a entrada da fila, sob o `buffer_cache.mutex`, que
+serializa todos os pontos de conclusão (ponto 7). O `FreeDeferred` tem `ASSERT(it->deferred)` (`:117`): uma segunda liberação
+acusa. A fila é **separada** do `async_buffers_death_ring` do download normal (`buffer_cache.h:119-123`, `:739`), e o `index`
+do staging é único, então os dois nunca liberam o mesmo.
+
+**5. Payload próprio e imutável.** Na captura, a entrada **copia** os bytes comparados do `inlined_buffer` (só as partes
+`at_risk`, ≤ 4096 B no total, num vetor da própria entrada), mais o mapeamento das partes `(addr, size, desl_no_staging)` e os
+metadados `{addr, size, mask, lots, papel da thread, tick, instante do sorteio}`. Nada guarda ponteiro para o `tmp_buffer` (que
+o próximo `CachedWriteMemory` reaproveita, `buffer_cache.h:159-162`), para o `BlkcmpRequest` `thread_local` (que o escopo apaga) nem
+para um `Buffer` (que `DeleteBuffer` pode remover): a comparação só precisa do staging, que a entrada possui, e do payload copiado.
+
+**6. Conclusão ligada à submissão que contém a cópia.** Depois de gravar a cópia, a entrada guarda `tick = runtime.CurrentTick()`
+(`vk_buffer_cache.cpp:431-433`), lido **depois** do `Record` (a cópia está no contexto desse tick; nenhuma submissão acontece
+dentro de `Record`: ela é explícita, `vk_scheduler.cpp:67-75`; **a conferir na implementação**, com uma asserção de que o tick não
+mudou entre antes e depois da gravação). A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
+`vk_master_semaphore.h:42`), a mesma regra pela qual o pool reaproveita um staging (`vk_staging_buffer_pool.cpp:187-189`).
+**Nunca** o syncpoint do guest nem um callback de fence do jogo (em Fast eles correm cedo), e **nunca** forçar uma submissão:
+`Finish`, `Flush` e `Wait` ficam fora. Uma entrada cujo tick não passou fica pendente, sem custo.
+
+**7. Fila limitada e encerramento.**
+- *Limites:* `EDEN_LIST_DIAG_BLKCMP_INFLIGHT` pedidos em voo (padrão **8**) e **64 KiB** de staging em voo (a soma de `total`). No limite, a
+  observação **nova** é descartada (`blkcmp_discard_queue_full`) **sem bloquear** e sem sair do ramo normal do upload.
+- *Onde a comparação roda:* na CPU, sob o `buffer_cache.mutex`, em **dois pontos de conclusão**: (a) no começo de
+  `BufferCache::BlkcmpCapture` (a thread que aplica, a de trás ou a da frente depois de `DrainBack`), no máximo 4 entradas por
+  chamada; (b) em `BufferCache::TickFrame` (`buffer_cache.h:85-123`, sob o mutex em `vk_rasterizer.cpp:1194-1197`), todas as
+  prontas. Em ambos: `IsFree(tick)`, comparar o staging com o payload copiado (3.8.3), contar, **liberar o staging**, tirar da fila.
+  O `papel da thread` contado é o da **captura**, guardado na entrada, não o de quem conclui. **Não** se usa o `PopAsyncBuffers`
+  (`buffer_cache.h:728-736`) para processar a comparação: ele é o caminho do download publicado (problema A) e acoplar um ao
+  outro misturaria os dois diagnósticos.
+- *Encerramento:* o resumo (no `NotifyShutdown`) imprime **comparados**, **pendentes** (entradas ainda na fila, com o tick ainda
+  não livre) e, na destruição do `BufferCache`, **cancelados**: entre os pendentes, os que a GPU já terminou são comparados e
+  liberados; os que não terminaram **não são liberados** (o staging e o pool pertencem ao destruidor do pool, que só o faz com a
+  GPU ociosa) e contam `blkcmp_cancelled`. Só se libera o que a GPU não usa mais.
+
+**Contadores novos:** `blkcmp_pending` (medidor: entradas em voo agora, e `blkcmp_pending_max`), `blkcmp_cancelled`,
+`blkcmp_discard_queue_full`, `blkcmp_discard_reorder_unprotected`, `blkcmp_latency_us_sum/_max/_n` (da captura à conclusão). A
+identidade passa a ser `drawn = compared + descartes + pendentes + cancelados`, com o resíduo, só no resumo final. O modo vem na
+linha "ligado" e no resumo (`blkcmp=async inflight=.. bytes=..`).
+
+**Perturbação declarada (hipótese, a medir):** uma cópia de até 4 KiB, duas barreiras, a perda da reordenação **das faixas
+marcadas**, o adiamento do reset do rastreador desse buffer até o `TickFrame` seguinte, e a comparação na CPU depois. Sem `Finish`,
+o custo por comparação não cresce com a fila da GPU, então o orçamento padrão pode subir: **proposta 20/s sustentado, rajada 20**,
+a confirmar pela medição de `blkcmp_latency_us_*` e pelo `other busy`.
+
+**Testes.**
+*No harness* (a máquina de estados é código de `list_diag/`, sem Vulkan, com um **relógio de ticks falso** e um **pool falso que
+conta as liberações**): a entrada guarda o payload por cópia (mudar o buffer de origem depois da captura não altera a
+comparação); só conclui quando o tick é livre (antes: pendente); conclusão fora de ordem de ticks; liberação **exatamente uma vez**
+por entrada (a segunda tentativa não libera e é acusada); limite de pedidos e de bytes (`queue_full`, sem bloquear, a entrada nova
+descartada); o papel da thread é o da captura; encerramento: comparados, pendentes e cancelados separados e a identidade; nenhum
+`Finish`, `Flush` ou `Wait` chamado pelo caminho (o pool falso conta); o orçamento e o sorteio como na versão síncrona.
+*Só por leitura e no build do usuário:* que o `MarkUsage` impede de fato a reordenação (precisa do T4.1); as barreiras e a
+visibilidade ao host (ponto 3); que o tick lido depois do `Record` é o da cópia (ponto 6); o `delayed_destruction_ring` (ponto 2);
+a liberação do staging deferido no `BufferCache` real; o custo. A confirmação é o log: `blkcmp_discard_reorder_unprotected` perto de
+zero, `blkcmp_pending_max` abaixo do limite, `cancelled` zero em encerramento limpo, e as diferenças da versão síncrona
+reaparecendo (ou não) com o mesmo padrão.
+
 ## 4. Problema A: janela do pop (contadores e logs próprios)
 
 **Definição do evento** (item 1a): *um pop (download antigo publicado) que grava bytes cobertos por um **aviso
