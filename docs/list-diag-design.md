@@ -492,8 +492,9 @@ serializado por `sys_core_guard`, `core/memory.cpp:709-717`), então `load` + `s
    `blk_incomplete_gpu_bytes` recebe o que o T3a teria afirmado (a identidade do teste de `N=1`, 3.7.7).
 
 **Proposição (nunca falso "completo").** Se a aplicação de uma faixa `R` da amostra afirma `blk_affirmed`, então todo
-aviso amostrado `n` do núcleo `c` com bytes em `R` e lote retirado `X = lots[c]` tem o seu registro **em `exact`**
-(aposentado por esta aplicação).
+aviso amostrado `n` do núcleo `c` com bytes em `R` e lote retirado `X = lots[c]` tem os seus bytes **em `exact`**.
+(Não se afirma que o registro foi aposentado: `Retire` pode perder a marca `applied` e o `emplace_back` acontece
+assim mesmo, `protocol.h:295-296`; revisão de `9311e7a`.)
 
 *Premissas:* (π1) o único produtor é `CollectNotice` (`grep` em `src/`, fora de testes: nenhum outro `Collect`,
 **verificado**; os produtores estrangeiros são o T3c); (π2) as faixas finais de um lote são disjuntas (a junção de
