@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página, cobertura declarada e caminho quente) implementado em `c700e86`, aguardando a medição do usuário (desenho na seção 3.7); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a medido (8.4: −20% de draws/s no FE); T3a.1 implementado em `c700e86` e medido (8.5: −1,3% com N=8; o B afirmado em ~40% das faixas amostradas sobre bytes da GPU; estouro ainda em 45% dos avisos amostrados); próximo: o desenho do T3a.2 (`blkcmp`); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -1126,6 +1126,66 @@ Leitura:
 **Consequência para o plano:** a próxima mudança do diagnóstico precisa baixar o custo, subir a cobertura e
 **declarar a cobertura incompleta** quando ela ocorrer, tudo junto. Aumentar o ledger sem mexer no caminho quente
 aumentaria o custo. Escopo do T3a.1: seção 11, revisão 4.
+
+### 8.5 Medições do T3a.1 (rodada 3, 2026-11-06)
+
+**Rodadas (medido pelo usuário; configuração conferida na linha `ligado` de cada log).** O build é de `c700e86` ou
+posterior: a linha `ligado` traz a amostra, e a linha `Dirty 2 KiB` não tem mais a chave. FE no lugar de sempre
+(25 s depois de carregar o save, parado), `EDEN_BACK_THREAD_STATS=1` em todas: 3a e 3c desligados; 3b e 3d com
+`pop,blk` e `N=8`; 3e com `pop` e `N=1`. Bananza: uma rodada `pop,blk` com `N=8`. Nenhuma violação de P0. Zero
+cruzamentos de 2 KiB. **Todas as identidades de conservação fecham com resíduo 0** nos quatro resumos.
+
+**Custo no FE (amostras com a trás ≥ 85%):**
+
+| Rodada | Diag | draws/s | `other busy` | Lotes de escritas seguradas |
+| --- | --- | --- | --- | --- |
+| 3a | desligado | 79 610 (5) | 15,0% | ~397/s, 27 trechos cada |
+| 3c | desligado | 78 846 (4) | 15,0% | ~405/s, 27 |
+| 3b | `pop,blk`, N=8 | 77 691 (4) | 16,2% | ~524/s, 21 |
+| 3d | `pop,blk`, N=8 | 78 735 (5) | 16,3% | ~520/s, 21 |
+| 3e | `pop`, N=1 | 71 394 (5) | 20,9% | ~857/s, 13 |
+
+- **`pop,blk` com N=8: −1,3%** (79 228 → 78 213). O ruído entre rodadas iguais foi de 1,0% e 1,3%, então o custo está
+  na borda do ruído e bem dentro do orçamento de 5%. No T3a era −20,0%. Medido com as estatísticas ligadas nos dois
+  braços: vale para essa configuração (7.4.1).
+- **A perturbação dos lotes diminuiu, mas não sumiu:** 1,3 vez mais lotes com N=8 (contra 2,6 vezes no T3a). Com
+  `pop` e N=1, −9,9% e 2,1 vezes mais lotes, com o `other busy` em 20,9%. A perturbação acompanha o custo por aviso:
+  é compatível com a hipótese 2 da 3.7.8, mas ainda não a prova.
+- **`InvalidateGPUCache` (contadores do D1, mesmo trecho):** desligado ~1 800/s com ~400/s com dados; N=8 ~1 780/s
+  com ~520/s com dados; N=1 ~1 630/s com ~860/s com dados. O número de chamadas quase não muda; muda quantas
+  encontram dados.
+
+**Cobertura e magnitude (resumos finais):**
+
+| Medida | 3b (N=8) | 3d (N=8) | 3e (`pop`, N=1) | Bananza (N=8) |
+| --- | --- | --- | --- | --- |
+| Avisos vistos / amostrados (fração de avisos) | 28,5 mi / 3,43 mi (0,120) | 29,1 mi / 3,45 mi (0,119) | 26,7 mi / todos | 21,2 mi / 2,45 mi (0,116) |
+| Amostrados que estouraram o ledger | **45%** | **45%** | **85%** | **54%** |
+| Faixas amostradas sobre bytes da GPU | 22 636 | 19 412 | — | 6 569 |
+| … ambíguas / incompletas / **afirmadas** | 47% / 10% / **43%** | 50% / 12% / **38%** | — | 74% / 9% / **16%** |
+| B: `at_risk` nas afirmadas / `not_seen_cpu_read` | 387 KB / 92% | 283 KB / 89% | — | 44 KB / 92% |
+| `at_risk` que o T3a teria afirmado nas incompletas | 404 KB | 408 KB | — | 147 KB |
+| A: pops sobre aviso / registros / bytes | 6 / 62 / 268, todos `equal` | 3 / 29 / 124, todos `equal` | **24 / 1 144 / 5 252, todos `equal`** | 4 / 103 / 544, 1 `different` |
+| Trocas de thread no `InvalidateGPUCache` | 1 | 1 | 1 | 24 249 |
+
+Leitura:
+- **O B existe nas faixas afirmadas.** São faixas com cobertura completa demonstrada: 43% e 38% das faixas amostradas
+  do FE que cobrem bytes da GPU. Nelas a aplicação sobe por cima de bytes da GPU que a CPU não escreveu, ~40 B por
+  faixa afirmada em média, e ~90% desses bytes estão fora de `cpu_read_ranges`. **Continua sendo limite superior**:
+  falta saber se os bytes do guest diferem dos da GPU, que é o que o T3a.2 (`blkcmp`) mede.
+- **O T3a superestimava o B.** Nas faixas que o T3a.1 declara incompletas, o T3a teria afirmado mais `at_risk` (404 KB) do
+  que existe nas afirmadas (387 KB). Era o buraco do overflow parcial que o revisor apontou (revisão 4).
+- **O estouro continua alto, por rajada.** Com N=8 são ~78 mil avisos amostrados/s e vida média de 7,5 ms: pela lei de
+  Little, ~570 registros vivos em média, abaixo dos 1 024 slots por núcleo. Mesmo assim, 45% estouram. Os avisos devem
+  chegar em rajadas, muitos de uma vez antes de uma aplicação (**hipótese**). Como `floor_raises` é pequeno (1 860), o
+  estouro se concentra em poucos lotes, e por isso só 10% das faixas saem incompletas.
+- **Muitos avisos repetem o mesmo bloco** (**hipótese**): ~650 mil avisos/s contra ~11 mil trechos finais por segundo,
+  ~60 avisos por trecho. Cada aviso ocupa um registro próprio. Juntar os registros por `(núcleo, lote, bloco de 64 B)`, com
+  máscara dos bytes escritos, deve eliminar quase todo o estouro. Isso muda o protocolo dos slots e é candidato a T3a.3.
+- **A, com todas as páginas (3e):** 24 pops sobre 1 144 registros, todos `sample_equal`, com 85% de estouro. Continua
+  sendo um piso com cobertura de ~15%.
+- **Bananza:** ambíguo domina (74%), por sobreposição com outros lotes (`apply_overlap_ambiguous_lot` 9 265). As trocas
+  de thread (24 mil) não violam a P0. Sem rodada desligada, não há custo.
 
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 

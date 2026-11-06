@@ -175,6 +175,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - A revisão do diff do D1 (`dee6963`) chegou depois do A/B: aprovado, sem defeito bloqueador. A correção de
   interpretação e a leitura dos contadores foram aplicadas ao 7.4.1. O comentário deslocado já tinha saído em
   `7addd24`. **O diff do T3a.1 (`c700e86`) ainda não foi revisado.**
+- Rodada 3 (T3a.1 em casa): `docs/list-diag-design.md` 8.5. `pop,blk` com N=8 custa −1,3%; a conservação fecha com
+  resíduo 0; o B aparece nas faixas afirmadas (limite superior); o estouro continua em 45% por rajadas. Proposta do
+  planejador: T3a.2 (`blkcmp`) agora, para medir se os bytes da GPU que a aplicação sobrescreve diferem do guest; a
+  junção de registros por `(núcleo, lote, bloco)` vira candidata a T3a.3, porque muda o protocolo dos slots.
 
 ## 8. Armadilhas
 
