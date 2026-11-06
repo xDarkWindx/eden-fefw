@@ -992,7 +992,7 @@ registro da cópia e a sua execução, e como cada um fica atrás da cópia:
 | O upload final (`InlineMemoryImplementation`, `:2123-2133`) | `CanReorderUpload` (`vk_buffer_cache.cpp:448-458`) devolve `false` se `IsRegionUsed(dst_offset, size)` (`:455`); o upload vai pelo `Record` do cmdbuf principal (`:487-499`), depois da cópia, e não pelo `upload_cmdbuf`, que executa antes (`:480-486`) |
 | Os uploads do `SynchronizeBuffer` (`MappedUploadMemory`, `:2093-2094`, `CanReorderUpload` por cópia) | o mesmo teste, cópia a cópia, contra as faixas marcadas |
 | Outras escritas em ordem de comando (`CopyBuffer` do cache, `ClearBuffer`, DMA) | gravadas no cmdbuf principal **depois** da cópia, em ordem de gravação; a ordem entre elas é a das barreiras (ponto 3) |
-| Substituição do buffer (`JoinOverlap`, `buffer_cache.h:1891-1912`, `DeleteBuffer`, `:2254`) | a cópia lê o `VkBuffer` antigo; o novo recebe a cópia do antigo **depois** dela, em ordem. **Não há prova de que o anel de destruição cubra a cópia** (revisão de `825c5b3`, item 2): `DelayedDestructionRing::Tick()` (`delayed_destruction_ring.h:20-23`) avança um índice e destrói o vetor daquela posição **sem consultar fence nem tick da GPU**; o cache o avança uma vez por `TickFrame` (`buffer_cache.h:118`), e `TICKS_TO_DESTROY` é 6 ou 8 frames (`buffer_cache_base.h:525-527`). Frames não são ticks da GPU: com a GPU atrasada mais que isso, o `VkBuffer` pode ser destruído antes de a cópia executar. O staging diferido protege o **destino**, não a **fonte**. **Decisão:** segurar a fonte até o tick da cópia (abaixo, "Retenção da fonte") |
+| Substituição do buffer (`JoinOverlap`, `buffer_cache.h:1891-1912`, `DeleteBuffer`, `:2254`) | a cópia lê o `VkBuffer` antigo; o novo recebe a cópia do antigo **depois** dela, em ordem. **Não há prova de que o anel de destruição cubra a cópia** (revisão de `825c5b3`, item 2): `DelayedDestructionRing::Tick()` (`delayed_destruction_ring.h:20-23`) avança um índice e destrói o vetor daquela posição **sem consultar fence nem tick da GPU**; o cache o avança uma vez por `TickFrame` (`buffer_cache.h:118`), e `TICKS_TO_DESTROY` é 6 ou 8 frames (`buffer_cache_base.h:525-527`). Frames não são ticks da GPU: com a GPU atrasada mais que isso, o `VkBuffer` pode ser destruído antes de a cópia executar. O staging diferido protege o **destino**, não a **fonte**. **Decisão:** reter a fonte até o maior tick, marcando as entradas, e devolvê-la ao anel (abaixo, "Retenção da fonte") |
 
 **`MarkUsage` da região lida.** O mecanismo que alimenta `CanReorderUpload` é `Buffer::MarkUsage` (`vk_buffer_cache.cpp:125-128`,
 `usage_tracker.h:40`). A marca cobre **os bytes lidos (as partes `at_risk`)** e, para o upload final, o par exato
@@ -1015,13 +1015,25 @@ não reconhece a marca, **não se compara**.
   `HOST_CACHED | HOST_COHERENT`, `vulkan_memory_allocator.cpp:96-99`, e a alocação usa `requiredFlags = 0`, `:289-293`; inventário 7.7).
   Depois de `IsFree(tick)` e **antes** da comparação, o `blkcmp` invalida o staging por `StagingBufferPool::Invalidate(ref)` (3.8.10).
 
-**Retenção da fonte (revisão de `825c5b3`, item 2).** A entrada guarda o `buffer_id` da fonte, **não** um ponteiro, e a lista de
-`BufferCache::blkcmp_held_` guarda `{Buffer, tick}`. `DeleteBuffer` (`buffer_cache.h:2254`, o `delayed_destruction_ring.Push` está em `:2312`),
-só quando o modo assíncrono tem entrada pendente com esse `buffer_id`, sem `source_released` e com `!IsFree(tick)`, **move o `Buffer`
-para a lista de retenção em vez de para o anel**, e marca a entrada `source_released` (o `buffer_id` pode ser reaproveitado pelo
-`SlotVector` depois, e a entrada não pode segurar o buffer novo). A lista é esvaziada nos mesmos pontos de conclusão, quando `IsFree(tick)`.
-O caminho normal do `DeleteBuffer` (sem entrada pendente, ou diagnóstico desligado) **não muda**. `JoinOverlap` (`:1911`) e o coletor de lixo
-(`:79`) chegam por `DeleteBuffer`, então estão cobertos. A retenção não força submissão: o tick passa com o fluxo normal.
+**Retenção da fonte (revisões de `825c5b3` e de `29ea216`).** O ajuste anterior (segurar o buffer até o tick **da cópia**) destruía cedo
+demais: o buffer pode ter **outros usos depois da cópia** (cópia no tick `T`, outro uso em `T+1`, `DeleteBuffer`, `T` termina com `T+1` ainda
+executando), e pode haver **várias capturas pendentes da mesma fonte**. A regra é:
+- **Todas as capturas da fonte:** `DeleteBuffer` (`buffer_cache.h:2254`; o `delayed_destruction_ring.Push` está em `:2312`) percorre a fila do
+  `blkcmp` e considera **todas** as entradas pendentes cujo `buffer_id` é o deste buffer e que ainda não foram marcadas `source_released`.
+- **O maior tick:** o buffer é retido até o **maior** `tick` entre essas entradas, e não até o da primeira (uma cópia mais nova pode estar
+  num tick maior; o uso posterior à cópia mais nova **não** é coberto por nenhum dos ticks das cópias, e por isso a retenção usa
+  `max(tick das cópias, CurrentTick() no momento do DeleteBuffer)`: o tick de agora cobre tudo o que já foi gravado até a remoção).
+- **Contra o reuso do `buffer_id`:** todas essas entradas são marcadas `source_released` na mesma passada (o `SlotVector` pode dar o mesmo
+  `buffer_id` a um buffer novo, e uma entrada marcada nunca mais retém o buffer novo; uma entrada **nova**, capturada depois, é sobre o
+  buffer novo e não sobre o removido).
+- **O objeto vai para a lista de retenção** `BufferCache::blkcmp_held_` (`{Buffer, tick}`), **em vez de** ir para o anel. A lista é
+  esvaziada nos mesmos pontos de conclusão, quando `IsFree(tick)`.
+- **No fim da retenção, devolve ao mecanismo normal de destruição adiada:** quando `IsFree(tick)`, o objeto é **empurrado para o
+  `delayed_destruction_ring`** (`Push`, o mesmo de `:2312`), **nunca destruído direto**. A alternativa seria provar que todos os usos anteriores
+  à remoção terminaram, o que exige uma garantia mais ampla que esta; devolver ao anel mantém a garantia que o resto do cache já
+  supõe depois da retenção.
+- O caminho normal do `DeleteBuffer` (sem entrada pendente, ou diagnóstico desligado, ou modo síncrono) **não muda**. `JoinOverlap`
+  (`:1911`) e o coletor de lixo (`:79`) chegam por `DeleteBuffer`. A retenção não força submissão.
 
 **4. Staging reservado até a comparação na CPU terminar, com o mecanismo diferido.** `runtime.DownloadStagingBuffer(total, true)`
 (`vk_buffer_cache.cpp:392`, `vk_staging_buffer_pool.cpp:103-108`): o `TryGetReservedBuffer` marca a entrada com `tick = max` e
@@ -1046,8 +1058,12 @@ mudou entre antes e depois da gravação). **Por que a leitura depois do `Record
 crescem; a cópia foi gravada no contexto de tick `T0`, e `T1 = CurrentTick()` lido depois é `>= T0`, então esperar `IsFree(T1)` é
 conservador (no pior caso uma submissão alheia entre a gravação e a leitura atrasa a conclusão). O que seria **inseguro** é ler antes
 da gravação. `RecordWithUploadBuffer` só grava no chunk ou chama `DispatchWork()` (`vk_scheduler.h:107-113`); quem avança o tick é o
-`SubmitExecution`, explícito (`vk_scheduler.cpp:67-75`). A exclusão entre os produtores do scheduler continua sendo premissa só para
-a asserção "o tick não mudou", que é diagnóstica. A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
+`SubmitExecution`, explícito (`vk_scheduler.cpp:67-75`). **A exclusão entre os produtores do scheduler é requisito próprio, não só do argumento do tick**
+(revisão de `29ea216`): o `Record` mexe em estado compartilhado do scheduler (o chunk, o contexto), e um tick que só cresce não torna seguras
+chamadas concorrentes. A captura grava a cópia sob o `buffer_cache.mutex`, na thread que aplica, e só é correta se **nenhuma outra
+thread grava no scheduler ao mesmo tempo**: é a convenção que o resto do código do rasterizador já segue (a trás, ou a frente depois de
+`DrainBack`; 3.3). A implementação assíncrona a declara como precondição, como a P0, e a vigia (uma asserção de diagnóstico de que o
+tick lido não mudou entre antes e depois da gravação); ela **não** a faz valer. A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
 `vk_master_semaphore.h:42`), a mesma regra pela qual o pool reaproveita um staging (`vk_staging_buffer_pool.cpp:187-189`).
 **Nunca** o syncpoint do guest nem um callback de fence do jogo (em Fast eles correm cedo), e **nunca** forçar uma submissão:
 `Finish`, `Flush` e `Wait` ficam fora. Uma entrada cujo tick não passou fica pendente, sem custo.
@@ -1120,7 +1136,8 @@ incorporados acima (3.8.9, pontos 2, 3, 6 e 7, "Retenção da fonte" e o orçame
    continua dependendo da exclusão entre os produtores do scheduler.
 5. **20/s** é orçamento experimental. Tirar o `Finish` remove aquela espera, não toda a interferência: continuam as
    barreiras, as restrições de reordenação e a pressão na fila.
-**Revisão de `29ea216` (pendências da versão assíncrona, antes do código dela; o codador atualiza o texto acima):**
+**Revisão de `29ea216` (pendências da versão assíncrona, antes do código dela). O texto acima (3.8.9, "Retenção da fonte" e a exclusão
+entre os produtores) e a 3.8.10 já a incorporam:**
 - **A retenção da fonte pode destruir cedo demais.** O buffer pode ter usos depois da cópia (cópia no tick T, outro uso em
   T+1, `DeleteBuffer`, T termina com T+1 ainda executando), e pode haver várias capturas pendentes da mesma fonte. Ajuste
   mínimo:
@@ -1160,7 +1177,9 @@ No assíncrono, o mesmo, **depois** de `IsFree(tick)` e antes da comparação (3
 **Campo no log e no resumo.** `Protocol::BlkcmpCompare` ganha o parâmetro `bool staging_coherent`. Contadores novos:
 `blkcmp_staging_coherent` e `blkcmp_staging_invalidated` (`compared = coherent + invalidated`, uma identidade a mais no resumo final). A
 linha de diferença do log ganha `staging=coherent|invalidated`. O resumo diz: `staging: coerente em N de M comparações, invalidado em K`.
-Interpretação: **se K for zero**, a memória do usuário era coerente e o resultado da 8.6 não dependia disso; **se K for maior que zero**, as
+**`staging=coherent` numa rodada nova vale para as alocações daquela rodada** (revisão de `29ea216`); **não prova o tipo das alocações antigas**,
+nem que a 8.6 foi lida com memória coerente. A evidência que conta é a medição nova, com a invalidação certa. Interpretação: **se K for zero**,
+a memória daquela rodada era coerente e o resultado novo não depende disso; **se K for maior que zero**, as
 diferenças da 8.6 podem incluir leitura de dados velhos do próprio staging (nesse caso o resultado se repete com a invalidação antes de se
 tirar conclusão). Até a primeira rodada com o campo, a 8.6 continua dizendo que **supõe coerência**.
 
