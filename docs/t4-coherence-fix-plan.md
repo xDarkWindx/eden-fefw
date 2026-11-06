@@ -162,7 +162,7 @@ A reprodução dirigida e o `blkcmp` assíncrono seguem em paralelo, sem ampliar
 
 ## 9. T4.1: o `UsageTracker` conservador e sem UB (desenho; sem código)
 
-**Estado: desenho, sem código.** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
+**Estado: implementado (commit B do T4.1), com a chave temporária `EDEN_USAGE_TRACKER_OLD=1` para o A/B; o texto abaixo descreve o que foi implementado, com os ajustes da revisão 3.** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
 (`list-diag-design.md` 3.8.9, ponto 2). Números de linha de `video_core/buffer_cache/usage_tracker.h`, salvo dito.
 
 ### 9.1 O contrato
@@ -205,21 +205,35 @@ e a máscara deslocada por `fb`, os bits que passam de 63 se perdem no deslocame
 
 ### 9.3 A conta nova
 
-Para `size > 0` e `offset <= UINT64_MAX - (size - 1)` (senão, `last = UINT64_MAX`, que cai em T-5):
+Implementado em `video_core/buffer_cache/usage_tracker.h` (`Track`, `IsUsed`, `BlocksOf`, `PageMask`). Com os ajustes da revisão 3:
 
 ```
-first_block = offset >> 6
-last_block  = (offset + (size - 1)) >> 6
-first_page  = first_block >> 6          // 64 blocos por palavra
-last_page   = last_block  >> 6
-para page em first_page .. last_page:
-    lo = (page == first_page) ? first_block & 63 : 0
-    hi = (page == last_page)  ? last_block  & 63 : 63
-    mask(page) = (~u64{0} << lo) & (~u64{0} >> (63 - hi))      // lo, hi em 0..63: deslocamentos em 0..63
-Track:  pages[page] |= mask(page)      (páginas >= pages.size() ignoradas; dirty_begin/end = [first_page, min(last_page, pages.size() - 1) + 1))
-IsUsed: algum (pages[page] & mask(page)) != 0, ou alguma página >= pages.size() tocada
-size == 0: Track não faz nada; IsUsed = false
+Track(offset, size):
+    size == 0: retorna, ANTES de qualquer `size - 1`
+    cache `recent` (par exato já rastreado desde o Reset): retorna
+    (first_block, last_block) = (offset >> 6, saturado(offset + (size - 1)) >> 6)      // saturado: não dá a volta em 64 bits
+    (first_page, last_page)   = (first_block >> 6, last_block >> 6)                      // 64 blocos por palavra
+    pages vazio, ou first_page >= pages.size(): retorna SEM mexer em dirty_begin/dirty_end   // sem interseção
+    last = min(last_page, pages.size() - 1)                                              // só a interseção com as páginas que existem
+    dirty_begin = min(dirty_begin, first_page);  dirty_end = max(dirty_end, last + 1)
+    para page em first_page .. last:  pages[page] |= PageMask(page)
+IsUsed(offset, size):
+    size == 0: false
+    last_page >= pages.size(): TRUE na hora (faixa não vazia que passa da extensão)
+    para page em first_page .. last_page:  (pages[page] & PageMask(page)) != 0  ->  true
+PageMask(page): ~0 para as páginas do meio (palavra inteira: nenhum trabalho por bloco);
+    nas pontas, lo = first_block & 63 (primeira página) ou 0, hi = last_block & 63 (última) ou 63;
+    mask = (~0 << lo) & (~0 >> (63 - hi))      // lo e hi em 0..63: nenhum deslocamento de 64
 ```
+
+`pages.size() - 1` só é calculado depois de `pages` ter ao menos uma palavra e de `first_page < pages.size()`. O laço de `Track`
+percorre no máximo `pages.size()` palavras (a interseção), nunca até o último endereço saturado. O modo antigo (`TrackOld`,
+`IsUsedOld`, `TrackPage`, `IsPageUsed`) continua no mesmo header, intacto, só para a chave temporária.
+
+**A chave temporária.** `EDEN_USAGE_TRACKER_OLD=1` liga o rastreador **antigo**; o novo é o padrão. É lida uma vez na partida
+(`UsageTrackerOldMode`) e fixada por instância no construtor, valendo para `Track` e `IsUsed` **juntos**, sem troca durante a execução. **Existe só para o
+A/B e será apagada**; o modo antigo conserva o UB conhecido (9.2). O relatório das estatísticas diz qual rastreador está ativo
+(linha "Upload reordering"). Uma rodada por braço é triagem: se os números ficarem próximos, repete-se em ordem alternada.
 
 **Cumpre o contrato.** T-1/T-2: `mask(page)` tem exatamente os bits `lo..hi` da palavra, ou seja, os blocos de `first_block..last_block`
 que caem naquela página; as páginas do meio são `~0`. Logo `Track(r1)` marca todo bloco tocado por `r1`, e `IsUsed(r2)` testa todo
@@ -243,13 +257,27 @@ dava falso positivo (casos 4 e 5). Isso é só ganho de reordenação.
 | `Buffer::ResetUsageTracking` (`vk_buffer_cache.h:64`) | `BufferCacheRuntime::TickFrame` (`vk_buffer_cache.cpp:424-428`) | nenhum, exceto `dirty_end` correto |
 | `blkcmp` (3.8) | `MarkUsage` na versão assíncrona | passa a poder confiar na marca |
 
-**É custo de desempenho, não de correção.** Marcar mais blocos pode **tirar a reordenação** de uploads que hoje são reordenados;
-marcar menos (os casos 1 e 4) pode **devolvê-la**. A reordenação existe para gravar o upload no `upload_cmdbuf`, que executa antes
+**O que o rastreador novo muda em cada grupo de `MarkUsage` (revisão 3, item 6; números de linha de `buffer_cache.h` de hoje, as
+unidades continuam deslocamento e tamanho em bytes dentro do buffer):**
+
+| Grupo (linhas) | O que marca | O que o rastreador novo muda |
+| --- | --- | --- |
+| Uniforms gráficos e de compute (`:1073`, `:1384`) | `(offset, size)` do uniform; `size` pode ser pequeno ou zero | `size = 0` deixa de marcar a palavra inteira (era UB): não marca nada e `IsUsed` é falso. `size < 64` marca só o(s) bloco(s) tocado(s), não os 4 KiB. Perde só os falsos positivos antigos; nunca um bloco tocado |
+| Storage segmentado (`:1239`) | cada segmento marca `(buffer.Offset(segment.device_addr), segment.size)` | as bordas parciais passam a marcar o bloco parcial do começo e do fim (o piso antigo os perdia); segmentos que terminam numa borda de 4 KiB deixam de marcar a palavra seguinte |
+| Vértices (`:902`, `:945`) | `(offset, binding.size)`, faixas grandes e repetidas | o cache `recent` continua (par idêntico = retorno imediato) e as palavras do meio são `~0` inteiras, sem trabalho por bloco; só as duas pontas são calculadas. O custo por faixa é o de hoje |
+| `JoinOverlap` e criação (`:1905`, `:1927`) | `(dst_offset, size)` da cópia e `(0, size_bytes)` do clear | continuam impedindo que um upload posterior passe à frente; a faixa que termina exatamente na borda marca até o último bloco tocado e não a palavra seguinte. `(0, size_bytes)` cobre a extensão inteira, e o último byte cai na última palavra (`(tamanho >> 12) + 1` palavras) |
+| Downloads (`:692`, `:2244`; era `:2232` na revisão) | `(copy.src_offset, copy.size)`, leitura da GPU | "uso" não é só escrita: um download também impede a sobrescrita antecipada do que ele lê; mesma marcação exata, e o bloco parcial final deixa de ficar de fora |
+| Cópias entre buffers e demais (`:275`, `:276`, `:311`, `:824`, `:1270`, `:1300`, `:1335`, `:1410`, `:1441`) | bindings e cópias, `(offset, size)` | a mesma regra; nenhuma muda de unidade |
+
+**Eliminar falsos negativos é correção de ordem de execução, não só desempenho** (revisão 3, item 3): um bloco tocado e não
+reconhecido deixa um upload passar à frente de um uso que ele não podia ultrapassar. O que muda o **desempenho** é a precisão a
+mais: marcar mais blocos (casos 2 e 3) pode **tirar a reordenação** de uploads que hoje são reordenados; marcar menos (os casos 1
+e 4, onde hoje a palavra inteira era marcada por UB) pode **devolvê-la**. A reordenação existe para gravar o upload no `upload_cmdbuf`, que executa antes
 dos draws do frame, **sem** `RequestOutsideRenderPassOperationContext` nem barreira dentro da passada (`CopyBuffer` com
-`can_reorder_upload`, `vk_buffer_cache.cpp:480-486`, contra `:487-499`). **Como medir:** hoje **não há contador** da reordenação
-(`grep reorder` em `video_core` só acha `CanReorderUpload` e a opção). Antes de mudar o rastreador, com as estatísticas ligadas,
-contar nos dois pontos de `CanReorderUpload`: uploads com `can_reorder` verdadeiro e falso, e os bytes de cada um (`BackStats`,
-atrás de `Enabled()`, no mesmo estilo do D1). A/B do usuário no FE, no mesmo lugar: a fração reordenada e os draws/s antes e depois;
+`can_reorder_upload`, `vk_buffer_cache.cpp:480-486`, contra `:487-499`). **Como medir (implementado):** com as estatísticas ligadas, a linha "Upload reordering" do relatório separa **permissão** (o que
+`CanReorderUpload` disse nos dois chamadores, `MappedUploadMemory` e `InlineMemoryImplementation`: pode / não pode, com os bytes) de
+**efeito** (o caminho que `BufferCacheRuntime::CopyBuffer` tomou: `upload_cmdbuf`, só quando a origem é o stream buffer **e** há
+permissão; em ordem vindo do stream buffer; em ordem, outras cópias; com os bytes). Permissão não é efeito (revisão 3, item 5). A/B do usuário no FE, no mesmo lugar: a fração reordenada e os draws/s antes e depois;
 o orçamento é o de `architecture-plan.md` 12.1.
 
 ### 9.5 Testes propostos (harness, `tools/list-diag-harness/`)
@@ -263,10 +291,12 @@ O `UsageTracker` é um header **sem Vulkan** (inclui só `<algorithm>`, `<array>
    64 bits. Em cada uma: `Track(r1)` e `IsUsed(r2)` batem com o oráculo (marcação exata; reconhecimento exato).
 2. **Aleatório** contra o oráculo: milhares de pares `(offset, size)` com `Reset` no meio; `IsUsed == oracle_overlap`; e a
    propriedade conservadora (nunca `false` quando o oráculo diz `true`).
-3. **Equivalência com o atual nas faixas alinhadas a 64 B**: uma cópia congelada do `UsageTracker` de `36b19ff` no teste
-   (marcada com `no_sanitize("shift")`, porque o caso 4 dispara o UB) e o novo, sobre as mesmas faixas alinhadas (`size >= 64`):
-   `novo_IsUsed ⇒ atual_IsUsed` **não** é exigido (o novo pode ser mais preciso), mas `oracle ⇒ novo` e `oracle ⇒ atual` valem, e
-   a diferença entre `atual` e `novo` só ocorre nos casos 4 e 5 (o teste classifica a diferença).
+3. **O oráculo é a referência normativa** (revisão 3, item 2); nada de `no_sanitize` no legado, que desliga a detecção e não define o
+   resultado. O legado (cópia congelada de `36b19ff` em `src/tests/video_core/usage_tracker_legacy.h`) é comparado **só nas
+   operações em que está definido** (`size >= 64` e, se a faixa cruza palavras, resto da última palavra `>= 64`), sob o UBSan: nas
+   faixas alinhadas o novo é igual ao oráculo e o legado nunca perde um bloco tocado, mas pode dizer "em uso" onde o oráculo diz
+   não (caso 5); nas não alinhadas o legado perde blocos (caso 2). Os casos que caem em UB no legado ficam em **um teste à
+   parte** (`T4.1 [6]`), que só calcula a contagem do deslocamento (64) e não executa o legado.
 4. **Cache `recent` e `Reset`**: o par repetido não muda o resultado; depois do `Reset` nada fica marcado (inclusive a última
    página e `dirty_end`); faixa que não passa de `dirty_end` anterior.
 5. **UBSan limpo** nos três builds, e o teste de cada caso 1 a 6 da tabela 9.2 falha com o rastreador atual (os que não são UB) e

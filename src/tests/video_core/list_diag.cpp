@@ -34,11 +34,13 @@
 
 #include "common/range_sets.h"
 #include "common/range_sets.inc"
+#include "video_core/buffer_cache/usage_tracker.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "video_core/list_diag.h"
 #include "video_core/list_diag/protocol.h"
 
 #include "list_diag_legacy_manager.h"
+#include "usage_tracker_legacy.h"
 #include "list_diag_t3a_frozen.h"
 
 namespace {
@@ -3155,4 +3157,292 @@ TEST_CASE("blkcmp [9]: the staging coherence is counted, logged and conserved (3
     }
     CHECK(text);
     CHECK(identity);
+}
+
+// =============================================================================================
+// T4.1: the UsageTracker (docs/t4-coherence-fix-plan.md, 9). The reference is the ORACLE of blocks: a set of the 64-byte
+// blocks that the ranges touched. Nothing here calls the old tracker where it has undefined behaviour, and no
+// sanitizer is switched off (the harness runs these under UBSan).
+
+namespace {
+
+constexpr u64 kUtBlock = 64;
+constexpr u64 kUtPage = 4096;
+
+/// The normative model of the contract (9.1): the blocks a non-empty range touches, from the block of its first byte to the
+/// block of its last byte (saturated). The tracker has `extent_pages` words, i.e. `extent_pages * 64` blocks.
+struct BlockOracle {
+    explicit BlockOracle(size_t buffer_size) : extent_blocks{((buffer_size >> 12) + 1) * 64} {}
+    u64 extent_blocks;
+    std::set<u64> marked;
+
+    static void Touched(u64 offset, u64 size, u64& first, u64& last) {
+        const u64 last_byte = (size - 1) > ~u64{0} - offset ? ~u64{0} : offset + (size - 1);
+        first = offset / kUtBlock;
+        last = last_byte / kUtBlock;
+    }
+    void Track(u64 offset, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        u64 first = 0, last = 0;
+        Touched(offset, size, first, last);
+        for (u64 b = first; b <= last && b < extent_blocks; ++b) {
+            marked.insert(b);
+        }
+    }
+    [[nodiscard]] bool IsUsed(u64 offset, u64 size) const {
+        if (size == 0) {
+            return false;
+        }
+        u64 first = 0, last = 0;
+        Touched(offset, size, first, last);
+        if (last >= extent_blocks) {
+            return true; // past the extent: unknown counts as in use (T-5)
+        }
+        for (u64 b = first; b <= last; ++b) {
+            if (marked.count(b) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    void Reset() {
+        marked.clear();
+    }
+};
+
+constexpr size_t kUtBuffer = 5 * kUtPage + 100; // 6 words, the last partial
+
+/// The same checks of one range pair `track` then `probe` against the oracle, on the NEW tracker.
+void CheckAgainstOracle(u64 track_offset, u64 track_size, u64 probe_offset, u64 probe_size) {
+    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    BlockOracle oracle{kUtBuffer};
+    INFO("track [" << track_offset << ",+" << track_size << ") probe [" << probe_offset << ",+" << probe_size << ")");
+    tracker.Track(track_offset, track_size);
+    oracle.Track(track_offset, track_size);
+    CHECK(tracker.IsUsed(probe_offset, probe_size) == oracle.IsUsed(probe_offset, probe_size));
+    // Never a false negative: what the oracle says is used, the tracker says.
+    if (oracle.IsUsed(probe_offset, probe_size)) {
+        CHECK(tracker.IsUsed(probe_offset, probe_size));
+    }
+}
+
+} // namespace
+
+TEST_CASE("T4.1 [1]: the cases of the contract against the oracle", "[list-diag][t41]") {
+    struct Case {
+        u64 offset, size;
+    };
+    // Inside a block; crossing a 64 B limit; ending exactly on a block edge; starting on one; one byte; 63; 64; 65.
+    const std::vector<Case> cases = {
+        {0, 1},      {10, 20},    {100, 64},   {100, 100},  {63, 2},     {64, 64},     {0, 64},      {1, 64},
+        {0, 63},     {0, 65},     {127, 2},    {128, 1},    {4032, 128}, {4000, 200},  {4095, 2},    {4096, 1},
+        {4064, 32},  {4096 - 64, 64}, {0, 4096}, {1, 4096}, {0, 4097},  {4000, 5000}, {0, kUtBuffer}, {kUtBuffer - 1, 1},
+        {kUtBuffer - 64, 64}, {kUtPage * 5, 100}, {kUtPage * 5 + 99, 1}, {kUtPage * 2, kUtPage}, {kUtPage * 2 - 1, kUtPage + 2},
+    };
+    for (const Case& t : cases) {
+        for (const Case& q : cases) {
+            CheckAgainstOracle(t.offset, t.size, q.offset, q.size);
+        }
+    }
+}
+
+TEST_CASE("T4.1 [2]: zero size, past the extent and a saturated offset + size", "[list-diag][t41]") {
+    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    BlockOracle oracle{kUtBuffer};
+    // Size zero: Track does nothing, IsUsed is false, even on a marked block.
+    tracker.Track(0, kUtBuffer);
+    oracle.Track(0, kUtBuffer);
+    CHECK(!tracker.IsUsed(100, 0));
+    CHECK(!tracker.IsUsed(0, 0));
+    tracker.Reset();
+    tracker.Track(500, 0);
+    CHECK(!tracker.IsUsed(0, kUtBuffer));
+    // Past the extent: a non-empty range answers true at once, and Track marks nothing.
+    CHECK(tracker.IsUsed(6 * kUtPage, 1));
+    CHECK(tracker.IsUsed(kUtBuffer, kUtPage * 4));
+    CHECK(tracker.IsUsed(5 * kUtPage, 2 * kUtPage)); // starts inside, ends past
+    tracker.Track(6 * kUtPage, 100); // no intersection: nothing changes
+    CHECK(!tracker.IsUsed(0, 6 * kUtPage));
+    // Saturated: offset + size would wrap.
+    constexpr u64 kMax = ~u64{0};
+    CHECK(tracker.IsUsed(kMax - 10, 100));
+    CHECK(tracker.IsUsed(kMax, 1));
+    CHECK(tracker.IsUsed(0, kMax));
+    tracker.Track(kMax - 10, 100);
+    tracker.Track(kMax, kMax);
+    tracker.Track(0, kMax); // marks the whole extent, with no loop over the saturated address
+    CHECK(tracker.IsUsed(0, 1));
+    CHECK(tracker.IsUsed(kUtBuffer - 1, 1));
+}
+
+TEST_CASE("T4.1 [3]: random ranges against the oracle, with Reset in the middle", "[list-diag][t41]") {
+    std::mt19937_64 rng{41};
+    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    BlockOracle oracle{kUtBuffer};
+    for (int i = 0; i < 60000; ++i) {
+        const u64 offset = rng() % (kUtBuffer + 64); // a few past the end
+        const u64 size = rng() % 3 == 0 ? rng() % 8 : rng() % (2 * kUtPage);
+        const unsigned op = static_cast<unsigned>(rng() % 12);
+        if (op == 0) {
+            tracker.Reset();
+            oracle.Reset();
+        } else if (op < 5) {
+            tracker.Track(offset, size);
+            oracle.Track(offset, size);
+        } else {
+            const bool got = tracker.IsUsed(offset, size);
+            const bool want = oracle.IsUsed(offset, size);
+            if (got != want) {
+                FAIL("i=" << i << " probe [" << offset << ",+" << size << ") tracker=" << got << " oracle=" << want);
+            }
+        }
+    }
+}
+
+TEST_CASE("T4.1 [4]: the recent cache, Reset and dirty_end, and ranges ending exactly on an edge", "[list-diag][t41]") {
+    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    const auto nothing_marked = [&] {
+        for (u64 b = 0; b < kUtBuffer; b += kUtBlock) {
+            if (tracker.IsUsed(b, kUtBlock)) {
+                return false;
+            }
+        }
+        return !tracker.IsUsed(0, kUtBuffer);
+    };
+    CHECK(nothing_marked());
+    // The same pair twice changes nothing; after Reset the pair is marked AGAIN (the cache was cleared with it).
+    tracker.Track(100, 100);
+    tracker.Track(100, 100);
+    CHECK(tracker.IsUsed(128, 1));
+    tracker.Reset();
+    CHECK(nothing_marked());
+    tracker.Track(100, 100); // would return early if `recent` survived the Reset
+    CHECK(tracker.IsUsed(128, 1));
+    tracker.Reset();
+    // Ranges that end exactly on a 64 B edge and on a 4 KiB edge mark the last block they touch and NOT the next one.
+    tracker.Track(0, 128);
+    CHECK(tracker.IsUsed(64, 64));
+    CHECK(!tracker.IsUsed(128, 64));
+    tracker.Reset();
+    tracker.Track(kUtPage - 128, 128);
+    CHECK(tracker.IsUsed(kUtPage - 64, 64));
+    CHECK(!tracker.IsUsed(kUtPage, 64)); // the next word is untouched (the old tracker marked all of it)
+    CHECK(!tracker.IsUsed(kUtPage, kUtPage));
+    tracker.Reset();
+    // The last words, for dirty_end: tracked, then cleared by Reset.
+    tracker.Track(kUtBuffer - 100, 100);
+    tracker.Track(4 * kUtPage, 2 * kUtPage); // ends past... inside the last word
+    CHECK(tracker.IsUsed(kUtBuffer - 1, 1));
+    tracker.Reset();
+    CHECK(nothing_marked());
+    // Whole words in the middle are marked and cleared.
+    tracker.Track(100, 4 * kUtPage);
+    CHECK(tracker.IsUsed(2 * kUtPage, 64));
+    tracker.Reset();
+    CHECK(nothing_marked());
+}
+
+TEST_CASE("T4.1 [5]: the old tracker compared only where it is defined; the alignment cases", "[list-diag][t41]") {
+    // The legacy runs ONLY for operations where its calculation has no undefined shift: size >= 64 and, for a range that
+    // crosses words, a last word with at least one block (the remainder after the last 4 KiB edge >= 64 B). Never
+    // under a sanitizer exemption.
+    const auto legacy_defined = [](u64 offset, u64 size) {
+        if (size < kUtBlock) {
+            return false;
+        }
+        const u64 end = offset + size;
+        if (offset / kUtPage == end / kUtPage) {
+            return true;
+        }
+        return end % kUtPage >= kUtBlock;
+    };
+    std::mt19937_64 rng{7};
+    unsigned legacy_misses = 0, legacy_false_positives = 0, compared = 0;
+    for (int round = 0; round < 400; ++round) {
+        VideoCommon::UsageTracker fresh{kUtBuffer, false};
+        LegacyUsage::UsageTracker legacy{kUtBuffer};
+        BlockOracle oracle{kUtBuffer};
+        for (int i = 0; i < 60; ++i) {
+            const bool aligned_only = round % 2 == 0;
+            u64 offset = rng() % kUtBuffer;
+            u64 size = kUtBlock + rng() % (3 * kUtPage);
+            if (aligned_only) {
+                offset &= ~(kUtBlock - 1);
+                size &= ~(kUtBlock - 1);
+                size = std::max<u64>(size, kUtBlock);
+            }
+            if (offset + size > kUtBuffer || !legacy_defined(offset, size)) {
+                continue;
+            }
+            if (rng() % 3 != 0) {
+                fresh.Track(offset, size);
+                legacy.Track(offset, size);
+                oracle.Track(offset, size);
+            } else {
+                ++compared;
+                const bool want = oracle.IsUsed(offset, size);
+                CHECK(fresh.IsUsed(offset, size) == want); // the oracle is the reference
+                const bool old = legacy.IsUsed(offset, size);
+                if (aligned_only) {
+                    // On aligned ranges the old tracker never missed a touched block ...
+                    if (want) {
+                        CHECK(old);
+                    }
+                    // ... and it may say "used" where the oracle says not (a single-page range tests from the start
+                    // of its word, 9.2 case 5): only a loss of reordering, never a wrong order.
+                    legacy_false_positives += (old && !want) ? 1 : 0;
+                } else {
+                    legacy_misses += (want && !old) ? 1 : 0;
+                }
+            }
+        }
+    }
+    CHECK(compared > 1000);
+    CHECK(legacy_misses > 0);          // the old tracker did miss touched blocks on unaligned ranges (9.2 case 2/3)
+    CHECK(legacy_false_positives > 0); // and did say "used" on aligned ranges where nothing was
+}
+
+TEST_CASE("T4.1 [6]: the defects of the old tracker, documented without running its undefined shift", "[list-diag][t41]") {
+    // The undefined shift of the old calculation is `~0 >> (64 - num_bits)` with num_bits = min(size, 4096) >> 6
+    // (usage_tracker.h:91-92 and :99-100 of 36b19ff): for size < 64 num_bits is 0 and the count is 64. This test
+    // only COMPUTES the count; it does not execute the shift (and the old tracker is not called with these sizes).
+    const auto old_shift_count = [](u64 size) { return 64 - (std::min<u64>(size, kUtPage) >> 6); };
+    for (const u64 size : {u64{1}, u64{16}, u64{63}}) {
+        CHECK(old_shift_count(size) == 64); // a shift by 64: undefined
+    }
+    CHECK(old_shift_count(64) == 63);
+    // A range ending exactly on a 4 KiB edge makes the old tracker use the NEXT word with a remainder of zero: count 64.
+    const u64 offset = kUtPage - 128, size = 128;
+    CHECK(((offset + size) % kUtPage) >> 6 == 0);
+    // The floor: [100, 164) touches blocks 1 and 2 and the probe [0, 100) touches blocks 0 and 1 (bytes 64..99 are block 1);
+    // the old calculation floors both to one block (size >> 6) and the probe tests only block 0: a FALSE NEGATIVE.
+    // Both operations are defined for the old tracker, so this runs on it, and shows what the new one does not have.
+    LegacyUsage::UsageTracker legacy{kUtBuffer};
+    legacy.Track(100, 64);
+    CHECK(!legacy.IsUsed(0, 100));       // block 1 is touched by both and the old tracker does not see it
+    VideoCommon::UsageTracker fresh{kUtBuffer, false};
+    fresh.Track(100, 64);
+    CHECK(fresh.IsUsed(0, 100));         // the new one does
+}
+
+TEST_CASE("T4.1 [7]: the temporary switch picks the tracker once, for Track and IsUsed together", "[list-diag][t41]") {
+    CHECK(!VideoCommon::ParseUsageTrackerOld(nullptr));
+    CHECK(!VideoCommon::ParseUsageTrackerOld("0"));
+    CHECK(!VideoCommon::ParseUsageTrackerOld(""));
+    CHECK(!VideoCommon::ParseUsageTrackerOld("11"));
+    CHECK(VideoCommon::ParseUsageTrackerOld("1"));
+    VideoCommon::UsageTracker old_mode{kUtBuffer, true};
+    VideoCommon::UsageTracker new_mode{kUtBuffer, false};
+    CHECK(old_mode.IsOldMode());
+    CHECK(!new_mode.IsOldMode());
+    // The mode of an instance never changes: the old one keeps the old false negative, the new one does not.
+    old_mode.Track(100, 64);
+    new_mode.Track(100, 64);
+    CHECK(!old_mode.IsUsed(0, 100));
+    CHECK(new_mode.IsUsed(0, 100));
+    // The default is the new tracker (the variable is not set in the harness).
+    VideoCommon::UsageTracker by_default{kUtBuffer};
+    CHECK(by_default.IsOldMode() == VideoCommon::UsageTrackerOldMode());
 }
