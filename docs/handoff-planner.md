@@ -162,6 +162,9 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - D1 implementado (`dee6963`, doc em `de5bc3d`). O planejador reproduziu o harness e a sensibilidade. Diff com o
   revisor. Medição: draws/s com as estatísticas ligadas nos dois braços (decisão e motivos em
   `docs/gpu-contract-inventory.md` 7.4.1), no lugar da separação custo/contagem que o revisor tinha sugerido.
+- A/B do D1 (7.4.1): custo −0,03% (ruído) e **zero** cruzamentos segurados no FE e no Bananza. A correção fica, a
+  chave sai e a contagem fica nas estatísticas. Próximo: o codador fecha o D1 e implementa o T3a.1 (desenho
+  fechado), e o diff vai ao revisor.
 
 ## 8. Armadilhas
 

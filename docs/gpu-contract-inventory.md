@@ -611,6 +611,37 @@ Protocolo: FE no mesmo lugar das rodadas a–d (25 s depois de carregar o save, 
 com `EDEN_DIRTY_SPLIT_2K=0` e sem ele, sem `EDEN_LIST_DIAG`. Bananza: duas rodadas, uma de cada, no mesmo ponto
 depois de carregar o save, anotando o chão.
 
+**Resultado do A/B (medido pelo usuário, 2026-11-06; logs `2a` a `2d` do FE e `banana2a`/`banana2b`).** Build com o
+D1, conferido pela linha `Dirty 2 KiB crossings` em todos os logs. A string de versão continua velha, como antes. A
+chave em cada log foi lida da própria linha (`on` em 2a, 2c e banana2a; `off` em 2b, 2d e banana2b). Lugar e
+configuração do protocolo acima: o FE parado no ponto de sempre, só `EDEN_BACK_THREAD_STATS=1`, sem diagnóstico.
+
+| Rodada FE | Chave | draws/s (média, amostras com a trás ≥ 85%) | `other busy` |
+| --- | --- | --- | --- |
+| 2a | on | 78 996 (5, 40-56 s) | 15,2% |
+| 2b | off | 79 412 (5, 41-57 s) | 15,2% |
+| 2c | on | 78 981 (5, 42-58 s) | 15,1% |
+| 2d | off | 78 612 (4, 43-55 s) | 15,2% |
+
+- **Custo:** ligada 78 989, desligada 79 012: **−0,03%**, muito abaixo do ruído (~1%). Não há custo mensurável.
+- **Cruzamentos de 2 KiB segurados: zero** em todas as amostras dos seis logs, nos dois jogos, com ~1 milhão de
+  pedaços segurados por segundo no FE e até ~2 milhões no Bananza. Nessas cenas, o bug não acontece. As escritas
+  grandes (`WriteBlock`) em páginas da GPU devem ser escritas na hora pelo cache (`written`), e não seguradas
+  (**hipótese**; o contador só vê as seguradas). O contador é confiável: o `with data` do `InvalidateGPUCache` é igual,
+  amostra por amostra, aos lotes de `held_writes` que já existiam (`vk_rasterizer.cpp:959`), e `CrossesTransform` é a
+  mesma função que o harness testa.
+- **Bananza:** as duas rodadas não chegam a um trecho estável (o log acaba em ~52 s, ainda subindo), então não há
+  custo comparável. O chão ficou como relatado pelo usuário.
+- **Taxa de `InvalidateGPUCache` sem diagnóstico (nova):** no FE estável, ~1 800 chamadas/s, ~77% vazias, ~400/s com
+  dados. Com o diagnóstico (8.4 do `list-diag-design.md`), os totais da sessão davam ~1 240/s e 48% vazias, com os lotes
+  de escritas em ~1 040/s. Os números não são do mesmo trecho, então só sugerem que o diagnóstico faz **menos**
+  chamadas e **mais** chamadas com dados, a hipótese 2 da 3.7.8 (**hipótese**). A rodada do T3a.1 mede as duas coisas
+  no mesmo log.
+
+**Decisão:** a correção fica, ligada sempre: ela remove um comportamento indefinido, sem custo medido. A chave
+`EDEN_DIRTY_SPLIT_2K` sai, como prometido. A contagem continua só nas estatísticas, para que outros jogos e cenas
+possam mostrar cruzamentos. O D1 não explica nada medido até agora no FE ou no Bananza.
+
 **Interação com o T3a.1 e o resto.** O D1 vem antes do T3a.1 (o bug contamina o que ele mede). A aplicação de um
 aviso recortado cobre as duas metades, e o `apply_partial` que o bug produzia deve cair (hipótese). Uma queda de
 desempenho no A/B seria custo de invalidações antes perdidas: investigar, não restaurar a perda.
