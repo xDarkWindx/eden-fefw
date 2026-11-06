@@ -578,3 +578,34 @@ antes; pode ser o custo do contador novo de tamanhos nas threads do jogo, que s�
   - o contador de tamanhos está funcionalmente correto, com a ressalva do seu custo e da interferência dele na comparação
     de desempenho, já que roda nas threads do jogo com as estatísticas ligadas.
 
+### Revisão 6 (diff do O1, `9cd24b6`; conferida pelo planejador)
+
+- **O mecanismo dos dois grãos está aprovado por leitura:**
+  - o grão é fixado na construção;
+  - coleta e entrega usam a mesma especialização, cada uma com constantes próprias;
+  - as ordens de memória foram preservadas;
+  - o laço do `Gather` usa a largura de 32 bits;
+  - os testes cobrem as bordas, o endereço máximo e os casos que o O1 não resolve.
+- **Bloqueador do A/B: o contador do `guard`.**
+  1. **Reset:** o relatório zera o contador com `exchange(0)` sem o `guard` (`gpu_dirty_memory_manager.h:55`), enquanto o
+     escritor faz `load` e `store` sob ele. Um incremento que atravessa o reset faz contagens antigas reaparecerem. O
+     TSan não acusa, porque todos os acessos são atômicos.
+  2. **Slots sem dono:** o slot sai de `fetch_add(...) % 16` (`:97`), sem reserva. Um gerenciador antigo vivo e um novo
+     podem dividir o slot, com `guard`s diferentes, e perder incrementos.
+  **Correção:**
+  - um contador **cumulativo** que pertence ao gerenciador, ou associado explicitamente aos gerenciadores estáveis da
+    sessão (sem um alocador genérico de slots);
+  - o relatório lê e calcula a diferença desde a leitura anterior, sem zerar;
+  - testes dirigidos para a leitura do relatório durante um incremento.
+- **O contador fica ligado só para medição**, com as estatísticas. Estar dentro de uma trava que já é tomada evita outra
+  trava, mas não torna grátis a escrita nem a linha de cache. O número mede trocas de transformação, não o custo total do
+  escritor.
+- **O +1,2 ns (+13%) na escrita já coberta do caminho de 64 B fica aceito para o experimento**, como exceção registrada
+  ao requisito de "nenhuma regressão". Não está aprovado para o padrão, e não é necessariamente temporário: com dois
+  modos na política, a seleção pode ficar. O A/B separa o custo da seleção do custo do grão comparando três braços: o pai,
+  o novo em `legacy-64` e o novo em `experimental-4`.
+- **Política:** a identidade `held_write_grain`, com os modos `legacy-64` e `experimental-4` e o log do valor efetivo,
+  pode entrar já num commit pequeno. O `EDEN_POLICY` usa o resolvedor único da L4; não nasce um parser isolado aqui.
+- **O apelido `EDEN_DIRTY_GRAIN`** hoje aceita valor inválido em silêncio como 64 B (`:27-29`). Ele passa a separar ausência,
+  valor válido e erro de configuração (regra 1 da 7.2 do handoff).
+

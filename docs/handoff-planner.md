@@ -272,7 +272,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   `Gather` consertado, contador do `guard`, testes nos dois grãos). Ressalva: no microbenchmark, a escrita já coberta
   no caminho de 64 B ficou +1,2 ns (+13%). Conferido pelo planejador: 97 casos, 94 passam e 3 falham como esperado, nos
   três builds e nos dois grãos; mutantes 6 e 2; a condição antiga do laço derruba 2 casos no grão de 4 B. Com o revisor;
-  depois, o A/B do usuário. O staging foi
+  depois, o A/B do usuário.
+- Revisão 6 (`t4-coherence-fix-plan.md` 8): o mecanismo foi aprovado. O contador do `guard` bloqueia o A/B: o reset sem o
+  `guard` e os slots `% 16` sem dono. A correção é um contador cumulativo, do gerenciador, ligado só com as estatísticas.
+  Entram também a identidade `held_write_grain` e o apelido com erro para valor inválido. O A/B tem três braços: o pai,
+  `legacy-64` e `experimental-4`. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
