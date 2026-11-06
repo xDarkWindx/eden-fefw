@@ -1463,6 +1463,8 @@ estoura e o segundo registra fora deles.
   payload que os substituiu". Isso **não** prova corrupção visível, nem exclui uma escrita legítima concorrente.
 - **Fora:** T3a.3 e a versão assíncrona.
 
+| # | O que a crítica disse | Procede no código? | O que mudou |
+| --- | --- | --- | --- |
 | 16 (revisão 6, sobre `54e2381`) | (1) T3a.1b aprovado e encerrado. (2) **Bloqueador:** a captura depois de `SynchronizeBuffer` chega tarde. `InlineMemoryImplementation` faz `ClearDownload`, subtrai a faixa de `gpu_modified_ranges`, `FindBuffer` e `SynchronizeBuffer` (`:2116-2121`), e este último sobe as faixas da CPU fora de `gpu_modified_ranges` (`:2002-2014`), então pode sobrescrever os bytes `at_risk` antes da cópia diagnóstica. A frase "a posição não importa" da 3.8.1 está errada: guardar endereços não guarda valores. (3) `MarkUsage` e `reorder_unprotected` saem da versão síncrona e ficam como requisito da assíncrona. (4) Marca de thread própria, com `other/unknown`, sem supor "frente". (5) M=4, 5/s e 4096 B estão bem; declarar taxa sustentada e rajada do balde; o staging precisa caber o alinhamento das até 16 partes. Tirar o teste de sanidade que rejeita 100% de diferenças com `gpu_old` zerado | Sim: conferido em `buffer_cache.h:2002-2009` e `:2116-2121`. E o `FindBuffer` também não serve para a captura: ele pode chamar `SynchronizeBufferWrites` (`:1759-1761`) e criar buffer. O começo dele, `page_table[page]` + `IsInBounds` (`:1754-1758`), é consulta pura | Decisão do planejador, abaixo |
 
 **T3a.2, revisão 6 (decidido pelo planejador):**
