@@ -169,7 +169,7 @@ A reprodução dirigida e o `blkcmp` assíncrono seguem em paralelo, sem ampliar
 
 ## 9. T4.1: o `UsageTracker` conservador e sem UB (desenho; sem código)
 
-**Estado: implementado (commit B do T4.1); a chave temporária `EDEN_USAGE_TRACKER_OLD=1` foi removida em `HASH_CHAVE` (revisão 4), e o rastreador novo é o único; o texto abaixo descreve o que foi implementado, com os ajustes da revisão 3 (o que fala da chave é histórico).** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
+**Estado: implementado (commit B do T4.1); a chave temporária `EDEN_USAGE_TRACKER_OLD=1` foi removida em `d5e7158` (revisão 4), e o rastreador novo é o único; o texto abaixo descreve o que foi implementado, com os ajustes da revisão 3 (o que fala da chave é histórico).** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
 (`list-diag-design.md` 3.8.9, ponto 2). Números de linha de `video_core/buffer_cache/usage_tracker.h`, salvo dito.
 
 ### 9.1 O contrato
@@ -235,9 +235,9 @@ PageMask(page): ~0 para as páginas do meio (palavra inteira: nenhum trabalho po
 
 `pages.size() - 1` só é calculado depois de `pages` ter ao menos uma palavra e de `first_page < pages.size()`. O laço de `Track`
 percorre no máximo `pages.size()` palavras (a interseção), nunca até o último endereço saturado. O modo antigo (`TrackOld`,
-`IsUsedOld`, `TrackPage`, `IsPageUsed`) **saiu do header em `HASH_CHAVE`**; a cópia congelada fica em `src/tests/video_core/usage_tracker_legacy.h`.
+`IsUsedOld`, `TrackPage`, `IsPageUsed`) **saiu do header em `d5e7158`**; a cópia congelada fica em `src/tests/video_core/usage_tracker_legacy.h`.
 
-**A chave temporária (REMOVIDA em `HASH_CHAVE`; texto histórico).** `EDEN_USAGE_TRACKER_OLD=1` ligava o rastreador **antigo**; o novo é o padrão. É lida uma vez na partida
+**A chave temporária (REMOVIDA em `d5e7158`; texto histórico).** `EDEN_USAGE_TRACKER_OLD=1` ligava o rastreador **antigo**; o novo é o padrão. É lida uma vez na partida
 (`UsageTrackerOldMode`) e fixada por instância no construtor, valendo para `Track` e `IsUsed` **juntos**, sem troca durante a execução. **Existia só para o
 A/B**; o modo antigo conserva o UB conhecido (9.2). A linha "Upload reordering" do relatório deixou de dizer qual rastreador está ativo. Uma rodada por braço é triagem: se os números ficarem próximos, repete-se em ordem alternada.
 
@@ -347,13 +347,73 @@ Conferida pelo planejador. **O corpo da seção 9 é atualizado pelo codador jun
 
 O tempo da thread de trás em `stage buffers` subiu de ~7,2% (rastreador antigo, uma rodada) para ~9,3-9,7% (novo, duas
 rodadas), no trecho final. Em draws/s, na janela escolhida, não se demonstrou regressão líquida (−0,9%, menos que a variação
-entre as duas rodadas do novo). A causa não está isolada. Hipótese: no `Track` novo, as faixas grandes que não batem no cache
-`recent` calculam `PageMask` por página, com dois desvios, onde o antigo fazia o meio como uma sequência de `~0`. A primeira
-investigação é ler `Track`/`IsUsed` dentro de `stage buffers`, sem rodada nova nem contador novo por enquanto.
+entre as duas rodadas do novo). Hipótese de partida: no `Track` novo, as faixas grandes que não batem no cache `recent`
+calculam `PageMask` por página, com dois desvios, onde o antigo fazia o meio como uma sequência de `~0`.
+
+**Investigação (sem mudar o rastreador; sem rodada nova no jogo).**
+
+*Que `Track` caem em `stage buffers`.* O trecho é `BindHostStageBuffers(stage)` (`vk_graphics_pipeline.cpp:989`), isto é,
+uniforms, storage e texture buffers por estágio (`buffer_cache.h:410`). Os `MarkUsage` dali:
+
+| Chamador | Faixa | Observação |
+| --- | --- | --- |
+| Uniform, caminho em cache (`:1073`) | tamanho do uniform (pequeno, até o limite de `uniform_buffer_skip_cache_size` ou mais se o dado é da GPU) | só quando o uniform **não** vai pelo stream buffer e precisa de bind |
+| Storage, uma faixa (`:1270`) | `binding.size` do storage, de centenas de bytes a MiB | a cada draw que religa |
+| Storage, multi-faixa (`:1239`) | cada segmento no seu deslocamento | idem |
+| Texture buffer (`:1300`) | tamanho do texel buffer | |
+| `SynchronizeBuffer` → `UploadMemory`/`MappedUploadMemory` → `CanReorderUpload` → `IsUsed` (`:2093`) | `dst_offset`, `size` de cada cópia | poucas por segundo (centenas a milhares), não por draw |
+
+Os vértices (`:902`, `:945`) **não** estão em `stage buffers`: caem em `UpdateGraphicsBuffers`/`BindHostGeometryBuffers`, o
+trecho `buffers`, e só quando a flag de sujo do vértice está ligada. `JoinOverlap`, criação e downloads também não. A hipótese,
+como foi escrita ("faixas grandes e repetidas de vértices"), aponta para o trecho errado; o que vale é qualquer faixa
+grande e **fora do `recent`** que um storage ou texture buffer religue.
+
+*Microbenchmark* (`tools/usage-tracker-bench/`, `run.sh`; -O2, sem sanitizadores, só faixas em que o antigo é definido:
+tamanho ≥ 64 e, se cruza uma palavra de 4 KiB, termina a ≥ 64 B dentro dela; o antigo é a cópia congelada
+`usage_tracker_legacy.h`). Mediana de 9 passadas, ns por chamada, uma máquina compartilhada de 4 núcleos na nuvem (os números
+pequenos oscilam de uma execução para outra em ±30%; os grandes não). `Track`, com `Reset` a cada 200 passadas:
+
+| Cenário (tamanhos como nos chamadores acima) | novo | antigo |
+| --- | --- | --- |
+| uniforms pequenos, 256 distintos (erram o `recent`) | 15-25 | 16-22 |
+| uniforms pequenos, 8 repetidos (acertam) | 4-12 | 4-6 |
+| storage segmentado 64 B-256 KiB, 200 distintos | **43-68** | 17-23 |
+| storage, 12 repetidos de até 1 MiB (acertam) | 8-11 | 8-9 |
+| vértices 4-32 MiB, 3 repetidos (acertam; a 1ª de cada `Reset` erra) | 17-34 | 11-14 |
+| vértices 1-16 MiB, 24 ciclando (erram sempre) | **1 560-2 490** | 255-280 |
+| vértice de 8 MiB com deslocamento mudando (erra sempre) | **1 520-1 920** | 103-108 |
+| termina a 64 B de uma borda de 4 KiB | 15-18 | 14-15 |
+
+`IsUsed` (destinos de upload contra um rastreador com ranges já marcados): faixas de até 4 KiB, 4-5 ns contra 3,5; de 4-64 KiB,
+11 contra 7; de 64 KiB-1 MiB, 133 contra 85; de 1-8 MiB, 555 contra 290-330. Mesmas respostas (as contagens de `true`
+coincidem nos dois), como se espera onde o antigo é definido.
+
+*Leitura.* **Hipótese confirmada no microbenchmark:** quando a faixa é grande e erra o `recent`, o `Track` novo custa ~0,75
+ns por palavra de 4 KiB contra ~0,05-0,13 ns do antigo (6 a 18 vezes), porque o antigo preenche o meio com uma sequência de
+`~0` (vetorizável) e o novo calcula `PageMask` por palavra. Nas faixas pequenas ou que acertam o `recent` não há diferença
+que se distinga da oscilação. O `IsUsed` fica 1,5 a 2 vezes mais lento nas faixas de várias palavras, mas é chamado só por
+upload.
+
+*O que isto não mostra.* (1) Que esse custo explica os ~2 pontos percentuais de `stage buffers` no jogo. Ordem de grandeza:
+com ~80 mil draws/s e a thread de trás cheia, 2 pontos são ~250-300 ns por draw, ou cerca de 400 palavras (1,6 MiB) de faixa
+que erra o `recent` por draw, a ~0,7 ns de diferença por palavra. É plausível para storage buffers grandes que mudam, mas **não
+está medido**: não há contador do tamanho em palavras dos `Track` que erram o `recent` por chamador. (2) As faixas do
+benchmark são sintéticas. Fica pendente, se o autor quiser fechar a causa antes de corrigir, um contador de estatística (palavras
+preenchidas nos `Track` que erram o `recent`, por chamador), e comparar o trecho `buffers`: se a causa estivesse nos vértices, esse
+trecho também teria subido, e a 8.7 não o traz.
+
+*Correção proposta (NÃO implementada; não muda o contrato).* No laço de `Track`, tratar a primeira palavra com `PageMask`,
+as do meio com um `std::fill(..., ~u64{0})` e a última com `PageMask` (a última palavra recortada pela extensão conta como do
+meio), em vez de um `PageMask` por palavra. O contrato (9.1) e a conta de blocos (9.3) ficam iguais. Num esboço fora do
+repositório (só no diretório de trabalho, rodado contra o mesmo benchmark) a linha de erros do `recent` volta a 267 e 108 ns,
+no mesmo patamar do antigo (255 e 109), e as demais linhas ficam dentro da oscilação. O esboço **não** passou pelos testes do
+harness (oráculo de blocos, T-1 a T-5); isso é parte de implementá-lo. O mesmo vale para o laço de `IsUsed`, que poderia
+sair da palavra de meio sem máscara (`pages[i] != 0` para as do meio). Decisão do planejador: implementar a correção (com os
+testes de 9.5 contra o oráculo e este benchmark como medida), ou pedir antes o contador acima.
 
 ### Revisão 4 (sobre `0e5ad1e`)
 
-- **A chave `EDEN_USAGE_TRACKER_OLD` e o modo antigo saem do código de produção** (feito, chave removida em `HASH_CHAVE`); a cópia congelada fica nos testes (os testes que alternavam a chave saíram; os que documentam o defeito antigo seguem contra a cópia). A
+- **A chave `EDEN_USAGE_TRACKER_OLD` e o modo antigo saem do código de produção** (feito, chave removida em `d5e7158`); a cópia congelada fica nos testes (os testes que alternavam a chave saíram; os que documentam o defeito antigo seguem contra a cópia). A
   decisão se apoia no contrato e no fim do UB, e não encerra a investigação de desempenho (9.6).
 - O contador da seção 4 segue com a especificação acima.
 - A escolha entre O1 e O2 preserva a distinção: O1 é mitigação para escritas alinhadas ao grão. Ter poucas escritas fora

@@ -1658,7 +1658,7 @@ execuções, não uma estimativa de ruído). Há uma rodada só do antigo, e o "
 com ele, `Track`): ~7,2% do tempo da trás com o antigo (5b) contra ~9,3-9,7% com o novo, nas duas rodadas (5a e 5a2), no
 trecho final. A causa não está isolada. Hipótese: o `Track` novo calcula `PageMask` por página nas faixas grandes que não
 batem no cache `recent`. Fica como investigação de desempenho do T4.1 (`t4-coherence-fix-plan.md` 9.6), sem rodada nova
-agora.
+agora. **Atualização:** o microbenchmark de 9.6 confirmou que o `Track` novo é 6 a 18 vezes mais lento por palavra nas faixas grandes que erram o `recent`; se isso explica o aumento no jogo não está medido.
 
 **Reordenação (medido):** a fração de uploads que vai para o `upload_cmdbuf` no trecho estável foi:
 
