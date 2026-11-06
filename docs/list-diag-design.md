@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página, cobertura declarada e caminho quente) implementado em `5a7a869`, aguardando a medição do usuário (desenho na seção 3.7); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página, cobertura declarada e caminho quente) implementado em `c700e86`, aguardando a medição do usuário (desenho na seção 3.7); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -764,7 +764,7 @@ quase nada amostrado) deixa só o custo fixo; se a perturbação persiste, é do
 proponho (**fora do escopo aprovado, a decidir**) dois contadores só no `BackStats`, sem o diagnóstico:
 chamadas de `InvalidateGPUCache` e chamadas vazias.
 
-#### 3.7.10 Notas da implementação (`5a7a869`)
+#### 3.7.10 Notas da implementação (`c700e86`)
 
 Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto deixava margem:
 - `cov_expired` dos textos é o contador `notice_expired` (a reciclagem de registro não encerrado); não há um segundo.
