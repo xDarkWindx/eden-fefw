@@ -59,13 +59,21 @@ public:
         if (pages.empty() || blocks.first_page >= pages.size()) {
             return;
         }
+        const size_t first = static_cast<size_t>(blocks.first_page);
         const size_t last = static_cast<size_t>((std::min<u64>)(blocks.last_page, pages.size() - 1));
-        dirty_begin = (std::min)(dirty_begin, static_cast<size_t>(blocks.first_page));
+        dirty_begin = (std::min)(dirty_begin, first);
         dirty_end = (std::max)(dirty_end, last + 1);
-        for (size_t page = static_cast<size_t>(blocks.first_page); page <= last; ++page) {
-            // Whole words in the middle: no work per block.
-            pages[page] |= PageMask(blocks, page);
+        const u64 first_mask = FirstMask(blocks);
+        const u64 last_mask = LastMask(blocks, last);
+        if (first == last) {
+            pages[first] |= first_mask & last_mask;
+            return;
         }
+        // A mask only on the first and the last word; the words in between are whole, with no branch per word.
+        pages[first] |= first_mask;
+        std::fill(pages.begin() + static_cast<std::ptrdiff_t>(first) + 1,
+                  pages.begin() + static_cast<std::ptrdiff_t>(last), ~u64{0});
+        pages[last] |= last_mask;
     }
 
     [[nodiscard]] bool IsUsed(u64 offset, u64 size) const noexcept {
@@ -76,12 +84,22 @@ public:
         if (pages.empty() || blocks.last_page >= pages.size()) {
             return true; // a non-empty range past the extent: unknown counts as in use
         }
-        for (size_t page = static_cast<size_t>(blocks.first_page); page <= static_cast<size_t>(blocks.last_page); ++page) {
-            if ((pages[page] & PageMask(blocks, page)) != 0) {
-                return true;
+        const size_t first = static_cast<size_t>(blocks.first_page);
+        const size_t last = static_cast<size_t>(blocks.last_page);
+        const u64 first_mask = FirstMask(blocks);
+        const u64 last_mask = LastMask(blocks, last);
+        if (first == last) {
+            return (pages[first] & first_mask & last_mask) != 0;
+        }
+        if ((pages[first] & first_mask) != 0) {
+            return true;
+        }
+        for (size_t page = first + 1; page < last; ++page) {
+            if (pages[page] != 0) {
+                return true; // the words in between are whole: any bit is a used block of the range
             }
         }
-        return false;
+        return (pages[last] & last_mask) != 0;
     }
 
 private:
@@ -106,14 +124,19 @@ private:
         return blocks;
     }
 
-    /// The bits of one word that belong to the range: `lo` and `hi` are in 0..63, so no shift is 64 or more.
-    static u64 PageMask(const Blocks& blocks, size_t page) noexcept {
-        if (page != blocks.first_page && page != blocks.last_page) {
+    /// The bits of the FIRST word that belong to the range: from the bit of its first block up. The shift is in 0..63.
+    static u64 FirstMask(const Blocks& blocks) noexcept {
+        return ~u64{0} << static_cast<unsigned>(blocks.first_block & 63);
+    }
+
+    /// The bits of the word `page` (the last one of the intersection) that belong to the range: up to the bit of its last
+    /// block when `page` is the last word of the range, all of them when the range goes on past `page` (the extent cut it).
+    /// `63 - hi` is in 0..63.
+    static u64 LastMask(const Blocks& blocks, size_t page) noexcept {
+        if (page != blocks.last_page) {
             return ~u64{0};
         }
-        const unsigned lo = page == blocks.first_page ? static_cast<unsigned>(blocks.first_block & 63) : 0;
-        const unsigned hi = page == blocks.last_page ? static_cast<unsigned>(blocks.last_block & 63) : 63;
-        return (~u64{0} << lo) & (~u64{0} >> (63 - hi));
+        return ~u64{0} >> (63 - static_cast<unsigned>(blocks.last_block & 63));
     }
 
     struct Range {

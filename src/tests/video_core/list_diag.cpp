@@ -3540,6 +3540,63 @@ TEST_CASE("size counter [2]: zero size first, no wrap, and the alignment categor
     CHECK(category_sum == counters.pieces.load());
 }
 
+TEST_CASE("T4.1 [8]: ranges of 1, 2, 3 and more words, and first word = last word, block by block", "[list-diag][t41]") {
+    // The split of Track and IsUsed into first word / words in between / last word (9.6): every edge of that form against the
+    // oracle. 8 words of 64 blocks, the last partial; ranges that start and end at the first, second, last-but-one and last block
+    // of a word, mid-block bytes included, spanning 1 word (first == last), 2, 3, 4 and the whole buffer, and ranges that pass
+    // the extent (clipped).
+    constexpr size_t kBuffer = 7 * kUtPage + 100;
+    constexpr u64 kBlocks = 8 * 64;
+    std::vector<std::pair<u64, u64>> ranges; // offset, size
+    for (const u64 word : {u64{0}, u64{1}, u64{3}, u64{6}, u64{7}}) {
+        for (const u64 block : {u64{0}, u64{1}, u64{31}, u64{62}, u64{63}}) {
+            for (const u64 skew : {u64{0}, u64{17}, u64{63}}) {
+                const u64 offset = (word * 64 + block) * kUtBlock + skew;
+                for (const u64 blocks : {u64{1}, u64{2}, u64{63}, u64{64}, u64{65}, u64{127}, u64{128}, u64{129}, u64{191},
+                                         u64{192}, u64{193}, u64{255}, u64{256}, u64{257}, u64{600}}) {
+                    for (const u64 trim : {u64{0}, u64{1}, u64{63}}) {
+                        ranges.emplace_back(offset, blocks * kUtBlock - (trim < blocks * kUtBlock ? trim : 0));
+                    }
+                }
+            }
+        }
+    }
+    CHECK(ranges.size() > 3000);
+    // Track a range, then every block of the extent has to agree with the oracle (the whole state, not one probe).
+    for (const auto& [offset, size] : ranges) {
+        VideoCommon::UsageTracker tracker{kBuffer};
+        BlockOracle oracle{kBuffer};
+        tracker.Track(offset, size);
+        oracle.Track(offset, size);
+        for (u64 b = 0; b < kBlocks; ++b) {
+            if (tracker.IsUsed(b * kUtBlock, 1) != oracle.IsUsed(b * kUtBlock, 1)) {
+                FAIL("block " << b << " after Track(" << offset << ", " << size << ")");
+            }
+        }
+        // And a second range on top (the first word of the second may be the last of the first).
+        tracker.Track(offset ^ 0x5c0, size / 2 + 1);
+        oracle.Track(offset ^ 0x5c0, size / 2 + 1);
+        for (u64 b = 0; b < kBlocks; b += 3) {
+            if (tracker.IsUsed(b * kUtBlock, 1) != oracle.IsUsed(b * kUtBlock, 1)) {
+                FAIL("block " << b << " after two ranges starting at " << offset);
+            }
+        }
+    }
+    // IsUsed of a range against one marked block, in every word: the words in between are tested with `!= 0`, the first and the
+    // last with their mask.
+    for (u64 marked = 0; marked < kBlocks; marked += (marked % 64 == 0 || marked % 64 == 63 ? 1 : 9)) {
+        VideoCommon::UsageTracker tracker{kBuffer};
+        BlockOracle oracle{kBuffer};
+        tracker.Track(marked * kUtBlock, 1);
+        oracle.Track(marked * kUtBlock, 1);
+        for (const auto& [offset, size] : ranges) {
+            if (tracker.IsUsed(offset, size) != oracle.IsUsed(offset, size)) {
+                FAIL("marked block " << marked << ", query (" << offset << ", " << size << ")");
+            }
+        }
+    }
+}
+
 TEST_CASE("blkcmp [10]: a staging entry not found cancels the comparison (counters and identities)", "[list-diag][blkcmp]") {
     // The protocol side only: the pool answers NotFound, the caller discards with NoStaging and does NOT call the comparison
     // (the bytes are not read). The real pool lookup (StagingBufferPool::Coherence) is confirmed only in the user's build.

@@ -402,14 +402,39 @@ benchmark são sintéticas. Fica pendente, se o autor quiser fechar a causa ante
 preenchidas nos `Track` que erram o `recent`, por chamador), e comparar o trecho `buffers`: se a causa estivesse nos vértices, esse
 trecho também teria subido, e a 8.7 não o traz.
 
-*Correção proposta (NÃO implementada; não muda o contrato).* No laço de `Track`, tratar a primeira palavra com `PageMask`,
-as do meio com um `std::fill(..., ~u64{0})` e a última com `PageMask` (a última palavra recortada pela extensão conta como do
-meio), em vez de um `PageMask` por palavra. O contrato (9.1) e a conta de blocos (9.3) ficam iguais. Num esboço fora do
-repositório (só no diretório de trabalho, rodado contra o mesmo benchmark) a linha de erros do `recent` volta a 267 e 108 ns,
-no mesmo patamar do antigo (255 e 109), e as demais linhas ficam dentro da oscilação. O esboço **não** passou pelos testes do
-harness (oráculo de blocos, T-1 a T-5); isso é parte de implementá-lo. O mesmo vale para o laço de `IsUsed`, que poderia
-sair da palavra de meio sem máscara (`pages[i] != 0` para as do meio). Decisão do planejador: implementar a correção (com os
-testes de 9.5 contra o oráculo e este benchmark como medida), ou pedir antes o contador acima.
+*Correção implementada (neste commit; não muda o contrato).* `Track` aplica `FirstMask` na primeira palavra e `LastMask` na última da
+interseção e preenche as do meio com `std::fill(..., ~u64{0})`, sem desvio por palavra; uma faixa de uma palavra só usa
+`FirstMask & LastMask`; a última palavra recortada pela extensão é tratada como inteira. `IsUsed` tem o mesmo formato: máscara na
+primeira e na última, `pages[i] != 0` nas do meio, saindo na primeira verdadeira; fora da extensão continua `true`. Mantidos: o caso
+vazio antes de `size - 1`, só a interseção com a extensão, `dirty_*` intocados sem interseção, o cache `recent`, e nenhum
+deslocamento fora de 0..63. Os testes T4.1 [1]-[6] contra o oráculo passaram sem ajuste; o [8] é novo (faixas de 1, 2, 3 e mais
+palavras, primeira = última, faixas recortadas pela extensão, o estado inteiro conferido bloco a bloco). Duas mutações de
+sensibilidade (o `fill` curto em uma palavra e o laço do meio do `IsUsed` curto em uma) são pegas pelo [8] e pelos antigos.
+
+Antes e depois, `tools/usage-tracker-bench/run.sh`, ns por chamada (duas execuções de cada; o antigo é a cópia congelada, na mesma
+execução, como régua):
+
+| Cenário | novo antes | novo depois | antigo (régua) |
+| --- | --- | --- | --- |
+| uniforms pequenos, 256 distintos | 15-19 | 15 | 12-23 |
+| uniforms pequenos, 8 repetidos (acertam) | 4-6 | 3,5 | 3-5 |
+| storage segmentado 64 B-256 KiB | 43-70 | 12 | 13-24 |
+| storage, 12 repetidos (acertam) | 6-10 | 6-7 | 6-10 |
+| vértices 4-32 MiB, 3 repetidos (acertam) | 21-30 | 8-10 | 9-11 |
+| vértices 1-16 MiB, 24 ciclando (erram) | **1 570-2 075** | **259-311** | 249-341 |
+| vértice de 8 MiB com deslocamento mudando (erra) | **1 640-1 700** | **107-139** | 103-141 |
+| termina a 64 B de uma borda de 4 KiB | 15-16 | 11-18 | 10-16 |
+| `IsUsed` até 4 KiB | 4,1 | 2,9-3,5 | 3,1-4,5 |
+| `IsUsed` 4-64 KiB | 11 | 5,6-8,7 | 5-9 |
+| `IsUsed` 64 KiB-1 MiB | 134-138 | 58-80 | 58-83 |
+| `IsUsed` 1-8 MiB | 555-568 | 170-175 | 181-320 |
+
+As linhas de faixa grande com erro no `recent` voltaram ao patamar do antigo (1 570-2 075 → 259-311 ns, e 1 640-1 700 → 107-139),
+e as demais não pioraram além da oscilação (máquina compartilhada de 4 núcleos; as linhas pequenas variam ±30% entre execuções).
+As contagens de `true` do `IsUsed` coincidem nos dois rastreadores.
+
+**Ressalva:** o efeito no jogo (o trecho `stage buffers` voltar de ~9,5% para ~7%) **não** está medido; confere-se na rodada do
+usuário. O microbenchmark só mostra o custo do `Track` e do `IsUsed` isolados, com faixas sintéticas.
 
 ### Revisão 4 (sobre `0e5ad1e`)
 
