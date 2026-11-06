@@ -212,7 +212,12 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Revisão 2 do T4: o T4.0 foi aprovado. Os testes residuais precisam de dados da GPU em [40, 48); falta um teste
   determinístico do ABA. O `blkcmp` assíncrono tem três pendências: a coerência do staging, a vida do buffer fonte e a
   contagem no encerramento. Achado: os downloads não invalidam memória não coerente (inventário 7.7). Próximo do
-  codador: corrigir os testes, desenhar o T4.1 e atualizar a 3.8.9. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  codador: corrigir os testes, desenhar o T4.1 e atualizar a 3.8.9.
+- Feitos `4950781` (testes; o ponto de parada `c.before_cas` é a única mudança fora deles), `49b7156` (desenho do T4.1,
+  `t4-coherence-fix-plan.md` 9) e `ccc0c92` (3.8.9 e 3.8.10: retenção do buffer fonte, encerramento, invalidação do
+  staging também no síncrono). O planejador reproduziu o harness (73 casos, 70 passam e 3 falham como esperado) e os
+  mutantes. Com o revisor. Proposta para depois: um commit com o contador de reordenação e a invalidação no `blkcmp`
+  síncrono, e outro com o T4.1 atrás de uma chave temporária para o A/B, num build só. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
