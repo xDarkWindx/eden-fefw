@@ -249,7 +249,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - `5aab322`: a correção (máscara só na primeira e na última palavra; `std::fill` e teste por palavra no meio) foi
   conferida pelo planejador. Harness com 84 casos, 81 passam e 3 falham como esperado; mutantes 6 e 2. No benchmark, o
   `Track` grande com erro no `recent` caiu para 261/101 ns (antigo 234/106) e o `IsUsed` grande para 170 ns (antigo 167).
-  O diff de `d5e7158`, `1b0d10d` e `5aab322` está com o revisor; depois, a rodada do usuário. O staging foi
+  O diff de `d5e7158`, `1b0d10d` e `5aab322` está com o revisor; depois, a rodada do usuário.
+- Rodada 6 (FE, `80fa234`): `stage buffers` voltou a ~6,7%, então a 9.6 está resolvida. O contador de tamanhos
+  (`t4-coherence-fix-plan.md` 4.1) mostra 100% `Write<T>`, 100% alinhado a 4 B na cena e ~99,8% na carga, e só 17% a 8 B. O
+  grão de 4 B é o candidato de O1; falta medir o custo do lado da aplicação (mais faixas) e ver o perfil do Bananza. A
+  decisão entre O1 e O2 é do usuário. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.

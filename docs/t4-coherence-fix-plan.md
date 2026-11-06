@@ -96,6 +96,32 @@ mede quantos bytes vizinhos têm dados da GPU divergentes, nem quantos seriam pe
 - só com as estatísticas, no relatório de 4 s, para que a carga e a cena estável se separem pelo horário. Também dá para ver se os grandes vêm de
 `WriteBlock`, que o contador por fonte do D1 já separa.
 
+### 4.1 Resultado (rodada 6, 2026-11-06; FE no lugar de sempre, sem diagnóstico, build `80fa234`)
+
+Medido pelo usuário, uma rodada. A carga e a cena se separam pelo horário: a cena começa aos 34 s, o primeiro relatório
+acima de 40 mil draws/s.
+
+| | Carga (24-30 s) | Cena estável (42-54 s) |
+| --- | --- | --- |
+| Pedaços segurados | ~50-60 mil/s, ~6,5 B cada | ~1 milhão/s, ~4,7 B cada |
+| Fonte | 100% `Write<T>` | 100% `Write<T>` (sem `WriteBlock`, `ZeroBlock` ou operação de cache) |
+| Menores que 4 B | 0,12-0,19% | 0,02% |
+| Endereço **e** tamanho alinhados a 4 B | 99,8-99,9% | **100,0%** |
+| Endereço e tamanho alinhados a 8 B | 60-66% | **17-18%** (~41% só o endereço alinhado, ~41% nenhum dos dois) |
+| Pedaços do `CollectT` por escrita (grão 4, grão 8, base de 64 B) | 1,000 / 1,000 / 1,000 | 1,000 / 1,000 / 1,000 |
+| Grãos tocados por escrita (grão 4 / 8 / 64 B) | 1,60-1,66 / 1,00 / 1,00 | 1,17-1,18 / 1,00 / 1,00 |
+
+**Leitura:**
+- **Grão de 4 B:** cobre na garantia de O1 praticamente todas as escritas seguradas do FE, 100% na cena e ~99,7-99,8% na
+  carga. Ficam de fora as menores que 4 B e as desalinhadas, 0,2-0,3% na carga, que é onde o `blkcmp` viu o B
+  (`list-diag-design.md` 8.7).
+- **Grão de 8 B:** não serve. Cerca de 40% das escritas da cena (4 B em endereço `4 mod 8`) arrastariam 4 bytes vizinhos.
+- **Custo no escritor:** nenhum pedaço a mais no `CollectT`, porque as escritas são minúsculas. O custo que falta medir é o
+  do lado da aplicação: com grão de 4 B, escritas não adjacentes no mesmo bloco de 64 B deixam de ser uma faixa só, e o
+  `Gather`, a junção por página e o `OnCachedWrites` recebem mais faixas (**hipótese**; até 16 por bloco).
+- **Limites:** é um jogo e uma rodada. Isto dimensiona as escritas fora da garantia de O1; não mede quantos vizinhos
+  divergentes elas teriam (revisão 4).
+
 ## 5. Confirmação e reprodução (em paralelo; não é condição para o desenho)
 
 - **Reprodução dirigida no harness (antes de qualquer código do T4).** O teste usa o `GPUDirtyMemoryManager` real, um
@@ -435,6 +461,11 @@ As contagens de `true` do `IsUsed` coincidem nos dois rastreadores.
 
 **Ressalva:** o efeito no jogo (o trecho `stage buffers` voltar de ~9,5% para ~7%) **não** está medido; confere-se na rodada do
 usuário. O microbenchmark só mostra o custo do `Track` e do `IsUsed` isolados, com faixas sintéticas.
+
+**Resultado da correção (rodada 6, medido pelo usuário):** `stage buffers` voltou a ~6,7% do tempo da trás na cena estável
+(antes da correção, 9,3-9,7%; rastreador antigo, 7,2%). Os draws/s alinhados pelo início da cena dão 77 569, dentro da
+faixa das rodadas 5 (77 308 a 81 918). **A pendência 9.6 está resolvida.** A trás ficou em ~83% de ocupação, contra 86-87%
+antes; pode ser o custo do contador novo de tamanhos nas threads do jogo, que só roda com as estatísticas (**hipótese**).
 
 ### Revisão 4 (sobre `0e5ad1e`)
 
