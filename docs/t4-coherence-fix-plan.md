@@ -31,7 +31,9 @@ Isso vale para a execução instrumentada; a confirmação sem `Finish` extra es
 
 **C1.** A aplicação de uma escrita segurada só muda no host os bytes que a CPU escreveu.
 
-**C2.** Os bytes que a CPU escreveu chegam ao host antes de qualquer consumidor posterior da GPU, como hoje.
+**C2.** Os bytes que a CPU escreveu chegam ao host antes de qualquer consumidor posterior da GPU, como hoje. **Escopo
+(revisão 1):** a garantia de G supõe payload válido, escrita concluída (M) e nenhuma sobrescrita por um download antigo
+(A). Enquanto A e M estiverem abertos, o T4 não garante C2 de forma geral.
 
 **C3.** Escrita que a CPU nunca fez não aparece no host, nem com valor velho nem com zero.
 
@@ -55,8 +57,11 @@ downloads (A).
 | O3 | **Juntar os bytes da GPU antes de subir** | na aplicação, para um bloco que cruza `gpu_modified_ranges`, ler os bytes da GPU, sobrepor só os bytes que a CPU escreveu e subir o resultado | Precisa dos mesmos bytes exatos (O1 ou O2) para saber o que sobrepor; e ainda lê da GPU na aplicação (síncrono: picos de 20-30 ms por leitura, medido no `blkcmp`). Só faz sentido se O1 e O2 não puderem dar posições exatas |
 | O4 | **Manter o guest coerente** | baixar mais cedo o que a GPU escreve (como `AsyncBufferDownloads` em Switch 1), para que o guest tenha o valor atual e subir o bloco inteiro não estrague nada | Não muda o gerenciador. Mas traz de volta o custo de banda e de espera que o caminho de Switch 2 evita, e mexe em A (mais downloads publicados). Custo provavelmente acima do orçamento (**hipótese**) |
 
-**Proposta do planejador: O1, com o grão escolhido por medição**, e O2 só se o residual de O1 for relevante.
-Motivos:
+**Proposta do planejador, revisada (seção 8): O1 como mitigação**, que elimina G só para escritas com início e fim
+alinhados ao grão. Uma escrita de 4 B desalinhada (`[1, 5)`, com grão de 4 B) ainda leva os vizinhos (`[0, 8)`).
+Escolher entre O1 e uma solução exata (O2) é decisão de compatibilidade e desempenho do usuário, com a medição da
+seção 4; não é garantia de correção. O1 depende de dois consertos: o laço do `Gather` (`:195`) e o `UsageTracker`
+(T4.1). Motivos para O1 como candidata:
 - muda pouco, no lugar que o D1 já corrigiu e testou;
 - não acrescenta estrutura nova com capacidade a esgotar;
 - o residual de O1 é mensurável antes de decidir.
@@ -66,8 +71,10 @@ Motivos:
 O marcador vazio (`~0U`, máscara 0) conta como válido. Então, depois de cada `Gather`, o primeiro `Collect` de cada
 núcleo com outro endereço toma o `guard` e empilha uma transformação vazia em `back_buffer`, e o `Gather` empilha a sua
 no `front_buffer`. As duas têm máscara 0 e não geram faixa; custam uma trava e uma inserção a mais por núcleo e por
-`Gather` (~1 800 `Gather`/s no FE, medido no D1). Corrigir é trocar o teste por `address != ~0U`; vale medir junto com
-O1, que mexe no mesmo lugar.
+`Gather` (~1 800 `Gather`/s no FE, medido no D1). **Correção (T4.0, revisão 1):** a transformação vazia é a de
+**máscara zero**, por um predicado que recebe a transformação (`IsEmpty`/`HasWrites`). Não por `address != ~0U`: com
+transformação de 128 B, o endereço `0xffffffff` é legítimo. Fica num commit à parte, antes de O1, medido contra o
+commit pai.
 
 ## 4. Medições antes de escolher o grão (baratas, só com as estatísticas)
 
@@ -75,7 +82,9 @@ Um contador no `BackStats`, no mesmo ponto da contagem do D1 (`core/memory.cpp`,
 pedaços segurados, conta tamanho e alinhamento:
 - quantos estão alinhados e são múltiplos de 4 B e de 8 B;
 - quantos são menores que 4 B;
-- quantos pedaços a mais cada grão produziria (`ceil` do tamanho alinhado dividido pelo grão, contra o de hoje).
+- quantos **pedaços** do `CollectT` cada grão produziria: com transformação `T = 32 × grão`,
+  `pedaços = 1 + ((address % T) + size - 1) / T` para tamanho positivo (revisão 1);
+- quantos **grãos** cada escrita toca, que é outro custo (as faixas do `Gather` e da junção).
 
 Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Também dá para ver se os grandes vêm de
 `WriteBlock`, que o contador por fonte do D1 já separa.
@@ -95,12 +104,13 @@ Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Tam
 
 ## 6. Critérios de aceite do T4 (a detalhar com o desenho escolhido)
 
-- **Reprodução dirigida:** o host mantém os bytes da GPU vizinhos à escrita; as escritas da CPU chegam inteiras.
+- **Aceite principal: a reprodução dirigida.** Dentro do escopo garantido (escritas alinhadas ao grão, no caso de O1),
+  o host mantém os bytes da GPU vizinhos à escrita, e as escritas da CPU chegam inteiras.
 - **Harness do gerenciador (D1, T3a.1):** equivalência das saídas do `Gather` com o grão novo; diagnóstico com
   `N=1` igual ao de antes, a não ser pela granularidade.
 - **Nos jogos:**
-  - `blkcmp` (síncrono e assíncrono) sem diferenças nas faixas afirmadas, ou com as que sobrarem explicadas pelo
-    residual medido;
+  - `blkcmp` (síncrono e assíncrono) com **menos** diferenças nas faixas afirmadas. Ausência de diferenças **não** é
+    requisito: A, M, escritas concorrentes e os limites da observação continuam existindo (revisão 1);
   - custo dentro do orçamento (`architecture-plan.md` 12.1), medido como em 7.4.1.
 - **Declarado:** A e M continuam em aberto.
 
