@@ -34,6 +34,9 @@ Como trabalhar:
   produzidas pela GPU, muitas trocas de thread no `InvalidateGPUCache`).
 - **Segurança e generalidade antes de desempenho**, com orçamento (`docs/architecture-plan.md` 12.1: até 5% de
   draws/s por item, 10% no total, medido). Antecipar problemas antes que aconteçam.
+- **Base forte antes de velocidade (usuário, 2026-11-06):** não apressar. Cada item segue desenho → revisor → código →
+  revisor → medição, inclusive os pequenos. O planejador não dispensa o revisor nem quando a correção é "exatamente o que
+  foi pedido", como fez com o `52e726b`. Defeito conhecido é corrigido no mecanismo, com teste, e não contornado por chave.
 - **Nunca:** ligar correção pelo nome/ID do jogo; mudar um padrão de comportamento sem A/B; mexer no `main`;
   criar PR sem o usuário pedir; citar identificador de modelo em docs ou mensagens de commit (as linhas de
   atribuição `Co-Authored-By`/`Claude-Session` que a sessão indicar são as únicas permitidas); portar commits dos
