@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "core/gpu_dirty_memory_manager.h"
 #include "video_core/back_thread_stats.h"
 #include "video_core/list_diag.h"
 
@@ -369,6 +370,16 @@ void Report() {
                  source(DirtySource::ZeroBlock), source(DirtySource::CacheOp),
                  source(DirtySource::Exclusive), source(DirtySource::Other), per_s(inv_total),
                  per_s(inv_empty), per_s(inv_data));
+        // The writer cost of the grain (docs/t4-coherence-fix-plan.md, revision 5): how many times a writer took the guard of its
+        // manager (the swap of the transformation in CollectOne). Always counted (inside the guard, never on the CAS path).
+        const u64 guard_takes = Core::TakeDirtyGuardTakes();
+        const size_t grain = Core::DirtyGrainBytes(Core::SessionDirtyGrain());
+        LOG_INFO(Render_Vulkan,
+                 "Dirty grain {} B (transformation {} B{}): guard taken (transformation swaps) {:.1f}/s, {:.2f}% of the "
+                 "held pieces; Collect-side only, the Gather ranges are in \"Invalidation batches\"",
+                 grain, grain * 32, grain == 4 ? ", EXPERIMENTAL EDEN_DIRTY_GRAIN=4" : ", default",
+                 per_s(guard_takes),
+                 dirty_held != 0 ? static_cast<double>(guard_takes) * 100.0 / static_cast<double>(dirty_held) : 0.0);
     }
     {
         // Size and alignment of the held pieces (docs/t4-coherence-fix-plan.md, 4). Compare the loading window with the

@@ -4,8 +4,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -14,6 +16,46 @@
 #include "core/device_memory_manager.h"
 
 namespace Core {
+
+/// The grain of the dirty manager: the bytes one bit of a transformation's u32 mask stands for. A transformation always holds
+/// 32 grains, so B64 is the transformation of 2 KiB of always, and B4 one of 128 B (docs/t4-coherence-fix-plan.md, 3 and 8,
+/// revision 5). B4 is an EXPERIMENTAL mitigation of the neighbour-byte loss (G): it removes the loss only for writes aligned to
+/// 4 B in address and size.
+enum class DirtyGrain : u8 { B64, B4 };
+
+/// EDEN_DIRTY_GRAIN=4 selects B4; unset, or any other value, selects B64 (the default).
+[[nodiscard]] inline DirtyGrain ParseDirtyGrain(const char* value) {
+    return value != nullptr && value[0] == '4' && value[1] == '\0' ? DirtyGrain::B4 : DirtyGrain::B64;
+}
+
+/// Read once, at the first use, and fixed for the session: every manager made without an explicit grain gets this one.
+[[nodiscard]] inline DirtyGrain SessionDirtyGrain() {
+    static const DirtyGrain grain = ParseDirtyGrain(std::getenv("EDEN_DIRTY_GRAIN"));
+    return grain;
+}
+
+[[nodiscard]] constexpr size_t DirtyGrainBytes(DirtyGrain grain) {
+    return grain == DirtyGrain::B4 ? 4 : 64;
+}
+
+/// How many times a writer took the guard of its manager (the swap of the transformation in `CollectOne`): the cost of the
+/// grain on the writer. Always on. Incremented INSIDE the guard, which is taken anyway; none on the CAS path. One cache line
+/// per slot, a manager keeping one slot for good (the slots are read and cleared by the statistics report).
+struct alignas(64) DirtyGuardSlot {
+    std::atomic<u64> takes{};
+};
+inline constexpr size_t kDirtyGuardSlots = 16;
+inline std::array<DirtyGuardSlot, kDirtyGuardSlots> g_dirty_guard_slots;
+inline std::atomic<u32> g_dirty_guard_next_slot{};
+
+/// Sum of the takes since the last call, and cleared.
+[[nodiscard]] inline u64 TakeDirtyGuardTakes() {
+    u64 total = 0;
+    for (DirtyGuardSlot& slot : g_dirty_guard_slots) {
+        total += slot.takes.exchange(0, std::memory_order_relaxed);
+    }
+    return total;
+}
 
 /// Stop points for the tests of the diagnostic (EDEN_LIST_DIAG, docs/list-diag-design.md). A test
 /// supplies a type with the same members whose `At` blocks on a named point; here nothing happens
@@ -43,7 +85,17 @@ static_assert(sizeof(GatherLotState) == 64);
 
 class GPUDirtyMemoryManager {
 public:
-    GPUDirtyMemoryManager() : current{default_transform} {
+    /// The grain of the session (EDEN_DIRTY_GRAIN, read once).
+    GPUDirtyMemoryManager() : GPUDirtyMemoryManager{SessionDirtyGrain()} {}
+
+    /// An explicit grain. The manager is no template (the arrays of managers, the statistics and the diagnostic keep one
+    /// type); the grain is a `const bool` next to `current`, and `CollectT` and the iteration of `GatherT` choose between two
+    /// instantiations of their bodies by it: each has its shifts and masks as COMPILE-TIME constants, so the 64 B path is the
+    /// code of before plus one load and one predictable branch (a fixed value for the whole session), with no variable shift.
+    explicit GPUDirtyMemoryManager(DirtyGrain grain)
+        : current{default_transform}, fine_grain{grain == DirtyGrain::B4},
+          guard_slot{static_cast<u8>(g_dirty_guard_next_slot.fetch_add(1, std::memory_order_relaxed) %
+                                     kDirtyGuardSlots)} {
         back_buffer.reserve(256);
         front_buffer.reserve(256);
     }
@@ -54,10 +106,17 @@ public:
         CollectT<false>(address, size);
     }
 
-    /// Whether [address, address + size) passes the end of the transformation that holds `address`
-    /// (2 KiB). By subtraction: `offset + size` could wrap. The statistics use the same function.
-    [[nodiscard]] static constexpr bool CrossesTransform(PAddr address, size_t size) {
-        return size > page_size - (address & page_mask);
+    /// Whether [address, address + size) passes the end of the transformation of `transform_bits` bits (default: the 2 KiB
+    /// of the 64 B grain) that holds `address`. By subtraction: `offset + size` could wrap. The statistics use the same
+    /// function.
+    [[nodiscard]] static constexpr bool CrossesTransform(PAddr address, size_t size,
+                                                         size_t transform_bits = kDefaultPageBits) {
+        const size_t transform = size_t{1} << transform_bits;
+        return size > transform - (address & (transform - 1));
+    }
+
+    [[nodiscard]] DirtyGrain Grain() const {
+        return fine_grain ? DirtyGrain::B4 : DirtyGrain::B64;
     }
 
     /// `Diag = false` is the code of before the diagnostic, with its memory orders. `Diag = true`
@@ -68,17 +127,31 @@ public:
         if (size == 0) {
             return;
         }
-        // One transformation covers `page_size` bytes (2 KiB); a write that crosses its end used to
-        // build a mask with a negative shift (docs/gpu-contract-inventory.md, 7.4). Subtraction, not
+        if (fine_grain) {
+            CollectSplit<Diag, Hooks, kAlignBits4>(address, size);
+        } else {
+            CollectSplit<Diag, Hooks, kAlignBits64>(address, size);
+        }
+    }
+
+private:
+    /// CollectT for one grain, `AlignBits` a compile-time constant (2 or 6; a transformation is 32 grains).
+    template <bool Diag, class Hooks, size_t AlignBits>
+    void CollectSplit(PAddr address, size_t size) {
+        constexpr size_t page_bits = AlignBits + 5;
+        constexpr size_t page_size = size_t{1} << page_bits;
+        constexpr size_t page_mask = page_size - 1;
+        // One transformation covers `page_size` bytes (2 KiB, or 128 B with the 4 B grain); a write that crosses its end used
+        // to build a mask with a negative shift (docs/gpu-contract-inventory.md, 7.4). Subtraction, not
         // `offset + size`, so that a huge size cannot wrap. A write that fits takes the old path
         // without a loop.
-        if (!CrossesTransform(address, size)) {
-            CollectOne<Diag, Hooks>(address, size);
+        if (size <= page_size - (address & page_mask)) {
+            CollectOne<Diag, Hooks, AlignBits>(address, size);
             return;
         }
         for (;;) {
             const size_t piece = (std::min)(size, page_size - (address & page_mask));
-            CollectOne<Diag, Hooks>(address, piece);
+            CollectOne<Diag, Hooks, AlignBits>(address, piece);
             address += piece;
             size -= piece;
             if (size == 0) {
@@ -88,16 +161,15 @@ public:
         }
     }
 
-private:
     /// The body of CollectT before the split, unchanged (same memory orders): `size` fits in one
     /// transformation.
-    template <bool Diag, class Hooks>
+    template <bool Diag, class Hooks, size_t AlignBits>
     void CollectOne(PAddr address, size_t size) {
         constexpr auto load_order = Diag ? std::memory_order_seq_cst : std::memory_order_acquire;
         constexpr auto exchange_order = Diag ? std::memory_order_seq_cst : std::memory_order_relaxed;
         constexpr auto cas_success = Diag ? std::memory_order_seq_cst : std::memory_order_release;
         constexpr auto cas_failure = Diag ? std::memory_order_seq_cst : std::memory_order_relaxed;
-        TransformAddress t = BuildTransform(address, size);
+        TransformAddress t = BuildTransform<AlignBits>(address, size);
         TransformAddress tmp, original;
         do {
             tmp = current.load(load_order);
@@ -105,6 +177,11 @@ private:
             if (tmp.address != t.address) {
                 if (HasWrites(tmp)) {
                     std::scoped_lock lk(guard);
+                    // Writer cost of the grain (see DirtyGuardSlot): under the guard, never on the CAS path. The slot of a manager
+                    // is its own (at most kDirtyGuardSlots managers are alive together) and the guard orders the writers
+                    // of this manager, so a load and a store do: no lock-prefixed operation.
+                    DirtyGuardSlot& slot = g_dirty_guard_slots[guard_slot];
+                    slot.takes.store(slot.takes.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
                     back_buffer.emplace_back(tmp);
                     current.exchange(t, exchange_order);
                     return;
@@ -182,20 +259,10 @@ public:
             }
             Hooks::At("g.before_iter");
         }
-        for (auto& transform : front_buffer) {
-            size_t offset = 0;
-            u64 mask = transform.mask;
-            while (mask != 0) {
-                const size_t empty_bits = std::countr_zero(mask);
-                offset += empty_bits << align_bits;
-                mask = mask >> empty_bits;
-
-                const size_t continuous_bits = std::countr_one(mask);
-                callback((static_cast<PAddr>(transform.address) << page_bits) + offset,
-                         continuous_bits << align_bits);
-                mask = continuous_bits < align_size ? (mask >> continuous_bits) : 0;
-                offset += continuous_bits << align_bits;
-            }
+        if (fine_grain) {
+            Deliver<kAlignBits4>(callback);
+        } else {
+            Deliver<kAlignBits64>(callback);
         }
         front_buffer.clear();
         if constexpr (Diag) {
@@ -216,13 +283,37 @@ private:
         u32 mask;
     };
 
-    constexpr static size_t page_bits = DEVICE_PAGEBITS - 1;
-    constexpr static size_t page_size = 1ULL << page_bits;
-    constexpr static size_t page_mask = page_size - 1;
+    /// Bits of a mask: one transformation is always 32 grains, whatever the grain is.
+    constexpr static size_t mask_width = 32;
+    constexpr static size_t kAlignBits64 = 6; ///< grain 64 B, transformation 2 KiB
+    constexpr static size_t kAlignBits4 = 2;  ///< grain 4 B, transformation 128 B
+    /// The transformation of the 64 B grain: 2 KiB.
+    constexpr static size_t kDefaultPageBits = DEVICE_PAGEBITS - 1;
+    static_assert(kDefaultPageBits == kAlignBits64 + 5, "32 grains of 64 B");
 
-    constexpr static size_t align_bits = 6U;
-    constexpr static size_t align_size = 1U << align_bits;
-    constexpr static size_t align_mask = align_size - 1;
+    /// The ranges of `front_buffer`, for one grain (`AlignBits` constant).
+    template <size_t AlignBits>
+    void Deliver(std::function<void(PAddr, size_t)>& callback) {
+        constexpr size_t page_bits = AlignBits + 5;
+        for (auto& transform : front_buffer) {
+            size_t offset = 0;
+            u64 mask = transform.mask;
+            while (mask != 0) {
+                const size_t empty_bits = std::countr_zero(mask);
+                offset += empty_bits << AlignBits;
+                mask = mask >> empty_bits;
+
+                const size_t continuous_bits = std::countr_one(mask);
+                callback((static_cast<PAddr>(transform.address) << page_bits) + offset, continuous_bits << AlignBits);
+                // The condition is about the WIDTH OF THE MASK (32 bits), not the size of the grain in bytes: with the
+                // grain in bytes (64) it was always true by coincidence, and with a 4 B grain it dropped every run after
+                // the first (docs/t4-coherence-fix-plan.md, 8, revision 1, item 1). A run of all 32 bits ends the mask.
+                mask = continuous_bits < mask_width ? (mask >> continuous_bits) : 0;
+                offset += continuous_bits << AlignBits;
+            }
+        }
+    }
+
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
     /// A transformation holds writes iff its mask is not zero; the empty one is `default_transform` (what
@@ -245,10 +336,14 @@ private:
         return mask;
     }
 
+    template <size_t AlignBits>
     TransformAddress BuildTransform(PAddr address, size_t size) {
+        constexpr size_t page_bits = AlignBits + 5;
+        constexpr size_t page_mask = (size_t{1} << page_bits) - 1;
+        constexpr size_t align_mask = (size_t{1} << AlignBits) - 1;
         const size_t minor_address = address & page_mask;
-        const size_t minor_bit = minor_address >> align_bits;
-        const size_t top_bit = (minor_address + size + align_mask) >> align_bits;
+        const size_t minor_bit = minor_address >> AlignBits;
+        const size_t top_bit = (minor_address + size + align_mask) >> AlignBits;
         TransformAddress result{};
         result.address = static_cast<u32>(address >> page_bits);
         result.mask = CreateMask<u32>(top_bit, minor_bit);
@@ -256,6 +351,9 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    /// The grain, fixed at construction (next to `current`: the same cache line).
+    const bool fine_grain; ///< true: 4 B grain (transformation 128 B); false: 64 B (2 KiB)
+    const u8 guard_slot;   ///< Which DirtyGuardSlot counts this manager's guard takes
     std::mutex guard;
     std::atomic<u64> gather_epoch{};
     std::vector<TransformAddress> back_buffer;

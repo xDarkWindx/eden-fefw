@@ -68,6 +68,40 @@ seção 4; não é garantia de correção. O1 depende de dois consertos: o laço
 - não acrescenta estrutura nova com capacidade a esgotar;
 - o residual de O1 é mensurável antes de decidir.
 
+**Implementado (revisão 5): O1 com grão de 4 B, como mitigação EXPERIMENTAL, desligada por padrão.** Em
+`core/gpu_dirty_memory_manager.h`:
+- **Opt-in.** `EDEN_DIRTY_GRAIN=4` liga o grão de 4 B (`align_bits` 2, transformação de 128 B, 32 grãos na máscara `u32`); sem a
+  variável, ou com qualquer outro valor (inclusive `8`, descartado em 4.1), fica o de hoje (64 B, 2 KiB). Lida uma vez
+  (`SessionDirtyGrain`) e fixada na sessão: todos os gerenciadores sem grão explícito usam o mesmo. O `System::Impl` registra uma
+  linha na partida com o grão ativo.
+- **Mecanismo, e por quê.** O grão é um `const bool` do gerenciador (junto de `current`); `CollectT` e a iteração do `GatherT`
+  escolhem entre **duas instanciações** dos corpos por ele, cada uma com os deslocamentos e máscaras como constantes de compilação.
+  Alternativa descartada: deslocamentos em membros `const` e deslocamento variável; medi essa primeiro e o caminho de 64 B ficou
+  de 13 a 34% mais lento que o commit pai (mediana de 3 execuções: CAS 9 contra 10-11 ns; guarda 18 contra 22-25 ns, por esse
+  deslocamento e por um contador com `lock xadd`, que passou a `load`+`store`). Com as duas instanciações, microbenchmark de uma
+  thread (`Collect`, `Gather` a cada 64; mediana de 11 execuções, ns por chamada, contra o commit pai): escrita já coberta no
+  mesmo 2 KiB (o caminho mais barato) **9,3 → 10,5 (+1,2 ns, +13%)**; troca de transformação 19,3 → 18,7; aleatório em 64 KiB
+  19,3 → 18,6; blocos de 64 B 19,2 → 18,6. **Ou seja, o caminho de 64 B não ficou mais lento, salvo ~1 ns na escrita já coberta**,
+  a carga e o desvio do grão (fixo na sessão); o grão de 4 B custa ~20 ns nesse caso (uma troca de transformação por escrita).
+  O microbenchmark é de uma thread e sintético: o custo no emulador se confere na rodada do usuário.
+- **Conserto do laço do `Gather`** (revisão 1, item 1): `mask = continuous_bits < mask_width ? mask >> continuous_bits : 0`, com
+  `mask_width = 32` (a largura da máscara), não o tamanho do grão em bytes. Vale para os dois grãos.
+- **O recorte do `CollectT` (D1)** corta na transformação do grão (128 B ou 2 KiB). `HasWrites` (T4.0) não mudou: o endereço
+  `0xffffffff` de 128 B é uma transformação legítima, identificada pela máscara.
+- **Custo do escritor** (aceite): um contador das vezes que o `CollectOne` toma o `guard` (a troca de transformação). Fica dentro
+  do `guard`, que já é tomado, com um `load` e um `store` (sem operação com `lock`); nenhum contador no caminho do CAS. Sempre
+  ligado, uma linha própria no relatório das estatísticas (`Dirty grain ...: guard taken ... /s, ...% of the held pieces`).
+- **Faixas por lote:** a linha "Invalidation batches" conta faixas em bytes e páginas de 4 KiB, não depende do grão; com 4 B ela
+  deve mostrar mais faixas por lote antes da junção, e é o que se confere no emulador.
+- **Layout:** o gerenciador cresce 8 bytes (o grão e o índice do contador). O teste do harness que exigia o layout antigo passou a
+  exigir exatamente esse acréscimo.
+- **Não compilado na nuvem:** `core/core.cpp`, `core/memory.cpp` e `video_core/back_thread_stats.cpp` (só checagem de sintaxe com
+  GCC/clang).
+
+**Continuam abertos:** o **G residual** (escritas desalinhadas ao grão e menores que 4 B ainda levam os vizinhos), **A** (escrita
+da CPU sobre dado novo da GPU antes de baixar) e **M** (escrita concorrente/observação perdida). O1 de 4 B não encerra a coerência
+de memória, e só vira padrão depois da medição no emulador (desempenho total, custo do escritor, faixas por lote).
+
 **Achado ao ler o gerenciador (verificado, preexistente, sem efeito nos dados):** `IsValid(PAddr)` testa
 `address < 2^39` (`:227-229`), mas é chamado com o campo `u32` da transformação (`:106` e `:168`), e todo `u32` passa.
 O marcador vazio (`~0U`, máscara 0) conta como válido. Então, depois de cada `Gather`, o primeiro `Collect` de cada
@@ -171,13 +205,31 @@ fica descartado pelo FE. Isto continua dimensionando, não medindo perda, e são
 
 - **Aceite principal: a reprodução dirigida.** Dentro do escopo garantido (escritas alinhadas ao grão, no caso de O1),
   o host mantém os bytes da GPU vizinhos à escrita, e as escritas da CPU chegam inteiras.
-- **Harness do gerenciador (D1, T3a.1):** equivalência das saídas do `Gather` com o grão novo; diagnóstico com
-  `N=1` igual ao de antes, a não ser pela granularidade.
+  **Estado (O1 de 4 B, harness):** o cenário PRINCIPAL (`[40, 44)`, GPU divergente em `[0, 32)`) e o residual de 4 B **alinhado**
+  (`[40, 44)` com GPU divergente também em `[40, 48)`, caso novo) cumprem o C1 com o grão de 4 B, e os casos correspondentes
+  perderam o `[!shouldfail]`. Caso a caso:
+  - `t4 [a]` principal, 64 B: igual (o `Gather` dá `[0,64)`, o host perde `[0,32)`).
+  - `t4 [b]` principal: **dividido em dois**. Com 64 B (o padrão) continua `[!shouldfail]`: o defeito do padrão segue
+    demonstrado. Com 4 B (`t4 [a4]`, `t4 [b4]`) o `Gather` dá `[40, 44)`, o host guarda `[0, 32)` e recebe `[40, 44)`: C1 cumprido,
+    sem a tag.
+  - `t4 [a]` residual (`[41,45)` e 1 B em 41), 64 B: igual (a preparação do defeito de hoje).
+  - `t4 [b]` residual, escrita desalinhada `[41, 45)` e de 1 B em 41, com GPU divergente em `[40, 48)`: **continuam
+    `[!shouldfail]` com o grão de 4 B** (`t4 [b4]`); `t4 [a4]` descreve o que levam (`[40, 48)` e `[40, 44)`). É o residual de O1.
+  - novo: `t4 [b4]` residual, 4 B alinhado em `[40, 44)`: C1 cumprido, e `[44, 48)` guarda os bytes da GPU.
+  - o teste das duas sequências de bits na mesma transformação roda nos dois grãos (e uma terceira sequência, e o bit 31); com a
+    condição do laço no tamanho do grão em bytes (o defeito da revisão 1) ele falha com 4 B.
+- **Harness do gerenciador (D1, T3a.1):** equivalência das saídas do `Gather` com o grão novo (feita: mesma cobertura em bytes
+  para escritas alinhadas a 64 B; com 4 B a cobertura contém os bytes escritos e fica dentro da de 64 B); bordas de 128 B e de
+  2 KiB (faixa exata, cruzando, terminando na borda); o endereço `0xffffffff` de 128 B; o contador do escritor. A bateria do
+  protocolo dos lotes, P0, ABA e cobertura roda com os **dois** grãos (`run.sh`): os testes que tratam de blocos de 64 B
+  arredondam a escrita ao bloco com o grão de 4 B (a diferença é a transformação de 128 B, que o protocolo tem de aguentar), e os
+  que têm um grão como assunto o fixam explicitamente.
 - **Nos jogos:**
   - `blkcmp` (síncrono e assíncrono) com **menos** diferenças nas faixas afirmadas. Ausência de diferenças **não** é
     requisito: A, M, escritas concorrentes e os limites da observação continuam existindo (revisão 1);
-  - custo dentro do orçamento (`architecture-plan.md` 12.1), medido como em 7.4.1.
-- **Declarado:** A e M continuam em aberto.
+  - custo dentro do orçamento (`architecture-plan.md` 12.1), medido como em 7.4.1, **com** o custo do escritor (trocas de
+    transformação) e as faixas por lote.
+- **Declarado:** G residual, A e M continuam em aberto.
 
 ## 7. Perguntas para o revisor
 

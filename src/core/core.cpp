@@ -111,7 +111,14 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 struct System::Impl {
     explicit Impl(System& system)
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
-          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
+          reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {
+        // The grain of the dirty managers, read once from EDEN_DIRTY_GRAIN and fixed for the session (core/gpu_dirty_memory_manager.h).
+        const auto grain = SessionDirtyGrain();
+        LOG_INFO(Core, "GPU dirty memory grain: {} B (transformation {} B){}", DirtyGrainBytes(grain),
+                 32 * DirtyGrainBytes(grain),
+                 grain == DirtyGrain::B4 ? ", EXPERIMENTAL (EDEN_DIRTY_GRAIN=4): writes aligned to 4 B keep their GPU neighbours"
+                                         : ", default");
+    }
 
     u64 program_id;
 

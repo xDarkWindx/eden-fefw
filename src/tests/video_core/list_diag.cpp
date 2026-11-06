@@ -28,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -155,8 +156,37 @@ constexpr u8 kGuestFill = 0xEE;
 
 /// The scaffolding the emulator has around the hooks: the join of ranges before OnCachedWrites
 /// (gpu.cpp:143-161, unchanged there), the application under the cache mutex and the pop under it.
+/// The grain the tests run the manager at: the one of the session (EDEN_DIRTY_GRAIN), so that tools/list-diag-harness/run.sh can run
+/// the same battery at 64 B and at 4 B. A test whose subject is ONE grain constructs its manager with that grain explicitly.
+inline Core::DirtyGrain TestGrain() {
+    return Core::SessionDirtyGrain();
+}
+
+/// The tests whose subject is the 64 B grain (rounding of a write to a block, the legacy manager, the 2 KiB transformation, the
+/// bytes at risk of problem B that only a 64 B block has) pin it, so that they stay a check of that behaviour in the 4 B run too.
+constexpr Core::DirtyGrain k64 = Core::DirtyGrain::B64;
+constexpr Core::DirtyGrain k4 = Core::DirtyGrain::B4;
+
+/// `count` managers of the same explicit grain (the manager has const members and a mutex: no copy, so the array is built in place).
+template <size_t... I>
+std::array<Manager, sizeof...(I)> MakeManagers(Core::DirtyGrain grain, std::index_sequence<I...>) {
+    return {((void)I, Manager{grain})...};
+}
+
+/// The diagnostic models blocks of 64 bytes. With the 4 B grain the manager delivers the exact 4 B cells of a write instead, so a
+/// test that checks the BLOCKS (the protocol of the lots, the application, the pop) hands the manager the write rounded to its
+/// 64 B blocks: the ranges are those of the 64 B grain, and what differs is the transformation (128 B instead of 2 KiB), which is
+/// what the protocol has to survive. The tests of the 4 B behaviour itself ("T4 O1" below) write the exact bytes.
+inline void RoundToBlocks(u64& addr, u64& size) {
+    const u64 begin = addr & ~u64{63};
+    const u64 end = (addr + size + 63) & ~u64{63};
+    addr = begin;
+    size = end - begin;
+}
+
 struct Fx {
-    explicit Fx(unsigned slots = 64) : proto(slots) {
+    explicit Fx(unsigned slots = 64, Core::DirtyGrain grain_ = TestGrain())
+        : managers{MakeManagers(grain_, std::make_index_sequence<kCores>{})}, grain{grain_}, proto(slots) {
         g_clock = 0;
         g_skip_overlap = false;
         g_mutant = 0;
@@ -181,6 +211,7 @@ struct Fx {
     }
 
     std::array<Manager, kCores> managers;
+    Core::DirtyGrain grain;
     Proto proto;
     Gates gates;
     std::mutex cache_mutex; ///< buffer_cache.mutex
@@ -201,6 +232,16 @@ struct Fx {
     }
 
     Proto::Claim Collect(unsigned core, u64 addr, u32 size = 4) {
+        if (grain == Core::DirtyGrain::B4) {
+            u64 a = addr, n = size;
+            RoundToBlocks(a, n);
+            return proto.CollectObserved(managers[core], core, a, static_cast<u32>(n));
+        }
+        return proto.CollectObserved(managers[core], core, addr, size);
+    }
+
+    /// The exact bytes, whatever the grain (the tests of the 4 B behaviour).
+    Proto::Claim CollectExact(unsigned core, u64 addr, u32 size) {
         return proto.CollectObserved(managers[core], core, addr, size);
     }
 
@@ -292,8 +333,8 @@ bool Contains(const std::vector<std::string>& lines, const std::string& needle) 
 TEST_CASE("list diag: Collect and Gather, Diag=false and Diag=true, equal the manager of before",
           "[list-diag]") {
     Legacy::GPUDirtyMemoryManager legacy;
-    Manager plain;
-    Manager diagnostic;
+    Manager plain{k64};
+    Manager diagnostic{k64};
     Core::GatherLotState lots;
     std::mt19937 rng{1234};
     using Out = std::vector<std::pair<u64, u64>>;
@@ -329,8 +370,9 @@ TEST_CASE("list diag: Collect and Gather, Diag=false and Diag=true, equal the ma
 TEST_CASE("list diag: the lot state lives outside the manager, one cache line per core", "[list-diag]") {
     STATIC_REQUIRE(sizeof(Core::GatherLotState) == 64);
     STATIC_REQUIRE(alignof(Core::GatherLotState) == 64);
-    // The manager of today has no member of the diagnostic: its layout is the one it always had.
-    STATIC_REQUIRE(sizeof(Manager) == sizeof(Legacy::GPUDirtyMemoryManager));
+    // The manager has no member of the diagnostic. Its only additions are the O1 fields (docs/t4-coherence-fix-plan.md, revision 5):
+    // the grain (two const u8) and the slot of the guard counter (one u8), which take 8 bytes with the padding.
+    STATIC_REQUIRE(sizeof(Manager) == sizeof(Legacy::GPUDirtyMemoryManager) + 8);
 }
 
 // =============================================================================================
@@ -839,8 +881,8 @@ TEST_CASE("list diag: sample_equal is consistent with an overwrite and with a me
     Fx f;
     std::map<u64, std::array<u8, 4>> guest;
     f.read_guest = [&](u64 addr, u8* out, size_t len) { std::memcpy(out, guest[addr].data(), len); };
-    f.Collect(0, 0xE000);
-    f.Collect(0, 0xE100);
+    f.CollectExact(0, 0xE000, 4);
+    f.CollectExact(0, 0xE100, 4);
     guest[0xE000] = {1, 2, 3, 4}; // the memcpy has not landed: the guest still holds the pop's bytes
     guest[0xE100] = {9, 9, 9, 9}; // newer bytes are there
     f.Pop(0xE000, 0xE004);
@@ -903,7 +945,7 @@ TEST_CASE("list diag: a notice that a pop reached and that expired without being
 // Part blk: the 64-byte block.
 
 TEST_CASE("list diag: the real Gather rounds a notice to a 64-byte block", "[list-diag]") {
-    Manager m;
+    Manager m{k64};
     m.Collect(0x10008, 4);
     std::vector<std::pair<u64, u64>> out;
     std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { out.emplace_back(a, s); };
@@ -915,7 +957,7 @@ TEST_CASE("list diag: the real Gather rounds a notice to a 64-byte block", "[lis
 
 TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did not write", "[list-diag]") {
     SECTION("64 bytes of the GPU in the block, 4 written by the CPU: 60 at risk (CPU read tracked)") {
-        Fx f;
+        Fx f{64, k64};
         f.track_cpu_reads = true;
         f.gpu_modified.Add(0x20000, 64);
         f.cpu_read.Add(0x20000, 16); // the CPU read [0x20000, 0x20010); the exact write is [0x20008, 0x2000c)
@@ -937,7 +979,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(Contains(lines, "gpu_covered=64 at_risk=60 (cpu_read=12 not_seen_cpu_read=48 unknown=0)"));
     }
     SECTION("without the CPU read tracking (not Switch 2) the at-risk bytes are unknown") {
-        Fx f;
+        Fx f{64, k64};
         f.track_cpu_reads = false;
         f.gpu_modified.Add(0x21000, 64);
         f.Collect(0, 0x21000);
@@ -947,7 +989,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(f.C(f.c().blk_at_risk_cpu_read) == 0);
     }
     SECTION("no GPU bytes in the block: nothing at risk") {
-        Fx f;
+        Fx f{64, k64};
         f.Collect(0, 0x22000);
         f.Invalidate();
         CHECK(f.C(f.c().blk_applies) == 1);
@@ -956,7 +998,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(f.C(f.c().blk_bytes_exact) == 4);
     }
     SECTION("GPU bytes only where the CPU wrote: the exact write is not at risk") {
-        Fx f;
+        Fx f{64, k64};
         f.gpu_modified.Add(0x23004, 4);
         f.Collect(0, 0x23004);
         f.Invalidate();
@@ -965,7 +1007,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(f.C(f.c().blk_ambiguous) == 0);
     }
     SECTION("two notices of the same lot in one block: the union of the exact writes is discounted") {
-        Fx f;
+        Fx f{64, k64};
         f.gpu_modified.Add(0x24000, 64);
         f.Collect(0, 0x24000);
         f.Collect(0, 0x24020);
@@ -974,7 +1016,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 56);
     }
     SECTION("a notice of another lot in the block makes the result ambiguous, not a number") {
-        Fx f;
+        Fx f{64, k64};
         f.gpu_modified.Add(0x25000, 64);
         f.Collect(0, 0x25000);
         const Proto::Batch b1 = f.GatherAll();
@@ -986,7 +1028,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(Contains(f.Lines(), "at_risk=ambiguous"));
     }
     SECTION("an application that the Gather did not hand over is unlinked and retires nothing") {
-        Fx f;
+        Fx f{64, k64};
         f.Collect(0, 0x26000);
         std::lock_guard lock{f.cache_mutex};
         f.proto.NoteApply(0x26000, 64, f.gpu_modified, f.cpu_read, false, f.read_guest); // no batch published
@@ -994,7 +1036,7 @@ TEST_CASE("list diag: problem B, the application covers GPU bytes the CPU did no
         CHECK(f.C(f.c().notice_applied) == 0);
     }
     SECTION("the part blk alone: no pop counters move") {
-        Fx f;
+        Fx f{64, k64};
         f.proto.pop_on = false;
         f.gpu_modified.Add(0x27000, 64);
         f.Collect(0, 0x27000);
@@ -1368,7 +1410,7 @@ Blocks Delivered(M& manager, std::vector<std::pair<u64, u64>>* ranges = nullptr)
 template <bool Diag>
 void CollectAndCheck(u64 addr, u64 size) {
     INFO("addr=0x" << std::hex << addr << " size=" << std::dec << size << " diag=" << Diag);
-    Manager manager;
+    Manager manager{k64};
     manager.template CollectT<Diag, TestHooks>(addr, size);
     CHECK(Delivered<Diag>(manager) == ExpectedBlocks(addr, size));
 }
@@ -1398,7 +1440,7 @@ TEST_CASE("list diag D1: crossing and exact cases deliver the whole range, round
 }
 
 TEST_CASE("list diag D1: the short crossing is two ranges of 64 bytes", "[list-diag][d1]") {
-    Manager manager;
+    Manager manager{k64};
     manager.CollectT<false>(0x107c0, 128);
     std::vector<std::pair<u64, u64>> ranges;
     Delivered<false>(manager, &ranges);
@@ -1426,7 +1468,7 @@ TEST_CASE("list diag D1: random writes inside a 4 KiB page are covered, not more
 TEST_CASE("list diag D1: several writes in one manager give the union", "[list-diag][d1]") {
     std::mt19937 rng{4242};
     for (int round = 0; round < 200; ++round) {
-        Manager manager;
+        Manager manager{k64};
         Blocks expected;
         for (int k = 0; k < 6; ++k) {
             const u64 page = 0x50000 + (rng() % 3) * 4096;
@@ -1452,8 +1494,8 @@ TEST_CASE("list diag D1: size zero changes nothing", "[list-diag][d1]") {
 TEST_CASE("list diag D1: writes that do not cross 2 KiB equal the manager of before",
           "[list-diag][d1]") {
     Legacy::GPUDirtyMemoryManager legacy;
-    Manager plain;
-    Manager diagnostic;
+    Manager plain{k64};
+    Manager diagnostic{k64};
     std::mt19937 rng{99};
     using Out = std::vector<std::pair<u64, u64>>;
     bool all_equal = true;
@@ -1571,7 +1613,11 @@ TEST_CASE("T3a.1 [1]: sampled and excluded pages mixed in the three paths of Col
         } else {
             const u64 addr = 0x40000 + (rng() % 6) * 4096 + (rng() % 64) * 64 + (rng() % 16) * 4;
             const auto c = f.Collect(0, addr);
-            reference.Collect(addr, 4);
+            u64 reference_addr = addr, reference_size = 4;
+            if (f.grain == Core::DirtyGrain::B4) {
+                RoundToBlocks(reference_addr, reference_size); // as Fx::Collect does for the manager of the fixture
+            }
+            reference.Collect(reference_addr, reference_size);
             ++steps;
             CHECK(c.sampled == f.proto.Sampled(addr));
             if (c.sampled) {
@@ -1630,7 +1676,7 @@ TEST_CASE("T3a.1 [2]: a notice outside the sample never touches the ledger or th
 
 TEST_CASE("T3a.1 [3]: partial and total overflow in the same block and lot", "[list-diag][t3a1]") {
     SECTION("partial: a record found, another lost") {
-        Fx f(2);
+        Fx f(2, k64);
         f.gpu_modified.Add(0x20000, 64);
         const auto a = f.Collect(0, 0x20000);
         const auto b = f.Collect(0, 0x20010);
@@ -1647,7 +1693,7 @@ TEST_CASE("T3a.1 [3]: partial and total overflow in the same block and lot", "[l
         CHECK(f.C(f.c().blk_incomplete_gpu_bytes) == 64 - 8);  // what T3a would have claimed
     }
     SECTION("the mutant NaiveNoCoverage claims it (the test can see the failure)") {
-        Fx f(2);
+        Fx f(2, k64);
         g_no_coverage = true;
         f.gpu_modified.Add(0x20000, 64);
         f.Collect(0, 0x20000);
@@ -1658,7 +1704,7 @@ TEST_CASE("T3a.1 [3]: partial and total overflow in the same block and lot", "[l
         CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 64 - 8);
     }
     SECTION("total: no record at all in the block is ambiguous, as 5 says") {
-        Fx f(1);
+        Fx f(1, k64);
         f.gpu_modified.Add(0x21000, 64);
         f.gpu_modified.Add(0x22000, 64);
         CHECK(f.Collect(0, 0x21000).registered);
@@ -1938,7 +1984,8 @@ struct FrozenHooks : TestHooks {};
 
 template <class P>
 struct Script {
-    explicit Script(unsigned slots) : proto(slots) {}
+    explicit Script(unsigned slots, Core::DirtyGrain grain = TestGrain())
+        : managers{MakeManagers(grain, std::make_index_sequence<kCores>{})}, proto(slots) {}
     std::array<Manager, kCores> managers;
     P proto;
     Common::RangeSet<u64> gpu_modified;
@@ -2354,8 +2401,8 @@ const Proto::BlkcmpRequest* AffirmedCycle(Fx& f, u64 page, u32 exact_off = 0, u3
 }
 
 struct BlkcmpFx {
-    Fx f{64};
-    BlkcmpFx() {
+    Fx f;
+    explicit BlkcmpFx(Core::DirtyGrain grain = k64) : f{64, grain} {
         f.proto.blkcmp_on = true;
         f.proto.BlkcmpExpire(); // nothing left from an earlier test of this thread
     }
@@ -2600,7 +2647,7 @@ TEST_CASE("blkcmp [6]: the discards by reason and the conservation", "[list-diag
 
 TEST_CASE("blkcmp [7]: nothing without blk or with blkcmp off, and the other counters do not change", "[list-diag][blkcmp]") {
     SECTION("blkcmp off: no request, no counter") {
-        Fx f(64);
+        Fx f(64, k64);
         f.proto.BlkcmpExpire();
         CHECK(AffirmedCycle(f, 0xE500) == nullptr);
         for (const FieldRef& field : Fields(f.c())) {
@@ -2611,7 +2658,7 @@ TEST_CASE("blkcmp [7]: nothing without blk or with blkcmp off, and the other cou
         }
     }
     SECTION("blkcmp on but blk off: AccountBlock does not run") {
-        Fx f(64);
+        Fx f(64, k64);
         f.proto.blkcmp_on = true;
         f.proto.blk_on = false;
         f.proto.blkcmp_odds = 1;
@@ -2621,7 +2668,7 @@ TEST_CASE("blkcmp [7]: nothing without blk or with blkcmp off, and the other cou
     SECTION("the same script with and without blkcmp gives the same blk and notice counters") {
         std::map<std::string, u64> with, without;
         for (const bool on : {true, false}) {
-            Script<Proto> sc(16);
+            Script<Proto> sc(16, k64);
             sc.proto.blkcmp_on = on;
             sc.proto.blkcmp_odds = 2;
             sc.proto.ledger.expiry_us = 1'500'000;
@@ -2738,7 +2785,7 @@ struct T4World {
     bool gpu_range_present_before = false;
     bool gpu_range_empty_after = false;
 
-    T4World() {
+    explicit T4World(Core::DirtyGrain grain) : manager{grain} {
         host.fill(kOldGuest);
         guest.fill(kOldGuest);
     }
@@ -2784,8 +2831,9 @@ struct T4World {
 /// `divergent_tail` the GPU also wrote [40, 48) with values the guest does NOT have (host != guest there), which
 /// the residual scenarios need: a write of [41, 45) or [41, 42) makes a grain of 4 or 8 bytes take the
 /// neighbours [40, 48) or [40, 44), and if host and guest began equal there the loss would be invisible.
-std::unique_ptr<T4World> AssembleB(u64 offset, u64 size, bool divergent_tail = false) { // the manager is not movable
-    auto w = std::make_unique<T4World>();
+std::unique_ptr<T4World> AssembleB(u64 offset, u64 size, bool divergent_tail = false,
+                                   Core::DirtyGrain grain = k64) { // the manager is not movable
+    auto w = std::make_unique<T4World>(grain);
     w->GpuWrites(0, 32);
     if (divergent_tail) {
         std::fill(w->host.begin() + 40, w->host.begin() + 48, kGpuByteTail);
@@ -2796,7 +2844,7 @@ std::unique_ptr<T4World> AssembleB(u64 offset, u64 size, bool divergent_tail = f
     return w;
 }
 
-/// The preparation, common to (a) of each scenario. `lost` says the current behaviour: the host lost [0, 32).
+/// The preparation of (a) at the 64 B grain. It says the behaviour of that grain: the host lost [0, 32).
 void CheckPreparation(const T4World& w, u64 offset, u64 size, bool divergent_tail = false) {
     // The bytes written: the guest holds the CPU's bytes and the old values elsewhere.
     for (u64 i = 0; i < 64; ++i) {
@@ -2837,61 +2885,471 @@ void CheckPreparation(const T4World& w, u64 offset, u64 size, bool divergent_tai
 
 } // namespace
 
+namespace {
+
+/// The preparation of (a) at the 4 B grain: the Gather delivers the exact cells of the write, so the GPU bytes around it
+/// stay in the host (nothing of [0, 32) comes back as the guest's old values) and the CPU's bytes arrive. With the divergent
+/// tail the neighbours inside the cell range are the ONLY bytes that can still be lost: `expect_lost_begin..end` are the
+/// bytes of [40, 48) outside the write that the cell range covers (empty for a write aligned to 4 B in address and size).
+void CheckPreparation4(const T4World& w, u64 offset, u64 size, bool divergent_tail, u64 delivered_begin, u64 delivered_end) {
+    for (u64 i = 0; i < 64; ++i) {
+        const bool written = i >= offset && i < offset + size;
+        REQUIRE(w.guest[i] == (written ? kCpuByte : kOldGuest));
+    }
+    for (u64 i = 0; i < 32; ++i) {
+        REQUIRE(w.host_before_apply[i] == kGpuByte);
+    }
+    REQUIRE(w.gpu_range_present_before);
+    // One range: the write rounded OUT to cells of 4 B (and nothing else), because the cells are in one 128 B transformation.
+    REQUIRE(w.delivered.size() == 1);
+    REQUIRE(w.delivered[0] == std::pair<u64, u64>{kPageBase + delivered_begin, delivered_end - delivered_begin});
+    for (u64 i = offset; i < offset + size; ++i) {
+        REQUIRE(w.host[i] == kCpuByte);
+    }
+    // The defect of the 64 B grain is gone for what the cells do not touch: the GPU's [0, 32) is still the GPU's.
+    for (u64 i = 0; i < 32; ++i) {
+        REQUIRE(w.host[i] == kGpuByte);
+    }
+    if (divergent_tail) {
+        for (u64 i = 40; i < 48; ++i) {
+            REQUIRE(w.host_before_apply[i] == kGpuByteTail);
+            const bool own_byte = i >= offset && i < offset + size;
+            REQUIRE((own_byte || w.guest[i] != w.host_before_apply[i]));
+        }
+    }
+}
+
+} // namespace
+
+// At the 64 B grain (the default): the Gather gives [0,64) and the host loses [0,32). The reproduction of B.
 TEST_CASE("t4 [a]: B, the main script: the Gather gives [0,64) and the host loses [0,32) (today)", "[list-diag][t4]") {
-    const auto w = AssembleB(40, 4);
+    const auto w = AssembleB(40, 4, false, k64);
     CheckPreparation(*w, 40, 4);
 }
 
-// Fails today (the loss is real). Remove [!shouldfail] when T4 fixes the problem: this case then passes, and the
-// tag makes Catch2 report that as a failure, which is the signal to remove it.
-TEST_CASE("t4 [b]: B, the main script: C1, the host keeps [0,32) and receives [40,44)", "[list-diag][t4][!shouldfail]") {
-    const auto w = AssembleB(40, 4);
+// Fails at the DEFAULT grain (the loss is real); the tag stays on the 64 B case, which documents the defect that the
+// default still has. O1 is opt-in (EDEN_DIRTY_GRAIN=4), so this does not go away by itself.
+TEST_CASE("t4 [b]: B, the main script, 64 B grain: C1, the host keeps [0,32) and receives [40,44)",
+          "[list-diag][t4][!shouldfail]") {
+    const auto w = AssembleB(40, 4, false, k64);
     CHECK(w->OnlyCpuBytesChanged(40, 4));
 }
 
-// The residual. With the manager at 64 B this only shows the current defect. It will show the residual of O1
-// (a write smaller than or misaligned to the grain still takes its neighbours) only when it runs with the
-// candidate grain, after O1 exists.
-// The GPU's data is divergent in [0, 32) AND [40, 48) here (revision 2 of the T4 plan), so the bytes outside the
-// exact write but inside the rounding to a grain of 4 or 8 bytes ([40, 48) and [40, 44)) show the loss.
-TEST_CASE("t4 [a]: residual, a misaligned 4-byte write [41,45) and a 1-byte write", "[list-diag][t4]") {
-    CheckPreparation(*AssembleB(41, 4, true), 41, 4, true);
-    CheckPreparation(*AssembleB(41, 1, true), 41, 1, true);
+// At the 4 B grain the main script meets C1: the Gather gives [40,44) and the GPU's [0,32) is kept. The tag leaves this case.
+TEST_CASE("t4 [a4]: B, the main script, 4 B grain: the Gather gives [40,44) and the host keeps [0,32)", "[list-diag][t4][o1]") {
+    const auto w = AssembleB(40, 4, false, k4);
+    CheckPreparation4(*w, 40, 4, false, 40, 44);
 }
 
-TEST_CASE("t4 [b]: residual, a misaligned 4-byte write [41,45): C1", "[list-diag][t4][!shouldfail]") {
-    const auto w = AssembleB(41, 4, true);
+TEST_CASE("t4 [b4]: B, the main script, 4 B grain: C1, the host keeps [0,32) and receives [40,44)", "[list-diag][t4][o1]") {
+    const auto w = AssembleB(40, 4, false, k4);
+    CHECK(w->OnlyCpuBytesChanged(40, 4));
+}
+
+// The residual. The GPU's data is divergent in [0, 32) AND [40, 48) here (revision 2 of the T4 plan), so the bytes outside the
+// exact write but inside the rounding to a grain show the loss.
+TEST_CASE("t4 [a]: residual, a misaligned 4-byte write [41,45) and a 1-byte write", "[list-diag][t4]") {
+    CheckPreparation(*AssembleB(41, 4, true, k64), 41, 4, true);
+    CheckPreparation(*AssembleB(41, 1, true, k64), 41, 1, true);
+}
+
+// A 4-byte write ALIGNED to the grain, with the GPU's data divergent in [40, 48): at the 4 B grain it takes no neighbour, so C1
+// holds and the GPU's [44, 48) is kept. Without the tag: this is what O1 delivers.
+TEST_CASE("t4 [b4]: residual, an aligned 4-byte write [40,44) with divergent GPU data in [40,48): C1", "[list-diag][t4][o1]") {
+    const auto w = AssembleB(40, 4, true, k4);
+    CheckPreparation4(*w, 40, 4, true, 40, 44);
+    CHECK(w->OnlyCpuBytesChanged(40, 4));
+    for (u64 i = 44; i < 48; ++i) {
+        CHECK(w->host[i] == kGpuByteTail); // the neighbours inside [40, 48) kept the GPU's bytes
+    }
+}
+
+// The NEGATIVES that stay: with the 4 B grain a write misaligned to it, or smaller than it, still takes its neighbours
+// ([40,48) for [41,45); [40,44) for the byte at 41). That is the residual of O1 (revision 1, item 3), not a solution.
+TEST_CASE("t4 [b4]: residual, a misaligned 4-byte write [41,45), 4 B grain: C1", "[list-diag][t4][o1][!shouldfail]") {
+    const auto w = AssembleB(41, 4, true, k4);
     CHECK(w->OnlyCpuBytesChanged(41, 4));
 }
 
-TEST_CASE("t4 [b]: residual, a 1-byte write at 41: C1", "[list-diag][t4][!shouldfail]") {
-    const auto w = AssembleB(41, 1, true);
+TEST_CASE("t4 [b4]: residual, a 1-byte write at 41, 4 B grain: C1", "[list-diag][t4][o1][!shouldfail]") {
+    const auto w = AssembleB(41, 1, true, k4);
     CHECK(w->OnlyCpuBytesChanged(41, 1));
 }
 
-// Two runs of bits in one transformation (bits 0-3 and 8 of the mask). This documents the CURRENT behaviour: both
-// ranges come out. It does NOT show the defect of the Gather loop (gpu_dirty_memory_manager.h:195,
-// "continuous_bits < align_size") with a smaller grain: with 64 B the mask has 32 bits, the condition is always
-// true and nothing is lost. The case has to run again with the candidate grain when O1 is implemented. The
-// manager is not changed here.
-TEST_CASE("t4: two runs of bits in one transformation give both ranges (current behaviour)", "[list-diag][t4]") {
-    // The addresses come from the GRAIN, not from literals: bits 0-3 of the mask are the first four grains and
-    // bit 8 is the ninth, in the SAME transformation (32 grains) whatever the grain is. kTestGrain is the grain of
-    // the manager today (its align_size, private); when O1 exists it becomes the candidate grain (4 or 8) and the
-    // case then runs with the smaller grain, where the Gather loop condition "continuous_bits < align_size"
-    // (gpu_dirty_memory_manager.h:195) is what must be fixed. The base is aligned to the transformation.
-    constexpr u64 kTestGrain = 64;
-    constexpr u64 kTransformation = 32 * kTestGrain;
-    static_assert(kPageBase % kTransformation == 0);
-    Manager manager;
-    manager.Collect(kPageBase, 4 * kTestGrain);                       // bits 0-3
-    manager.Collect(kPageBase + 8 * kTestGrain, kTestGrain);          // bit 8
+// The residual, described: the cell range of those two writes (this one passes: it states WHICH neighbours are taken).
+TEST_CASE("t4 [a4]: residual, the cells of [41,45) and of the byte at 41 take [40,48) and [40,44)", "[list-diag][t4][o1]") {
+    const auto w1 = AssembleB(41, 4, true, k4);
+    REQUIRE(w1->delivered.size() == 1);
+    CHECK(w1->delivered[0] == std::pair<u64, u64>{kPageBase + 40, 8});
+    for (u64 i = 40; i < 48; ++i) {
+        if (i < 41 || i >= 45) {
+            CHECK(w1->host[i] == kOldGuest); // the GPU's [40,41) and [45,48) were lost
+        }
+    }
+    const auto w2 = AssembleB(41, 1, true, k4);
+    REQUIRE(w2->delivered.size() == 1);
+    CHECK(w2->delivered[0] == std::pair<u64, u64>{kPageBase + 40, 4});
+    CHECK(w2->host[40] == kOldGuest);
+    CHECK(w2->host[44] == kGpuByteTail); // beyond the cell: kept
+}
+
+// Two runs of bits in one transformation (bits 0-3 and 8 of the mask), at BOTH grains. The addresses come from the grain: bits
+// 0-3 are the first four grains and bit 8 the ninth, in the SAME transformation (32 grains). At 4 B this is what the fix of
+// the Gather loop (gpu_dirty_memory_manager.h, "continuous_bits < mask_width") shows: with the condition on the grain in bytes
+// (`< align_size`, 4) the run at bit 8 was dropped; at 64 B the condition was always true and nothing was lost.
+TEST_CASE("t4: two runs of bits in one transformation give both ranges, at both grains", "[list-diag][t4][o1]") {
+    for (const Core::DirtyGrain grain : {k64, k4}) {
+        const u64 g = Core::DirtyGrainBytes(grain);
+        const u64 transformation = 32 * g;
+        INFO("grain " << g);
+        static_assert(kPageBase % 2048 == 0);
+        REQUIRE(kPageBase % transformation == 0);
+        Manager manager{grain};
+        manager.Collect(kPageBase, 4 * g);           // bits 0-3
+        manager.Collect(kPageBase + 8 * g, g);       // bit 8
+        manager.Collect(kPageBase + 20 * g, 3 * g);  // bits 20-22: a third run
+        manager.Collect(kPageBase + 31 * g, g);      // bit 31: the last bit of the mask
+        std::vector<std::pair<u64, u64>> got;
+        std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
+        manager.Gather(cb);
+        REQUIRE(got.size() == 4);
+        CHECK(got[0] == std::pair<u64, u64>{kPageBase, 4 * g});
+        CHECK(got[1] == std::pair<u64, u64>{kPageBase + 8 * g, g});
+        CHECK(got[2] == std::pair<u64, u64>{kPageBase + 20 * g, 3 * g});
+        CHECK(got[3] == std::pair<u64, u64>{kPageBase + 31 * g, g});
+        // The transformation edge: bit 31 is the last grain of the 32, and the next write starts a new transformation.
+        CHECK((kPageBase + 31 * g + g) == (kPageBase + transformation));
+    }
+}
+
+TEST_CASE("t4: a full mask (32 grains) and a run to the end of the mask, at both grains", "[list-diag][t4][o1]") {
+    for (const Core::DirtyGrain grain : {k64, k4}) {
+        const u64 g = Core::DirtyGrainBytes(grain);
+        INFO("grain " << g);
+        Manager manager{grain};
+        manager.Collect(kPageBase, 32 * g);
+        manager.Collect(kPageBase + 32 * g + 5 * g, 27 * g); // bits 5-31 of the next transformation
+        std::vector<std::pair<u64, u64>> got;
+        std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
+        manager.Gather(cb);
+        REQUIRE(got.size() == 2);
+        CHECK(got[0] == std::pair<u64, u64>{kPageBase, 32 * g});
+        CHECK(got[1] == std::pair<u64, u64>{kPageBase + 37 * g, 27 * g});
+    }
+}
+
+// =============================================================================================
+// O1 (docs/t4-coherence-fix-plan.md, 3 and 8, revision 5): the 4 B grain (a transformation of 128 B) next to the 64 B one (2 KiB).
+
+namespace {
+
+using Cells = std::set<u64>;
+
+Cells ExpectedCells(u64 grain, u64 addr, u64 size) {
+    Cells cells;
+    for (u64 c = addr / grain; c <= (addr + size - 1) / grain; ++c) {
+        cells.insert(c);
+    }
+    return cells;
+}
+
+/// What the Gather delivers, as cells of `grain` bytes (every range must be a whole number of aligned cells), plus its ranges.
+template <bool Diag>
+Cells DeliveredCells(Manager& manager, u64 grain, std::vector<std::pair<u64, u64>>* ranges = nullptr) {
+    Cells cells;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) {
+        REQUIRE(a % grain == 0);
+        REQUIRE(s % grain == 0);
+        REQUIRE(s != 0);
+        if (ranges != nullptr) {
+            ranges->emplace_back(a, s);
+        }
+        for (u64 c = a / grain; c < (a + s) / grain; ++c) {
+            cells.insert(c);
+        }
+    };
+    if constexpr (Diag) {
+        Core::GatherLotState lots;
+        u64 lot = 0;
+        manager.template GatherT<true, TestHooks>(cb, &lots, &lot);
+    } else {
+        manager.Gather(cb);
+    }
+    return cells;
+}
+
+template <bool Diag>
+void CheckCellsOf(Core::DirtyGrain grain, u64 addr, u64 size) {
+    const u64 g = Core::DirtyGrainBytes(grain);
+    INFO("grain " << g << " addr=0x" << std::hex << addr << " size=" << std::dec << size << " diag=" << Diag);
+    Manager manager{grain};
+    manager.template CollectT<Diag, TestHooks>(addr, size);
+    CHECK(DeliveredCells<Diag>(manager, g) == ExpectedCells(g, addr, size));
+}
+
+template <bool Diag>
+void RunBorderCases(Core::DirtyGrain grain) {
+    const u64 g = Core::DirtyGrainBytes(grain);
+    const u64 t = 32 * g; // 128 B or 2 KiB
+    const u64 base = 0x100000; // aligned to both
+    // Exactly one transformation, the next one, and two; a single grain at the first and at the last position.
+    CheckCellsOf<Diag>(grain, base, t);
+    CheckCellsOf<Diag>(grain, base + t, t);
+    CheckCellsOf<Diag>(grain, base, 2 * t);
+    CheckCellsOf<Diag>(grain, base, g);
+    CheckCellsOf<Diag>(grain, base + t - g, g);
+    // Ending exactly on the edge (from inside), starting exactly on it, and one byte past it.
+    CheckCellsOf<Diag>(grain, base + t - 3 * g, 3 * g);
+    CheckCellsOf<Diag>(grain, base + t, g);
+    CheckCellsOf<Diag>(grain, base + t - 1, 2);
+    CheckCellsOf<Diag>(grain, base + t - g, g + 1);
+    // Crossing one edge and two edges, unaligned at both ends.
+    CheckCellsOf<Diag>(grain, base + t - g - 1, 2 * g + 3);
+    CheckCellsOf<Diag>(grain, base + t / 2 + 1, 3 * t);
+    CheckCellsOf<Diag>(grain, base + 3, 5 * t + 7);
+    // One byte, anywhere in the first and the last grain of a transformation.
+    CheckCellsOf<Diag>(grain, base + 1, 1);
+    CheckCellsOf<Diag>(grain, base + t - 1, 1);
+    // A whole 4 KiB page, and a write that spans many pages.
+    CheckCellsOf<Diag>(grain, base, 4096);
+    CheckCellsOf<Diag>(grain, base + 5, 3 * 4096 + 11);
+}
+
+} // namespace
+
+TEST_CASE("O1: the borders of the transformation, 128 B at the 4 B grain and 2 KiB at the 64 B grain", "[list-diag][o1]") {
+    for (const Core::DirtyGrain grain : {k64, k4}) {
+        RunBorderCases<false>(grain);
+        RunBorderCases<true>(grain);
+    }
+}
+
+TEST_CASE("O1: random writes are covered at both grains, never more than the rounding to the grain", "[list-diag][o1]") {
+    std::mt19937 rng{20261106};
+    for (int i = 0; i < 30000; ++i) {
+        const u64 page = 0x40000 + (rng() % 4) * 4096;
+        const u64 off = rng() % 4096;
+        const u64 size = 1 + rng() % (rng() % 8 == 0 ? 3 * 4096 : 600);
+        const Core::DirtyGrain grain = (i & 1) != 0 ? k4 : k64;
+        if ((i & 2) != 0) {
+            CheckCellsOf<false>(grain, page + off, size);
+        } else {
+            CheckCellsOf<true>(grain, page + off, size);
+        }
+    }
+}
+
+TEST_CASE("O1: the highest transformation, whose address field is the marker value, holds a write at the 4 B grain",
+          "[list-diag][o1]") {
+    // At 128 B the address field of the last transformation below 2^39 is 0xffffffff: the value of the empty marker. A write
+    // there has a non-zero mask and must be delivered; the empty marker (mask 0) must not.
+    constexpr u64 kTop = u64{0xffffffff} << 7;
+    Manager manager{k4};
     std::vector<std::pair<u64, u64>> got;
     std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
     manager.Gather(cb);
+    CHECK(got.empty());
+    manager.Collect(kTop + 8, 4);
+    manager.Collect(kTop + 120, 8); // the last two grains of the transformation (bits 30 and 31)
+    manager.Gather(cb);
     REQUIRE(got.size() == 2);
-    CHECK(got[0] == std::pair<u64, u64>{kPageBase, 4 * kTestGrain});
-    CHECK(got[1] == std::pair<u64, u64>{kPageBase + 8 * kTestGrain, kTestGrain});
+    CHECK(got[0] == std::pair<u64, u64>{kTop + 8, 4});
+    CHECK(got[1] == std::pair<u64, u64>{kTop + 120, 8});
+    got.clear();
+    manager.Gather(cb);
+    CHECK(got.empty());
+    // The same write after a Gather, then an other transformation: the swap keeps both.
+    manager.Collect(kTop, 4);
+    manager.Collect(0x1000, 4);
+    manager.Gather(cb);
+    CHECK(got.size() == 2);
+}
+
+namespace {
+
+/// The bytes a Gather delivers, as sorted, merged intervals.
+std::vector<std::pair<u64, u64>> CoverageOf(Manager& manager) {
+    std::vector<std::pair<u64, u64>> ranges;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { ranges.emplace_back(a, a + s); };
+    manager.Gather(cb);
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<u64, u64>> merged;
+    for (const auto& [b, e] : ranges) {
+        if (!merged.empty() && b <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, e);
+        } else {
+            merged.emplace_back(b, e);
+        }
+    }
+    return merged;
+}
+
+bool Within(const std::vector<std::pair<u64, u64>>& inner, const std::vector<std::pair<u64, u64>>& outer) {
+    return std::all_of(inner.begin(), inner.end(), [&](const auto& r) {
+        return std::any_of(outer.begin(), outer.end(),
+                           [&](const auto& o) { return o.first <= r.first && r.second <= o.second; });
+    });
+}
+
+} // namespace
+
+TEST_CASE("O1: for writes aligned to 64 B both grains give the same coverage in bytes", "[list-diag][o1]") {
+    std::mt19937 rng{64064};
+    Manager m64{k64};
+    Manager m4{k4};
+    for (int step = 0; step < 40000; ++step) {
+        if (rng() % 9 == 0) {
+            const auto a = CoverageOf(m64);
+            const auto b = CoverageOf(m4);
+            REQUIRE(a == b); // the same bytes; the SPLIT into ranges may differ at the 128 B edges, so merged
+        } else {
+            const u64 addr = 0x200000 + (rng() % 96) * 64 + (rng() % 3) * 4096;
+            const u64 size = (1 + rng() % (rng() % 6 == 0 ? 80 : 6)) * 64; // up to 5 KiB: crosses 128 B and 2 KiB edges
+            m64.Collect(addr, size);
+            if (step & 1) {
+                m4.template CollectT<true, TestHooks>(addr, size);
+            } else {
+                m4.Collect(addr, size);
+            }
+        }
+    }
+    CHECK(CoverageOf(m64) == CoverageOf(m4));
+}
+
+TEST_CASE("O1: for any write the 4 B coverage holds the bytes, and lies inside the 64 B coverage", "[list-diag][o1]") {
+    std::mt19937 rng{4004};
+    Manager m64{k64};
+    Manager m4{k4};
+    std::vector<std::pair<u64, u64>> written;
+    for (int step = 0; step < 30000; ++step) {
+        if (rng() % 10 == 0) {
+            const auto a = CoverageOf(m64);
+            const auto b = CoverageOf(m4);
+            REQUIRE(Within(b, a));                           // the smaller grain never covers more
+            for (const auto& [begin, end] : written) {       // and it holds every byte written
+                REQUIRE(Within(std::vector<std::pair<u64, u64>>{{begin, end}}, b));
+            }
+            written.clear();
+        } else {
+            const u64 addr = 0x300000 + rng() % 12288;
+            const u64 size = 1 + rng() % (rng() % 7 == 0 ? 700 : 24);
+            m64.Collect(addr, size);
+            m4.Collect(addr, size);
+            written.emplace_back(addr, addr + size);
+        }
+    }
+}
+
+TEST_CASE("O1: the writer cost counter counts the guard takes (the swaps of the transformation), only inside the guard",
+          "[list-diag][o1]") {
+    (void)Core::TakeDirtyGuardTakes();
+    constexpr u64 kBase = 0x400000;
+    {
+        // 16 writes 128 B apart in one 2 KiB region: one transformation at 64 B, a swap each time at 4 B.
+        Manager m64{k64};
+        for (u64 i = 0; i < 16; ++i) {
+            m64.Collect(kBase + i * 128, 4);
+        }
+        CHECK(Core::TakeDirtyGuardTakes() == 0);
+        Manager m4{k4};
+        for (u64 i = 0; i < 16; ++i) {
+            m4.Collect(kBase + i * 128, 4);
+        }
+        CHECK(Core::TakeDirtyGuardTakes() == 15); // the first goes to the empty `current` by CAS: no guard
+    }
+    {
+        // Several writes in the same transformation: the CAS path only, nothing counted.
+        Manager m4{k4};
+        for (u64 i = 0; i < 32; ++i) {
+            m4.Collect(kBase + i * 4, 4);
+        }
+        m4.Collect(kBase + 8, 4);
+        CHECK(Core::TakeDirtyGuardTakes() == 0);
+    }
+    {
+        // After a Gather `current` is empty again: the next write is by CAS, the one after a different region by the guard.
+        Manager m4{k4};
+        std::function<void(PAddr, size_t)> cb = [](PAddr, size_t) {};
+        m4.Collect(kBase, 4);
+        m4.Gather(cb);
+        m4.Collect(kBase + 1024, 4);
+        CHECK(Core::TakeDirtyGuardTakes() == 0);
+        m4.Collect(kBase + 2048, 4);
+        CHECK(Core::TakeDirtyGuardTakes() == 1);
+    }
+    {
+        // A write that crosses the edge is two pieces: the guard is taken once for the second piece after the first.
+        Manager m64{k64};
+        m64.Collect(kBase + 2040, 20);
+        CHECK(Core::TakeDirtyGuardTakes() == 1);
+        Manager m4{k4};
+        m4.Collect(kBase + 124, 8);
+        CHECK(Core::TakeDirtyGuardTakes() == 1);
+    }
+}
+
+TEST_CASE("O1: ParseDirtyGrain, the session grain and the layout", "[list-diag][o1]") {
+    CHECK(Core::ParseDirtyGrain(nullptr) == k64);
+    CHECK(Core::ParseDirtyGrain("") == k64);
+    CHECK(Core::ParseDirtyGrain("0") == k64);
+    CHECK(Core::ParseDirtyGrain("64") == k64);
+    CHECK(Core::ParseDirtyGrain("8") == k64); // 8 B was ruled out (T4 plan, 4.1): not an option
+    CHECK(Core::ParseDirtyGrain("44") == k64);
+    CHECK(Core::ParseDirtyGrain("4") == k4);
+    CHECK(Core::DirtyGrainBytes(k64) == 64);
+    CHECK(Core::DirtyGrainBytes(k4) == 4);
+    Manager a{k4};
+    Manager b{k64};
+    CHECK(a.Grain() == k4);
+    CHECK(b.Grain() == k64);
+    // The default-constructed manager has the grain of the session, whatever it is.
+    Manager d;
+    CHECK(d.Grain() == Core::SessionDirtyGrain());
+}
+
+TEST_CASE("O1: the diagnostic at the 4 B grain: smaller ranges, the same classification in 64-byte blocks", "[list-diag][o1]") {
+    SECTION("an aligned 4-byte write over GPU bytes: the range is the write, nothing at risk, no blkcmp request") {
+        BlkcmpFx b{k4};
+        b.f.proto.blkcmp_odds = 1;
+        b.f.gpu_modified.Add(0xE700 << 12, 64);
+        b.f.CollectExact(0, (u64{0xE700} << 12) + 8, 4);
+        ApplyAll(b.f, b.f.GatherAll());
+        CHECK(b.f.C(b.f.c().blk_applies) == 1);
+        CHECK(b.f.C(b.f.c().blk_applies_over_gpu) == 1);
+        CHECK(b.f.C(b.f.c().blk_bytes_range) == 4);
+        CHECK(b.f.C(b.f.c().blk_bytes_exact) == 4);
+        CHECK(b.f.C(b.f.c().blk_gpu_bytes_covered) == 4);
+        CHECK(b.f.C(b.f.c().blk_gpu_bytes_at_risk) == 0);
+        CHECK(b.f.C(b.f.c().blkcmp_eligible) == 0);
+    }
+    SECTION("a misaligned 4-byte write: the range is the two cells, 4 bytes at risk, the request is made") {
+        BlkcmpFx b{k4};
+        b.f.proto.blkcmp_odds = 1;
+        b.f.proto.blkcmp_max_bytes = 4096;
+        b.f.proto.blkcmp_burst = 100;
+        const u64 page = 0xE701;
+        b.f.gpu_modified.Add(page << 12, 64);
+        b.f.CollectExact(0, (page << 12) + 9, 4);
+        ApplyAll(b.f, b.f.GatherAll());
+        CHECK(b.f.C(b.f.c().blk_bytes_range) == 8);
+        CHECK(b.f.C(b.f.c().blk_bytes_exact) == 4);
+        CHECK(b.f.C(b.f.c().blk_gpu_bytes_covered) == 8);
+        CHECK(b.f.C(b.f.c().blk_gpu_bytes_at_risk) == 4);
+        CHECK(b.f.C(b.f.c().blkcmp_eligible) == 1);
+        CHECK(b.f.proto.BlkcmpPending((page << 12) + 8, 8) != nullptr); // the affirmed range: the two cells
+    }
+    SECTION("the identity of the lots and the conservation hold with the transformation of 128 B (writes in many of them)") {
+        Fx f{256, k4};
+        for (int round = 0; round < 50; ++round) {
+            for (u64 i = 0; i < 40; ++i) {
+                f.CollectExact(static_cast<unsigned>(i % kCores), 0x500000 + (static_cast<u64>(round) * 40 + i) * 132, 4);
+            }
+            f.Invalidate();
+        }
+        CHECK(f.Conserved());
+        CHECK(f.W().registered == 2000);
+        CHECK(f.C(f.c().notice_applied) + f.W().late + f.W().expired + f.PublishedSlots() == f.W().registered);
+    }
 }
 
 // =============================================================================================
@@ -2964,7 +3422,7 @@ TEST_CASE("t4.0 [3]: a non-zero mask at the address of the marker is a write, no
     // be a different, lower address, which is the case that matters; this test is the guard for that day. A test of
     // the address (`address != ~0U`) would discard this write; the test of the mask does not.
     constexpr u64 kMarkerPage = u64{0xffffffff} << 11;
-    Manager m;
+    Manager m{k64};
     Legacy::GPUDirtyMemoryManager legacy;
     m.Collect(kMarkerPage + 64, 64);
     legacy.Collect(kMarkerPage + 64, 64);
@@ -2993,8 +3451,8 @@ TEST_CASE("t4.0 [3]: a non-zero mask at the address of the marker is a write, no
 
 TEST_CASE("t4.0 [4]: random sequences with many Gathers: the same output as the manager of before", "[list-diag][t40]") {
     Legacy::GPUDirtyMemoryManager legacy;
-    Manager plain;
-    Manager diagnostic;
+    Manager plain{k64};
+    Manager diagnostic{k64};
     Core::GatherLotState lots;
     std::mt19937 rng{2026};
     bool same = true;
@@ -3025,7 +3483,7 @@ TEST_CASE("t4.0 [5]: collect and Gather interleaved in threads: coverage is kept
     // that takes the guard path can overwrite the other writer's concurrent CAS, and a block is lost; the old
     // manager does it too (3 of 20 rounds in a check made while writing this test). Production does not do it.
     for (int round = 0; round < 3; ++round) {
-        Manager m;
+        Manager m{k64};
         constexpr unsigned kWrites = 8000;
         std::vector<u64> written;
         std::atomic<bool> done{false};
