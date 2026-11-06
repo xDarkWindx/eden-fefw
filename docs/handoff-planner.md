@@ -70,6 +70,7 @@ mexe em `docs/` só quando o codador está parado, e diz no prompt seguinte "tra
 | `docs/t4-coherence-fix-plan.md` | T4 (problema B): mecanismo, contrato, o que não resolve (A, M), opções O1 a O4, medições, reprodução dirigida, aceite |
 | `docs/future-optimizations-plan.md` | Preparação para engine/rasterizador separados, descriptor sets persistentes e heap bindless |
 | `docs/back-thread-split-plan.md`, `docs/perf-handoff.md`, `docs/handoff-aggressive.md` | Histórico do desempenho do FE (consulta) |
+| `docs/back-thread-phase3-design.md`, `docs/handoff-threads.md` | Recuperados dos branches `perf/back-thread-split` e `perf/draw-overhead` (2026-11-06): desenho da fase 3 do split (segunda divisão, heap bindless) e pré-plano de dividir o trabalho por draw da thread de trás. Só existiam nesses branches |
 
 Harnesses (rodam na nuvem, sem o jogo): `tools/gpu-contract-harness/run.sh` (modelo dos contratos, 29 casos,
 dois modos de host; o completo leva vários minutos) e `tools/list-diag-harness/run.sh` (protocolo do
