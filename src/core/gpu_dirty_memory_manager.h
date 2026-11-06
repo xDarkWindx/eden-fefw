@@ -103,7 +103,7 @@ private:
             tmp = current.load(load_order);
             original = tmp;
             if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
+                if (HasWrites(tmp)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
                     current.exchange(t, exchange_order);
@@ -165,7 +165,7 @@ public:
             std::scoped_lock lk(guard);
             TransformAddress t = current.exchange(default_transform, exchange_order);
             front_buffer.swap(back_buffer);
-            if (IsValid(t.address)) {
+            if (HasWrites(t)) {
                 front_buffer.emplace_back(t);
             }
             if constexpr (Diag) {
@@ -224,8 +224,14 @@ private:
     constexpr static size_t align_mask = align_size - 1;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
-    bool IsValid(PAddr address) {
-        return address < (1ULL << 39);
+    /// A transformation holds writes iff its mask is not zero; the empty one is `default_transform` (what
+    /// `current` holds after a Gather, and at the start). Identified by the MASK, never by the address: the
+    /// marker's address (~0U) is also a legitimate address field, and a write there has a non-zero mask
+    /// (docs/t4-coherence-fix-plan.md, 3 and 8, item 4). The old `IsValid` tested `address < 2^39` on the
+    /// u32 field of the transformation, so every transformation, the empty one included, counted as valid,
+    /// and an empty one was queued in back_buffer and front_buffer for nothing.
+    [[nodiscard]] static constexpr bool HasWrites(const TransformAddress& transform) {
+        return transform.mask != 0;
     }
 
     template <typename T>

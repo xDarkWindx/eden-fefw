@@ -2859,3 +2859,180 @@ TEST_CASE("t4: two runs of bits in one transformation give both ranges (current 
     CHECK(got[0] == std::pair<u64, u64>{kPageBase, 256});
     CHECK(got[1] == std::pair<u64, u64>{kPageBase + 512, 64});
 }
+
+// =============================================================================================
+// T4.0 (docs/t4-coherence-fix-plan.md, 3 and 8, item 4): the empty transformation is the one with mask 0, found by
+// a predicate that takes the TRANSFORMATION. The observable output of the Gather (order, ranges, no empty
+// callback) is the same as the manager of before for the same serial sequence of operations; the difference is
+// internal: the empty one is no longer queued in back_buffer and front_buffer.
+
+namespace {
+
+using Out = std::vector<std::pair<u64, u64>>;
+
+Out GatherOf(Manager& m) {
+    Out out;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { out.emplace_back(a, s); };
+    m.Gather(cb);
+    return out;
+}
+Out GatherOf(Legacy::GPUDirtyMemoryManager& m) {
+    Out out;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { out.emplace_back(a, s); };
+    m.Gather(cb);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("t4.0 [1]: empty, collect, Gather, empty Gather, collect again (reuse)", "[list-diag][t40]") {
+    Manager m;
+    Legacy::GPUDirtyMemoryManager legacy;
+    CHECK(GatherOf(m).empty()); // empty at the start
+    CHECK(GatherOf(legacy).empty());
+    for (const u64 a : {u64{0x10040}, u64{0x20000}, u64{0x10040}}) {
+        m.Collect(a, 64);
+        legacy.Collect(a, 64);
+        const Out got = GatherOf(m);
+        REQUIRE(got.size() == 1);
+        CHECK(got[0] == std::pair<u64, u64>{a, 64});
+        CHECK(got == GatherOf(legacy));
+        CHECK(GatherOf(m).empty()); // the empty Gather after it
+        CHECK(GatherOf(legacy).empty());
+    }
+}
+
+TEST_CASE("t4.0 [2]: empty, collect in A, collect in B: the change of address does not lose A", "[list-diag][t40]") {
+    Manager m;
+    Legacy::GPUDirtyMemoryManager legacy;
+    m.Collect(0x30000, 128);
+    m.Collect(0x31000, 64); // another 2 KiB transformation: A goes to back_buffer
+    legacy.Collect(0x30000, 128);
+    legacy.Collect(0x31000, 64);
+    const Out got = GatherOf(m);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0] == std::pair<u64, u64>{0x30000, 128});
+    CHECK(got[1] == std::pair<u64, u64>{0x31000, 64});
+    CHECK(got == GatherOf(legacy));
+    // After a Gather the manager is empty: the first collect at a different address must not queue an empty one.
+    m.Collect(0x32000, 64);
+    m.Collect(0x30800, 64);
+    legacy.Collect(0x32000, 64);
+    legacy.Collect(0x30800, 64);
+    CHECK(GatherOf(m) == GatherOf(legacy));
+}
+
+TEST_CASE("t4.0 [3]: a non-zero mask at the address of the marker is a write, not the empty one", "[list-diag][t40]") {
+    // WHAT THIS EXERCISES: the REPRESENTATION. The u32 address field equal to 0xffffffff (the value of the empty
+    // marker, default_transform) with a non-zero mask. With the transformation of today (2 KiB), that field is the
+    // PAddr 0xffffffff << 11 = 0x7ffffffff800, far above the 2^39 of the real address space, so this is NOT the
+    // limit of the address space. With a 4-byte grain (a 128-byte transformation, T4 O1) the same field value would
+    // be a different, lower address, which is the case that matters; this test is the guard for that day. A test of
+    // the address (`address != ~0U`) would discard this write; the test of the mask does not.
+    constexpr u64 kMarkerPage = u64{0xffffffff} << 11;
+    Manager m;
+    Legacy::GPUDirtyMemoryManager legacy;
+    m.Collect(kMarkerPage + 64, 64);
+    legacy.Collect(kMarkerPage + 64, 64);
+    const Out got = GatherOf(m);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0] == std::pair<u64, u64>{kMarkerPage + 64, 64});
+    CHECK(got == GatherOf(legacy));
+    // The same page with the manager holding something else first, and then the marker page swapped out.
+    m.Collect(0x40000, 64);
+    m.Collect(kMarkerPage, 64);
+    m.Collect(0x41000, 64);
+    legacy.Collect(0x40000, 64);
+    legacy.Collect(kMarkerPage, 64);
+    legacy.Collect(0x41000, 64);
+    const Out both = GatherOf(m);
+    CHECK(both.size() == 3);
+    CHECK(both == GatherOf(legacy));
+    // A write at the marker page right after a Gather (current is the empty marker with the SAME address field).
+    m.Collect(kMarkerPage + 128, 64);
+    m.Collect(kMarkerPage + 256, 64);
+    const Out merged = GatherOf(m);
+    REQUIRE(merged.size() == 2);
+    CHECK(merged[0] == std::pair<u64, u64>{kMarkerPage + 128, 64});
+    CHECK(merged[1] == std::pair<u64, u64>{kMarkerPage + 256, 64});
+}
+
+TEST_CASE("t4.0 [4]: random sequences with many Gathers: the same output as the manager of before", "[list-diag][t40]") {
+    Legacy::GPUDirtyMemoryManager legacy;
+    Manager plain;
+    Manager diagnostic;
+    Core::GatherLotState lots;
+    std::mt19937 rng{2026};
+    bool same = true;
+    for (int step = 0; step < 60000; ++step) {
+        if (rng() % 2 == 0) { // half of the steps are Gathers: most find the empty marker
+            Out a = GatherOf(legacy), b = GatherOf(plain), c;
+            std::function<void(PAddr, size_t)> cb = [&](PAddr x, size_t y) { c.emplace_back(x, y); };
+            u64 lot = 0;
+            diagnostic.GatherT<true, TestHooks>(cb, &lots, &lot);
+            same = same && a == b && a == c;
+        } else {
+            const u64 addr = 0x10000 + (rng() % 9) * 2048 + (rng() % 32) * 64;
+            const u64 size = 1 + rng() % (2048 - (addr & 2047));
+            legacy.Collect(addr, size);
+            plain.Collect(addr, size);
+            diagnostic.CollectT<true, TestHooks>(addr, size);
+        }
+    }
+    CHECK(same);
+}
+
+TEST_CASE("t4.0 [5]: collect and Gather interleaved in threads: coverage is kept, lot claims are valid",
+          "[list-diag][t40][stress]") {
+    // Coverage: ONE writer per manager (precondition pi4: the production has one writer per core manager) and
+    // one Gatherer. Every block written is delivered at least once after it was written (the union of what came
+    // out contains it), and nothing outside what was written comes out. The grouping in time between two runs is
+    // not required to be the same. NOTE (preexisting, not changed here): with TWO writers on one manager a Collect
+    // that takes the guard path can overwrite the other writer's concurrent CAS, and a block is lost; the old
+    // manager does it too (3 of 20 rounds in a check made while writing this test). Production does not do it.
+    for (int round = 0; round < 3; ++round) {
+        Manager m;
+        constexpr unsigned kWrites = 8000;
+        std::vector<u64> written;
+        std::atomic<bool> done{false};
+        std::thread writer([&] {
+            std::mt19937 rng{static_cast<unsigned>(round)};
+            for (unsigned i = 0; i < kWrites; ++i) {
+                const u64 block = 0x1000 + (rng() % 2048) * 64; // several 2 KiB transformations
+                m.Collect(block, 64);
+                written.push_back(block);
+                if (rng() % 16 == 0) {
+                    std::this_thread::yield();
+                }
+            }
+            done.store(true);
+        });
+        std::set<u64> delivered_blocks;
+        const auto gather = [&] {
+            for (const auto& [a, s] : GatherOf(m)) {
+                for (u64 b = a; b < a + s; b += 64) {
+                    delivered_blocks.insert(b);
+                }
+            }
+        };
+        while (!done.load()) {
+            gather();
+            std::this_thread::yield();
+        }
+        writer.join();
+        gather();
+        const std::set<u64> expected(written.begin(), written.end());
+        CHECK(delivered_blocks == expected); // all of it, and nothing else
+    }
+    // The lot claims of the diagnostic stay valid with the manager of T4.0 (ground truth: the Gather itself).
+    const unsigned notices = StressNotices();
+    for (unsigned round = 1; round <= 2; ++round) {
+        const StressResult roomy = RunStress({notices, 4096, 1'000'000'000ull, round + 30, 0});
+        CHECK(roomy.bad_claims == 0);
+        CHECK(roomy.missing == 0);
+        CHECK(roomy.false_windows == 0);
+        CHECK(roomy.conserved);
+        CHECK(roomy.overlapped == 0);
+        CHECK(roomy.false_complete == 0);
+    }
+}
