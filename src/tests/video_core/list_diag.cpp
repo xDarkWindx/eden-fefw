@@ -3216,7 +3216,7 @@ constexpr size_t kUtBuffer = 5 * kUtPage + 100; // 6 words, the last partial
 
 /// The same checks of one range pair `track` then `probe` against the oracle, on the NEW tracker.
 void CheckAgainstOracle(u64 track_offset, u64 track_size, u64 probe_offset, u64 probe_size) {
-    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    VideoCommon::UsageTracker tracker{kUtBuffer};
     BlockOracle oracle{kUtBuffer};
     INFO("track [" << track_offset << ",+" << track_size << ") probe [" << probe_offset << ",+" << probe_size << ")");
     tracker.Track(track_offset, track_size);
@@ -3249,7 +3249,7 @@ TEST_CASE("T4.1 [1]: the cases of the contract against the oracle", "[list-diag]
 }
 
 TEST_CASE("T4.1 [2]: zero size, past the extent and a saturated offset + size", "[list-diag][t41]") {
-    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    VideoCommon::UsageTracker tracker{kUtBuffer};
     BlockOracle oracle{kUtBuffer};
     // Size zero: Track does nothing, IsUsed is false, even on a marked block.
     tracker.Track(0, kUtBuffer);
@@ -3279,7 +3279,7 @@ TEST_CASE("T4.1 [2]: zero size, past the extent and a saturated offset + size", 
 
 TEST_CASE("T4.1 [3]: random ranges against the oracle, with Reset in the middle", "[list-diag][t41]") {
     std::mt19937_64 rng{41};
-    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    VideoCommon::UsageTracker tracker{kUtBuffer};
     BlockOracle oracle{kUtBuffer};
     for (int i = 0; i < 60000; ++i) {
         const u64 offset = rng() % (kUtBuffer + 64); // a few past the end
@@ -3302,7 +3302,7 @@ TEST_CASE("T4.1 [3]: random ranges against the oracle, with Reset in the middle"
 }
 
 TEST_CASE("T4.1 [4]: the recent cache, Reset and dirty_end, and ranges ending exactly on an edge", "[list-diag][t41]") {
-    VideoCommon::UsageTracker tracker{kUtBuffer, false};
+    VideoCommon::UsageTracker tracker{kUtBuffer};
     const auto nothing_marked = [&] {
         for (u64 b = 0; b < kUtBuffer; b += kUtBlock) {
             if (tracker.IsUsed(b, kUtBlock)) {
@@ -3361,7 +3361,7 @@ TEST_CASE("T4.1 [5]: the old tracker compared only where it is defined; the alig
     std::mt19937_64 rng{7};
     unsigned legacy_misses = 0, legacy_false_positives = 0, compared = 0;
     for (int round = 0; round < 400; ++round) {
-        VideoCommon::UsageTracker fresh{kUtBuffer, false};
+        VideoCommon::UsageTracker fresh{kUtBuffer};
         LegacyUsage::UsageTracker legacy{kUtBuffer};
         BlockOracle oracle{kUtBuffer};
         for (int i = 0; i < 60; ++i) {
@@ -3422,29 +3422,9 @@ TEST_CASE("T4.1 [6]: the defects of the old tracker, documented without running 
     LegacyUsage::UsageTracker legacy{kUtBuffer};
     legacy.Track(100, 64);
     CHECK(!legacy.IsUsed(0, 100));       // block 1 is touched by both and the old tracker does not see it
-    VideoCommon::UsageTracker fresh{kUtBuffer, false};
+    VideoCommon::UsageTracker fresh{kUtBuffer};
     fresh.Track(100, 64);
     CHECK(fresh.IsUsed(0, 100));         // the new one does
-}
-
-TEST_CASE("T4.1 [7]: the temporary switch picks the tracker once, for Track and IsUsed together", "[list-diag][t41]") {
-    CHECK(!VideoCommon::ParseUsageTrackerOld(nullptr));
-    CHECK(!VideoCommon::ParseUsageTrackerOld("0"));
-    CHECK(!VideoCommon::ParseUsageTrackerOld(""));
-    CHECK(!VideoCommon::ParseUsageTrackerOld("11"));
-    CHECK(VideoCommon::ParseUsageTrackerOld("1"));
-    VideoCommon::UsageTracker old_mode{kUtBuffer, true};
-    VideoCommon::UsageTracker new_mode{kUtBuffer, false};
-    CHECK(old_mode.IsOldMode());
-    CHECK(!new_mode.IsOldMode());
-    // The mode of an instance never changes: the old one keeps the old false negative, the new one does not.
-    old_mode.Track(100, 64);
-    new_mode.Track(100, 64);
-    CHECK(!old_mode.IsUsed(0, 100));
-    CHECK(new_mode.IsUsed(0, 100));
-    // The default is the new tracker (the variable is not set in the harness).
-    VideoCommon::UsageTracker by_default{kUtBuffer};
-    CHECK(by_default.IsOldMode() == VideoCommon::UsageTrackerOldMode());
 }
 
 TEST_CASE("blkcmp [10]: a staging entry not found cancels the comparison (counters and identities)", "[list-diag][blkcmp]") {

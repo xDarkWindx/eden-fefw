@@ -169,7 +169,7 @@ A reprodução dirigida e o `blkcmp` assíncrono seguem em paralelo, sem ampliar
 
 ## 9. T4.1: o `UsageTracker` conservador e sem UB (desenho; sem código)
 
-**Estado: implementado (commit B do T4.1), com a chave temporária `EDEN_USAGE_TRACKER_OLD=1` para o A/B; o texto abaixo descreve o que foi implementado, com os ajustes da revisão 3.** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
+**Estado: implementado (commit B do T4.1); a chave temporária `EDEN_USAGE_TRACKER_OLD=1` foi removida em `HASH_CHAVE` (revisão 4), e o rastreador novo é o único; o texto abaixo descreve o que foi implementado, com os ajustes da revisão 3 (o que fala da chave é histórico).** Escrito sobre `36b19ff`. Pré-requisito de O1 (revisão 1, item 2) e do `blkcmp` assíncrono
 (`list-diag-design.md` 3.8.9, ponto 2). Números de linha de `video_core/buffer_cache/usage_tracker.h`, salvo dito.
 
 ### 9.1 O contrato
@@ -235,12 +235,11 @@ PageMask(page): ~0 para as páginas do meio (palavra inteira: nenhum trabalho po
 
 `pages.size() - 1` só é calculado depois de `pages` ter ao menos uma palavra e de `first_page < pages.size()`. O laço de `Track`
 percorre no máximo `pages.size()` palavras (a interseção), nunca até o último endereço saturado. O modo antigo (`TrackOld`,
-`IsUsedOld`, `TrackPage`, `IsPageUsed`) continua no mesmo header, intacto, só para a chave temporária.
+`IsUsedOld`, `TrackPage`, `IsPageUsed`) **saiu do header em `HASH_CHAVE`**; a cópia congelada fica em `src/tests/video_core/usage_tracker_legacy.h`.
 
-**A chave temporária.** `EDEN_USAGE_TRACKER_OLD=1` liga o rastreador **antigo**; o novo é o padrão. É lida uma vez na partida
-(`UsageTrackerOldMode`) e fixada por instância no construtor, valendo para `Track` e `IsUsed` **juntos**, sem troca durante a execução. **Existe só para o
-A/B e será apagada**; o modo antigo conserva o UB conhecido (9.2). O relatório das estatísticas diz qual rastreador está ativo
-(linha "Upload reordering"). Uma rodada por braço é triagem: se os números ficarem próximos, repete-se em ordem alternada.
+**A chave temporária (REMOVIDA em `HASH_CHAVE`; texto histórico).** `EDEN_USAGE_TRACKER_OLD=1` ligava o rastreador **antigo**; o novo é o padrão. É lida uma vez na partida
+(`UsageTrackerOldMode`) e fixada por instância no construtor, valendo para `Track` e `IsUsed` **juntos**, sem troca durante a execução. **Existia só para o
+A/B**; o modo antigo conserva o UB conhecido (9.2). A linha "Upload reordering" do relatório deixou de dizer qual rastreador está ativo. Uma rodada por braço é triagem: se os números ficarem próximos, repete-se em ordem alternada.
 
 **Cumpre o contrato.** T-1/T-2: `mask(page)` tem exatamente os bits `lo..hi` da palavra, ou seja, os blocos de `first_block..last_block`
 que caem naquela página; as páginas do meio são `~0`. Logo `Track(r1)` marca todo bloco tocado por `r1`, e `IsUsed(r2)` testa todo
@@ -354,7 +353,7 @@ investigação é ler `Track`/`IsUsed` dentro de `stage buffers`, sem rodada nov
 
 ### Revisão 4 (sobre `0e5ad1e`)
 
-- **A chave `EDEN_USAGE_TRACKER_OLD` e o modo antigo saem do código de produção**; a cópia congelada fica nos testes. A
+- **A chave `EDEN_USAGE_TRACKER_OLD` e o modo antigo saem do código de produção** (feito, chave removida em `HASH_CHAVE`); a cópia congelada fica nos testes (os testes que alternavam a chave saíram; os que documentam o defeito antigo seguem contra a cópia). A
   decisão se apoia no contrato e no fim do UB, e não encerra a investigação de desempenho (9.6).
 - O contador da seção 4 segue com a especificação acima.
 - A escolha entre O1 e O2 preserva a distinção: O1 é mitigação para escritas alinhadas ao grão. Ter poucas escritas fora

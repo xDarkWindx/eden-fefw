@@ -8,27 +8,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
 
-#include "common/alignment.h"
 #include "common/common_types.h"
 
 namespace VideoCommon {
-
-/// TEMPORARY switch, read once at the start: EDEN_USAGE_TRACKER_OLD=1 selects the tracker of before T4.1. It exists ONLY for
-/// the user's A/B of the new tracker and WILL BE DELETED after it, with the new one left always on; it is not a permanent
-/// option. The old mode keeps a KNOWN undefined behaviour (a shift by 64 for ranges smaller than 64 bytes or ending on
-/// a 4 KiB edge) and false negatives (docs/t4-coherence-fix-plan.md, 9.2).
-[[nodiscard]] inline bool ParseUsageTrackerOld(const char* value) {
-    return value != nullptr && value[0] == '1' && value[1] == '\0';
-}
-[[nodiscard]] inline bool UsageTrackerOldMode() {
-    static const bool old_mode = ParseUsageTrackerOld(std::getenv("EDEN_USAGE_TRACKER_OLD"));
-    return old_mode;
-}
 
 /// Which 64-byte blocks of a buffer a draw or a copy used since the last Reset, one bit per block and one 64-bit word per
 /// 4 KiB. Contract (docs/t4-coherence-fix-plan.md, 9.1): a block touched by a non-empty range is marked by Track and is
@@ -41,14 +27,9 @@ class UsageTracker {
     static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
     static constexpr size_t BUFFER_PAGE_BYTES = 1 << BUFFER_PAGE_SHIFT;
 public:
-    /// `old_mode` is fixed for the life of the tracker: Track and IsUsed use the same calculation (never mixed).
-    explicit UsageTracker(size_t size, bool old_mode_ = UsageTrackerOldMode()) : old_mode{old_mode_} {
+    explicit UsageTracker(size_t size) {
         const size_t num_pages = (size >> BUFFER_PAGE_SHIFT) + 1;
         pages.resize(num_pages, 0ULL);
-    }
-
-    [[nodiscard]] bool IsOldMode() const noexcept {
-        return old_mode;
     }
 
     void Reset() noexcept {
@@ -62,10 +43,6 @@ public:
     }
 
     void Track(u64 offset, u64 size) noexcept {
-        if (old_mode) {
-            TrackOld(offset, size);
-            return;
-        }
         if (size == 0) {
             return; // touches no block; handled before any `size - 1`
         }
@@ -92,9 +69,6 @@ public:
     }
 
     [[nodiscard]] bool IsUsed(u64 offset, u64 size) const noexcept {
-        if (old_mode) {
-            return IsUsedOld(offset, size);
-        }
         if (size == 0) {
             return false;
         }
@@ -142,79 +116,12 @@ private:
         return (~u64{0} << lo) & (~u64{0} >> (63 - hi));
     }
 
-    // ---- The tracker of before T4.1 (EDEN_USAGE_TRACKER_OLD=1), kept as it was: it has an undefined shift by 64 for
-    // ---- num_bits == 0 and misses the partial blocks (docs/t4-coherence-fix-plan.md, 9.2). To be deleted with the switch.
-    void TrackOld(u64 offset, u64 size) noexcept {
-        // Consecutive draws keep binding the same ranges (a vertex buffer can span tens of MiB);
-        // tracking a range again changes nothing until the next reset.
-        for (const Range& range : recent) {
-            if (range.offset == offset && range.size == size) {
-                return;
-            }
-        }
-        recent[recent_next++ % recent.size()] = Range{offset, size};
-        const size_t page = offset >> BUFFER_PAGE_SHIFT;
-        const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
-        if (page_end < page || page_end >= pages.size()) {
-            return;
-        }
-        dirty_begin = (std::min)(dirty_begin, page);
-        dirty_end = (std::max)(dirty_end, page_end + 1);
-        TrackPage(page, offset, size);
-        if (page == page_end) {
-            return;
-        }
-        for (size_t i = page + 1; i < page_end; i++) {
-            pages[i] = ~u64{0};
-        }
-        const size_t offset_end = offset + size;
-        const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
-        TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
-    }
-
-    [[nodiscard]] bool IsUsedOld(u64 offset, u64 size) const noexcept {
-        const size_t page = offset >> BUFFER_PAGE_SHIFT;
-        const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
-        if (page_end < page || page_end >= pages.size()) {
-            return false;
-        }
-        if (IsPageUsed(page, offset, size)) {
-            return true;
-        }
-        for (size_t i = page + 1; i < page_end; i++) {
-            if (pages[i] != 0) {
-                return true;
-            }
-        }
-        const size_t offset_end = offset + size;
-        const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
-        return IsPageUsed(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
-    }
-
-    void TrackPage(u64 page, u64 offset, u64 size) noexcept {
-        const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
-        const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t mask = ~u64{0} >> (64 - num_bits);
-        pages[page] |= (~u64{0} & mask) << first_bit;
-    }
-
-    bool IsPageUsed(u64 page, u64 offset, u64 size) const noexcept {
-        const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
-        const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
-        const size_t mask = ~u64{0} >> (64 - num_bits);
-        const size_t mask2 = (~u64{0} & mask) << first_bit;
-        return (pages[page] & mask2) != 0;
-    }
-
     struct Range {
         u64 offset;
         u64 size;
     };
     static constexpr Range NO_RANGE{(std::numeric_limits<u64>::max)(), 0};
 
-    bool old_mode;
     std::vector<u64> pages;
     /// A draw can bind more than four ranges of one buffer (storage buffers carved from one pool):
     /// with too few slots each draw forgot the others and filled their pages again.
