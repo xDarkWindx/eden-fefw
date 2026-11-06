@@ -45,6 +45,7 @@ struct Event {
     EventKind kind = EventKind::PopHit;
     Sample sample = Sample::None;
     bool ambiguous = false;
+    bool incomplete = false; ///< blk: coverage declared incomplete (3.7.3)
     u32 core = 0;
     u64 lot = 0;
     u64 notice_addr = 0;
@@ -67,8 +68,14 @@ public:
     struct Claim {
         u64 lot = 0; ///< 0: ambiguous
         bool ambiguous = true;
+        bool sampled = true; ///< false: the page is outside the sample and nothing was recorded
         bool registered = false;
         Handle handle;
+    };
+    /// The writer-side counters of all cores, summed (3.7.5). Not a consistent cut while the game runs.
+    struct NoticeSums {
+        u64 seen = 0, sampled = 0, registered = 0, ambiguous = 0, late = 0, overflow = 0, expired = 0,
+            floor_raises = 0;
     };
     struct Gathered {
         std::vector<Range> pre; ///< What the callbacks delivered, with their core
@@ -85,8 +92,71 @@ public:
     Counters counters;
     Ledger<Hooks> ledger;
     std::array<Core::GatherLotState, N> lots{};
+    std::array<WriterCounters, N> writer_counters{};
+    std::array<WriterShared, N> writer_shared{};
     bool pop_on = true;
     bool blk_on = true;
+    /// The sample (3.7.1): one page of every `sample_n` (1 = all). Fixed for the session; the
+    /// emulator sets them from EDEN_LIST_DIAG_SAMPLE and _SEED before the first notice.
+    u64 sample_n = 1;
+    u64 sample_seed = 1;
+    /// False when EDEN_HELD_WRITE_MERGE=0: the final ranges of a lot may overlap, premise pi2 of
+    /// 3.7.3 fails, and every range is declared incomplete (blk_incomplete_nomerge).
+    bool merge_on = true;
+
+    static constexpr u64 SplitMix64(u64 x) {
+        x += 0x9e3779b97f4a7c15ull;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        return x ^ (x >> 31);
+    }
+    /// The one predicate of the sample, over the 4 KiB page of the address and never over the core.
+    [[nodiscard]] bool Sampled(u64 addr) const {
+        if (sample_n <= 1) {
+            return true;
+        }
+        const u64 h = SplitMix64(sample_seed ^ (addr >> 12));
+        return (sample_n & (sample_n - 1)) == 0 ? (h & (sample_n - 1)) == 0 : h % sample_n == 0;
+    }
+
+    struct Value {
+        const char* name;
+        Group group;
+        u64 value;
+    };
+    /// Every value the report and the violation snapshot walk, in a fixed order: the shared counters,
+    /// then the sums of the writer's per-core counters (3.7.5).
+    [[nodiscard]] std::vector<Value> Snapshot() {
+        std::vector<Value> out;
+        for (const FieldRef& f : Fields(counters)) {
+            out.push_back({f.name, f.group, Get(*f.counter)});
+        }
+        const NoticeSums w = Sums();
+        out.push_back({"notices_seen", Group::Sample, w.seen});
+        out.push_back({"notices_sampled", Group::Sample, w.sampled});
+        out.push_back({"notice_registered", Group::Notices, w.registered});
+        out.push_back({"notice_ambiguous", Group::Notices, w.ambiguous});
+        out.push_back({"notice_late", Group::Notices, w.late});
+        out.push_back({"notice_expired", Group::Notices, w.expired});
+        out.push_back({"notice_overflow", Group::Notices, w.overflow});
+        out.push_back({"floor_raises", Group::Notices, w.floor_raises});
+        return out;
+    }
+
+    [[nodiscard]] NoticeSums Sums() const {
+        NoticeSums sums;
+        for (const WriterCounters& w : writer_counters) {
+            sums.seen += w.seen.load(std::memory_order_relaxed);
+            sums.sampled += w.sampled.load(std::memory_order_relaxed);
+            sums.registered += w.registered.load(std::memory_order_relaxed);
+            sums.ambiguous += w.ambiguous.load(std::memory_order_relaxed);
+            sums.late += w.late.load(std::memory_order_relaxed);
+            sums.overflow += w.overflow.load(std::memory_order_relaxed);
+            sums.expired += w.expired.load(std::memory_order_relaxed);
+            sums.floor_raises += w.floor_raises.load(std::memory_order_relaxed);
+        }
+        return sums;
+    }
 
     // ---------------------------------------------------------------------------------------
     // core/memory.cpp:765: the Collect, observed.
@@ -97,10 +167,39 @@ public:
     /// memcpy: it is a registered notice, never a completed write (3.5).
     template <class Manager>
     Claim CollectObserved(Manager& manager, unsigned core, u64 addr, u32 size) {
+        WriterCounters& wc = writer_counters[core];
+        WriterShared& ws = writer_shared[core];
+        wc.Bump(wc.seen);
+        if (!Sampled(addr)) {
+            // Outside the sample: the Collect of the diagnostic (seq_cst on `current`, which the proof of
+            // 3.3 needs for every access) and nothing else: no ledger, no lot loads, nothing shared.
+            manager.template CollectT<true, Hooks>(addr, size);
+            Claim out;
+            out.sampled = false;
+            return out;
+        }
+        wc.Bump(wc.sampled);
+        // O1: from here until O2 a notice of this core may be between the Collect and its record.
+        const bool use_open = !NoOpenFlag();
+        if (use_open) {
+            ws.open.store(1, std::memory_order_seq_cst);
+        }
+        struct CloseOpen {
+            WriterShared& ws;
+            bool use;
+            ~CloseOpen() {
+                Hooks::At("w.before_open_clear");
+                if (use) {
+                    ws.open.store(0, std::memory_order_release); // O2: release, as designed
+                }
+            }
+        } close_open{ws, use_open};
+        Hooks::At("w.after_open");
         auto& st = lots[core];
         const u64 d = st.lot_done.load(std::memory_order_seq_cst);
         const u64 s = st.lot_started.load(std::memory_order_seq_cst);
         Hooks::At("w.after_r0");
+        // With the D1 split (2 KiB) this is one or two pieces, all between the reads s and s2.
         manager.template CollectT<true, Hooks>(addr, size);
         Hooks::At("w.after_collect");
         const u64 s2 = st.lot_started.load(std::memory_order_seq_cst);
@@ -112,9 +211,13 @@ public:
                 claim.lot = static_cast<u64>(static_cast<long long>(claim.lot) + Hooks::MutantDelta());
             }
         }
+        // Every lot this notice can belong to is <= hi (3.7.3, (b) and (c)).
+        const u64 hi = claim.ambiguous ? s2 + 1 : d + 1;
         Hooks::At("w.after_s2");
+        const u64 now = Hooks::NowUs(); // the one clock read of the notice
         Reclaimed reclaimed;
-        claim.handle = ledger.Register(core, addr, size, claim.lot, claim.ambiguous, &reclaimed);
+        claim.handle = ledger.Register(core, addr, size, claim.ambiguous ? hi : claim.lot, claim.ambiguous, now,
+                                       &reclaimed, wc, ws);
         claim.registered = claim.handle.ok;
         if (reclaimed.happened && reclaimed.was_popped) {
             Event ev;
@@ -126,11 +229,16 @@ public:
             Push(ev);
         }
         if (!claim.registered) {
+            // The notice reached no record: the coverage of every lot it can belong to is incomplete.
+            if (!NoCoverage()) {
+                RaiseIncomplete(ws, wc, hi);
+            }
+            Hooks::At("w.after_overflow");
             return claim;
         }
-        Inc(counters.notice_registered);
+        wc.Bump(wc.registered);
         if (claim.ambiguous) {
-            Inc(counters.notice_ambiguous);
+            wc.Bump(wc.ambiguous);
             return claim;
         }
         Hooks::At("w.after_publish");
@@ -143,15 +251,18 @@ public:
                 applying = 0;
             }
         }
-        const u64 t_write = Hooks::NowUs();
         if (claim.lot != 0 && applying >= claim.lot) {
-            const MarkResult r = ledger.Mark(*claim.handle.slot, claim.handle.tag(), MarkKind::Late, t_write);
+            const MarkResult r = ledger.Mark(*claim.handle.slot, claim.handle.tag(), MarkKind::Late, now);
             if (r == MarkResult::Ok) {
-                Inc(counters.notice_late);
+                wc.Bump(wc.late);
+                // The applier skips a late record: this lot's coverage is incomplete (before the Free).
+                if (!NoCoverage()) {
+                    RaiseIncomplete(ws, wc, claim.lot);
+                }
                 ledger.Free(core, *claim.handle.slot, claim.handle.gen);
             }
         } else {
-            ledger.Mark(*claim.handle.slot, claim.handle.tag(), MarkKind::Checked, t_write);
+            ledger.Mark(*claim.handle.slot, claim.handle.tag(), MarkKind::Checked, now);
         }
         return claim;
     }
@@ -199,9 +310,12 @@ public:
         batch.lots = gathered.lots;
         for (const auto& [address, size] : final_ranges) {
             Range merged{address, size, 0};
-            for (const Range& r : gathered.pre) {
-                if (r.addr >= address && r.addr + r.size <= address + size) {
-                    merged.mask |= r.mask;
+            // Only the ranges of the sample use their cores (NoteApply returns early for the others).
+            if (Sampled(address)) {
+                for (const Range& r : gathered.pre) {
+                    if (r.addr >= address && r.addr + r.size <= address + size) {
+                        merged.mask |= r.mask;
+                    }
                 }
             }
             batch.merged.push_back(merged);
@@ -247,6 +361,11 @@ public:
     template <class RangeSet, class ReadGuest>
     void NoteApply(u64 addr, u64 size, const RangeSet& gpu_modified, const RangeSet& cpu_read,
                    bool track_cpu_reads, ReadGuest&& read_guest) {
+        Inc(counters.apply_ranges_seen);
+        if (!Sampled(addr)) {
+            return; // outside the sample: no sweep, no blk (3.7.2)
+        }
+        Inc(counters.apply_ranges_selected);
         const Batch* batch = current_batch_;
         const u64 end = addr + size;
         u32 mask = 0;
@@ -262,6 +381,14 @@ public:
         if (!linked) {
             Inc(counters.apply_unlinked);
         }
+        // rho: BEFORE the sweep, whether a sampled notice of a core of this range is being registered.
+        std::array<u64, N> open_before{};
+        for (unsigned c = 0; c < N; ++c) {
+            if (((mask >> c) & 1) != 0) {
+                open_before[c] = writer_shared[c].open.load(std::memory_order_seq_cst);
+            }
+        }
+        Hooks::At("a.after_open_read");
         std::vector<std::pair<u64, u64>> exact;
         bool ambiguous = false;
         ledger.ForEachLive([&](unsigned core, unsigned index) {
@@ -296,8 +423,26 @@ public:
             Retire(slot, v, m, read_guest);
             exact.emplace_back(v.addr, v.addr + v.size);
         });
+        Hooks::At("a.after_sweep");
+        // phi: AFTER the sweep, the coverage floor of each core against the lot taken for it.
+        Cover cover;
+        cover.mask = mask;
+        cover.lots = batch != nullptr ? batch->lots.data() : nullptr;
+        for (unsigned c = 0; c < N; ++c) {
+            if (((mask >> c) & 1) == 0) {
+                continue;
+            }
+            if (open_before[c] != 0) {
+                cover.open = true;
+            }
+            const u64 floor = writer_shared[c].incomplete_floor.load(std::memory_order_seq_cst);
+            if (batch != nullptr && floor >= batch->lots[c]) {
+                cover.floor = true;
+            }
+        }
+        cover.nomerge = !merge_on;
         if (blk_on) {
-            AccountBlock(addr, size, exact, ambiguous || !linked, gpu_modified, cpu_read, track_cpu_reads);
+            AccountBlock(addr, size, exact, ambiguous || !linked, cover, gpu_modified, cpu_read, track_cpu_reads);
         }
     }
 
@@ -307,6 +452,25 @@ public:
     /// `bytes` are the download bytes the pop is about to write over [start, end).
     void NotePop(u64 start, u64 end, const u8* bytes) {
         Inc(counters.pop_ranges);
+        // 3.7.4: the range is cut by page only to COUNT and to skip the sweep when no fragment is in
+        // the sample. The write of the download is unchanged and the sweep is one over the whole
+        // range: a record lives in one page, so it falls in exactly one fragment.
+        const u64 first_page = start >> 12;
+        const u64 last_page = (end - 1) >> 12;
+        const u64 fragments = last_page - first_page + 1;
+        u64 selected = fragments;
+        if (sample_n > 1) {
+            selected = 0;
+            for (u64 page = first_page; page <= last_page; ++page) {
+                selected += Sampled(page << 12) ? 1 : 0;
+            }
+        }
+        Inc(counters.pop_fragments, fragments);
+        Inc(counters.pop_fragments_selected, selected);
+        if (selected == 0) {
+            return;
+        }
+        std::vector<u64> hit_pages;
         bool any = false;
         u64 flagged_bytes = 0;
         ledger.ForEachLive([&](unsigned core, unsigned index) {
@@ -334,6 +498,7 @@ public:
             }
             if ((m & kBitPopped) != 0) {
                 any = true;
+                hit_pages.push_back(lo >> 12);
                 flagged_bytes += hi - lo;
                 if constexpr (Hooks::kTest) {
                     Hooks::OnWindowFlag(v.addr, v.size);
@@ -344,6 +509,7 @@ public:
             ledger.WritePop(slot, v.tag(), lo, len, Fnv48(bytes + (lo - start), len));
             if (ledger.Mark(slot, v.tag(), MarkKind::Popped, v.t_write) == MarkResult::Ok) {
                 any = true;
+                hit_pages.push_back(lo >> 12);
                 flagged_bytes += hi - lo;
                 if constexpr (Hooks::kTest) {
                     Hooks::OnWindowFlag(v.addr, v.size);
@@ -364,12 +530,19 @@ public:
                 ev.v[1] = end;
                 ev.v[2] = hi - lo;
                 ev.v[3] = width;
+                ev.v[4] = fragments;
+                ev.v[5] = selected;
                 Push(ev);
             }
         });
         if (any) {
+            // One per ORIGINAL pop; the fragments hit are counted apart (the per-page rate is the
+            // unbiased one).
             Inc(counters.pop_over_notice);
             Inc(counters.pop_over_notice_bytes, flagged_bytes);
+            std::sort(hit_pages.begin(), hit_pages.end());
+            Inc(counters.pop_over_notice_fragments,
+                static_cast<u64>(std::unique(hit_pages.begin(), hit_pages.end()) - hit_pages.begin()));
         }
     }
 
@@ -396,10 +569,9 @@ public:
         if (!p0_claimed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             return;
         }
-        auto fields = Fields(counters);
         at_violation_.clear();
-        for (const FieldRef& f : fields) {
-            at_violation_.push_back(Get(*f.counter));
+        for (const Value& v : Snapshot()) {
+            at_violation_.push_back(v.value);
         }
         p0_violated_.store(true, std::memory_order_release);
         Event ev;
@@ -452,20 +624,22 @@ public:
     /// The lines of the periodic report (EDEN_BACK_THREAD_STATS): totals and the change per second
     /// since the previous call. One caller at a time.
     std::vector<std::string> ReportLines(double elapsed_seconds) {
-        auto fields = Fields(counters);
+        const std::vector<Value> fields = Snapshot();
         std::vector<u64> now;
-        for (const FieldRef& f : fields) {
-            now.push_back(Get(*f.counter));
+        for (const Value& f : fields) {
+            now.push_back(f.value);
         }
         if (last_report_.size() != now.size()) {
             last_report_.assign(now.size(), 0);
         }
         std::vector<std::string> lines;
-        const char* prefix = P0Violated() ? "[ListDiag][P0 VIOLATED: results after this are not reliable] "
-                                          : "[ListDiag] ";
-        const Group groups[] = {Group::Notices, Group::Pop, Group::Apply, Group::Blk, Group::Calls, Group::Log};
-        const char* names[] = {"notices", "pop", "apply", "blk", "calls", "log"};
-        for (size_t g = 0; g < 6; ++g) {
+        // The sums of the cores are read while the game runs: not a consistent cut (3.7.5).
+        const char* prefix = P0Violated() ? "[ListDiag][P0 VIOLATED: results after this are not reliable] (aprox.) "
+                                          : "[ListDiag] (aprox.) ";
+        const Group groups[] = {Group::Notices, Group::Sample, Group::Pop, Group::Apply,
+                                Group::Blk,     Group::Calls,  Group::Log};
+        const char* names[] = {"notices", "sample", "pop", "apply", "blk", "calls", "log"};
+        for (size_t g = 0; g < 7; ++g) {
             std::string line = std::string{prefix} + names[g] + ":";
             bool any = false;
             for (size_t i = 0; i < fields.size(); ++i) {
@@ -479,7 +653,7 @@ public:
                 line += buffer;
                 any = true;
             }
-            if (g == 4) {
+            if (g == 5) {
                 for (unsigned core = 0; core < N; ++core) {
                     const u64 calls = Get(counters.gather_calls[core]);
                     if (calls != 0) {
@@ -504,22 +678,87 @@ public:
     /// and the counters as they were when the violation was first seen.
     std::vector<std::string> SummaryLines(const char* tag = "summary") {
         CheckViolation();
-        auto fields = Fields(counters);
+        const std::vector<Value> fields = Snapshot();
         std::vector<std::string> lines;
+        const bool is_final = std::string{tag} == "summary";
+        // The 30 s totals are read with the game running: approximate. Only the final summary, with
+        // the execution stopped, can be conserved (3.7.5).
+        const std::string approx = is_final ? "" : " (aprox.)";
         if (P0Violated()) {
             lines.push_back(std::string{"[ListDiag]["} + tag + "] *** precondicao P0 violada: os resultados do diagnostico a partir da primeira "
                             "violacao nao sao confiaveis (gather_overlapped=" +
                             std::to_string(Get(counters.gather_overlapped)) +
                             ", apply_out_of_order=" + std::to_string(Get(counters.apply_out_of_order)) + ") ***");
         }
-        std::string line = std::string{"[ListDiag]["} + tag + "]";
-        for (const FieldRef& f : fields) {
-            const u64 value = Get(*f.counter);
-            if (value != 0) {
-                line += std::string{" "} + f.name + "=" + std::to_string(value);
+        std::string line = std::string{"[ListDiag]["} + tag + "]" + approx;
+        for (const Value& f : fields) {
+            if (f.value != 0) {
+                line += std::string{" "} + f.name + "=" + std::to_string(f.value);
             }
         }
         lines.push_back(line);
+        const NoticeSums w = Sums();
+        {
+            char b[320];
+            std::snprintf(b, sizeof(b),
+                          "[ListDiag][%s]%s amostra: N=%llu semente=0x%llx notices_seen=%llu notices_sampled=%llu "
+                          "sampled/seen=%.4f (fracao de AVISOS selecionados, 1/N=%.4f; nada e multiplicado por N)",
+                          tag, approx.c_str(), static_cast<unsigned long long>(sample_n),
+                          static_cast<unsigned long long>(sample_seed), static_cast<unsigned long long>(w.seen),
+                          static_cast<unsigned long long>(w.sampled),
+                          w.seen != 0 ? static_cast<double>(w.sampled) / static_cast<double>(w.seen) : 0.0,
+                          1.0 / static_cast<double>(sample_n));
+            lines.push_back(b);
+            std::snprintf(b, sizeof(b),
+                          "[ListDiag][%s]%s cobertura: notice_overflow=%llu notice_expired=%llu notice_late=%llu "
+                          "notice_ambiguous=%llu floor_raises=%llu blk_incomplete=%llu (open=%llu floor=%llu nomerge=%llu) "
+                          "blk_affirmed=%llu; pop_over_notice nas paginas amostradas e um piso enquanto overflow e expired "
+                          "forem diferentes de zero",
+                          tag, approx.c_str(), static_cast<unsigned long long>(w.overflow),
+                          static_cast<unsigned long long>(w.expired), static_cast<unsigned long long>(w.late),
+                          static_cast<unsigned long long>(w.ambiguous), static_cast<unsigned long long>(w.floor_raises),
+                          static_cast<unsigned long long>(Get(counters.blk_incomplete)),
+                          static_cast<unsigned long long>(Get(counters.blk_incomplete_open)),
+                          static_cast<unsigned long long>(Get(counters.blk_incomplete_floor)),
+                          static_cast<unsigned long long>(Get(counters.blk_incomplete_nomerge)),
+                          static_cast<unsigned long long>(Get(counters.blk_affirmed)));
+            lines.push_back(b);
+        }
+        if (is_final) {
+            // Conservation: valid only because the execution is stopped. Both sides and the residual.
+            const auto identity = [&](const char* name, u64 left, u64 right) {
+                char b[256];
+                std::snprintf(b, sizeof(b), "[ListDiag][%s] conservacao (so com a execucao parada) %s: %llu vs %llu (residuo %lld)",
+                              tag, name, static_cast<unsigned long long>(left), static_cast<unsigned long long>(right),
+                              static_cast<long long>(left) - static_cast<long long>(right));
+                lines.push_back(b);
+            };
+            identity("sampled = registered + overflow", w.sampled, w.registered + w.overflow);
+            identity("registered = applied + late + expired + pendentes", w.registered,
+                     Get(counters.notice_applied) + w.late + w.expired + PublishedCount());
+            if (blk_on) {
+                identity("blk_applies = apply_ranges_selected", Get(counters.blk_applies),
+                         Get(counters.apply_ranges_selected));
+                identity("blk_applies_over_gpu = ambiguous + incomplete + affirmed", Get(counters.blk_applies_over_gpu),
+                         Get(counters.blk_ambiguous) + Get(counters.blk_incomplete) + Get(counters.blk_affirmed));
+            }
+            if (pop_on) {
+                char b[200];
+                std::snprintf(b, sizeof(b),
+                              "[ListDiag][%s] conservacao pop: pop_ranges=%llu <= pop_fragments=%llu; "
+                              "pop_fragments_selected=%llu <= pop_fragments (%s)",
+                              tag, static_cast<unsigned long long>(Get(counters.pop_ranges)),
+                              static_cast<unsigned long long>(Get(counters.pop_fragments)),
+                              static_cast<unsigned long long>(Get(counters.pop_fragments_selected)),
+                              Get(counters.pop_ranges) <= Get(counters.pop_fragments) &&
+                                      Get(counters.pop_fragments_selected) <= Get(counters.pop_fragments)
+                                  ? "ok"
+                                  : "VIOLADA");
+                lines.push_back(b);
+            }
+            lines.push_back(std::string{"[ListDiag]["} + tag +
+                            "] escala: nenhuma (valores observados; a amostra e 1/N das paginas e nao e multiplicada)");
+        }
         for (unsigned core = 0; core < N; ++core) {
             const u64 calls = Get(counters.gather_calls[core]);
             if (calls != 0) {
@@ -539,6 +778,17 @@ public:
         return lines;
     }
 
+    /// Published slots (records not yet finished or freed), counted from the slots themselves.
+    [[nodiscard]] u64 PublishedCount() {
+        u64 n = 0;
+        for (unsigned core = 0; core < ledger.Cores(); ++core) {
+            for (unsigned i = 0; i < ledger.SlotsPerCore(); ++i) {
+                n += (ledger.SlotAt(core, i).state.load(std::memory_order_seq_cst) & 3) == kPublished ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
     std::string FormatEvent(const Event& ev) const {
         char b[512];
         const auto hex = [](u64 x) { return static_cast<unsigned long long>(x); };
@@ -546,9 +796,9 @@ public:
         case EventKind::PopHit:
             std::snprintf(b, sizeof(b),
                           "[ListDiag][pop] hit: notice=[0x%llx,+%u) core=%u lot=%llu download=[0x%llx,0x%llx) overlap=%llu "
-                          "order=notice -> pop@+%lluus (apply pending)",
+                          "order=notice -> pop@+%lluus (apply pending) pop_fragments=%llu selected=%llu",
                           hex(ev.notice_addr), ev.notice_size, ev.core, hex(ev.lot), hex(ev.v[0]), hex(ev.v[1]),
-                          hex(ev.v[2]), hex(ev.v[3]));
+                          hex(ev.v[2]), hex(ev.v[3]), hex(ev.v[4]), hex(ev.v[5]));
             break;
         case EventKind::PopApplied: {
             const char* label = ev.sample == Sample::Equal       ? "sample_equal"
@@ -571,6 +821,8 @@ public:
             char at_risk[48];
             if (ev.ambiguous) {
                 std::snprintf(at_risk, sizeof(at_risk), "ambiguous");
+            } else if (ev.incomplete) {
+                std::snprintf(at_risk, sizeof(at_risk), "incomplete(would_be=%llu)", hex(ev.v[3]));
             } else {
                 std::snprintf(at_risk, sizeof(at_risk), "%llu", hex(ev.v[3]));
             }
@@ -592,6 +844,21 @@ public:
     }
 
 private:
+    /// Test-only mutants (the tests prove they can see the failure): coverage never declared, and the
+    /// `open` flag never set. Constant false in the emulator.
+    static bool NoCoverage() {
+        if constexpr (Hooks::kTest) {
+            return Hooks::NaiveNoCoverage();
+        }
+        return false;
+    }
+    static bool NoOpenFlag() {
+        if constexpr (Hooks::kTest) {
+            return Hooks::NaiveNoOpenFlag();
+        }
+        return false;
+    }
+
     bool Suspect(const View& v) const {
         return v.ambiguous ||
                (v.lot != 0 && v.lot <= lots[v.core].violation_floor.load(std::memory_order_seq_cst));
@@ -644,9 +911,20 @@ private:
         ledger.Free(v.core, slot, v.gen);
     }
 
+    struct Cover {
+        bool open = false;
+        bool floor = false;
+        bool nomerge = false;
+        u32 mask = 0;                  ///< Cores of the range (test hook only)
+        const u64* lots = nullptr;     ///< Lots taken for them (test hook only)
+        [[nodiscard]] bool Incomplete() const {
+            return open || floor || nomerge;
+        }
+    };
+
     template <class RangeSet>
     void AccountBlock(u64 addr, u64 size, std::vector<std::pair<u64, u64>>& exact, bool ambiguous,
-                      const RangeSet& gpu_modified, const RangeSet& cpu_read, bool track_cpu_reads) {
+                      const Cover& cover, const RangeSet& gpu_modified, const RangeSet& cpu_read, bool track_cpu_reads) {
         const u64 end = addr + size;
         Inc(counters.blk_applies);
         Inc(counters.blk_bytes_range, size);
@@ -696,6 +974,9 @@ private:
             // No exact writes of this lot to subtract (or another lot or an ambiguous lot is in the
             // range): the result is "ambiguous", never a guess. `gpu_covered` stays an upper bound.
             Inc(counters.blk_ambiguous);
+            if (!ambiguous) {
+                Inc(counters.blk_ambiguous_no_record);
+            }
             ev.ambiguous = true;
             Push(ev);
             return;
@@ -730,6 +1011,24 @@ private:
                 cursor = std::max(cursor, ee);
             }
             account(cursor, ge);
+        }
+        if (cover.Incomplete()) {
+            // Coverage is not known to be complete: what T3a would have claimed is NOT claimed (3.7.3).
+            Inc(counters.blk_incomplete);
+            Inc(cover.open ? counters.blk_incomplete_open
+                : cover.floor ? counters.blk_incomplete_floor
+                              : counters.blk_incomplete_nomerge);
+            Inc(counters.blk_incomplete_gpu_bytes, at_risk);
+            ev.incomplete = true;
+            ev.v[3] = at_risk;
+            if (at_risk != 0) {
+                Push(ev);
+            }
+            return;
+        }
+        Inc(counters.blk_affirmed);
+        if constexpr (Hooks::kTest) {
+            Hooks::OnAffirmed(addr, size, cover.mask, cover.lots, merged_exact);
         }
         Inc(counters.blk_gpu_bytes_at_risk, at_risk);
         ev.v[3] = at_risk;

@@ -31,18 +31,49 @@ inline void Max(Counter& counter, u64 value) {
     }
 }
 
+/// What a writer moves, one per core and one cache line each (docs/list-diag-design.md, 3.7.5). One
+/// writer per core (precondition pi4: the sys_core_guard serialises the system core), so the
+/// increment is a relaxed load and store, not a read-modify-write. If pi4 failed a count could be
+/// lost, never corrupted, and the conservation of the final summary would show it. The report sums
+/// the cores; while the game runs the sum is not a consistent cut.
+struct alignas(64) WriterCounters {
+    std::atomic<u64> seen{};         ///< Every notice of the core while the diagnostic is on
+    std::atomic<u64> sampled{};      ///< ... of a page in the sample
+    std::atomic<u64> registered{};   ///< ... that reached a record (ambiguous ones included)
+    std::atomic<u64> ambiguous{};
+    std::atomic<u64> late{};
+    std::atomic<u64> overflow{};     ///< ... that found no free slot
+    std::atomic<u64> expired{};      ///< records recycled while not finished
+    std::atomic<u64> floor_raises{}; ///< times the coverage floor rose
+    void Bump(std::atomic<u64>& field) {
+        field.store(field.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+};
+static_assert(sizeof(WriterCounters) == 64 && alignof(WriterCounters) == 64);
+
+/// What the applier reads about coverage (3.7.3), written only by the writer of the core. Another
+/// cache line than WriterCounters: the applier's loads must not invalidate the writer's counters.
+struct alignas(64) WriterShared {
+    std::atomic<u64> open{};             ///< 1 between the start of a sampled notice's Collect and the end of its registration
+    std::atomic<u64> incomplete_floor{}; ///< Every lot of this core up to here has incomplete coverage
+};
+static_assert(sizeof(WriterShared) == 64 && alignof(WriterShared) == 64);
+
 /// Problem A (the pop window) and problem B (64-byte blocks) have their own counters, as the
 /// design requires: fixing one does not fix the other.
 struct Counters {
-    // The notices (every one ends in exactly one of applied, late, expired, or stays pending).
-    Counter notice_registered{};
+    // The notices (every one ends in exactly one of applied, late, expired, or stays pending). The
+    // counters the WRITER moves (registered, late, expired, overflow, ambiguous, and the sample
+    // counts) are per core in WriterCounters below, summed at report time; only the applier's is here.
     Counter notice_applied{};
-    Counter notice_late{};
-    Counter notice_expired{};
-    Counter notice_overflow{};
-    Counter notice_ambiguous{};
     // Problem A: a pop over a registered notice that was not applied yet.
     Counter pop_ranges{};
+    // T3a.1 (docs/list-diag-design.md, 3.7): the sample. Observed values, never scaled by N.
+    Counter apply_ranges_seen{};
+    Counter apply_ranges_selected{};
+    Counter pop_fragments{};
+    Counter pop_fragments_selected{};
+    Counter pop_over_notice_fragments{};
     Counter pop_over_notice{};
     Counter pop_over_notice_bytes{};
     Counter pop_over_notice_records{};
@@ -75,6 +106,13 @@ struct Counters {
     Counter blk_at_risk_not_seen_cpu_read{};
     Counter blk_at_risk_unknown{};
     Counter blk_ambiguous{};
+    Counter blk_ambiguous_no_record{}; ///< inside blk_ambiguous: the exact list was empty
+    Counter blk_incomplete{};          ///< coverage declared incomplete (3.7.3); at_risk not claimed
+    Counter blk_incomplete_open{};     ///< ... a sampled notice of a core in the range was being registered
+    Counter blk_incomplete_floor{};    ///< ... a notice of the (core, lot) never reached a record
+    Counter blk_incomplete_nomerge{};  ///< ... the join of ranges is off: ranges may overlap
+    Counter blk_incomplete_gpu_bytes{}; ///< what T3a would have claimed as at_risk in those ranges
+    Counter blk_affirmed{};            ///< complete coverage: at_risk is claimed
     // The calls that apply notices, counted for real (no assumption of one per list or fence).
     Counter invalidate_calls{};
     Counter invalidate_empty{};
@@ -88,7 +126,7 @@ struct Counters {
     Counter log_dropped{};
 };
 
-enum class Group { Notices, Pop, Apply, Blk, Calls, Log };
+enum class Group { Notices, Sample, Pop, Apply, Blk, Calls, Log };
 
 struct FieldRef {
     const char* name;
@@ -100,12 +138,12 @@ struct FieldRef {
 inline std::vector<FieldRef> Fields(Counters& c) {
     std::vector<FieldRef> f;
 #define LD_FIELD(group, name) f.push_back({#name, Group::group, &c.name})
-    LD_FIELD(Notices, notice_registered);
     LD_FIELD(Notices, notice_applied);
-    LD_FIELD(Notices, notice_late);
-    LD_FIELD(Notices, notice_expired);
-    LD_FIELD(Notices, notice_overflow);
-    LD_FIELD(Notices, notice_ambiguous);
+    LD_FIELD(Sample, apply_ranges_seen);
+    LD_FIELD(Sample, apply_ranges_selected);
+    LD_FIELD(Sample, pop_fragments);
+    LD_FIELD(Sample, pop_fragments_selected);
+    LD_FIELD(Sample, pop_over_notice_fragments);
     LD_FIELD(Pop, pop_ranges);
     LD_FIELD(Pop, pop_over_notice);
     LD_FIELD(Pop, pop_over_notice_bytes);
@@ -137,6 +175,13 @@ inline std::vector<FieldRef> Fields(Counters& c) {
     LD_FIELD(Blk, blk_at_risk_not_seen_cpu_read);
     LD_FIELD(Blk, blk_at_risk_unknown);
     LD_FIELD(Blk, blk_ambiguous);
+    LD_FIELD(Blk, blk_ambiguous_no_record);
+    LD_FIELD(Blk, blk_incomplete);
+    LD_FIELD(Blk, blk_incomplete_open);
+    LD_FIELD(Blk, blk_incomplete_floor);
+    LD_FIELD(Blk, blk_incomplete_nomerge);
+    LD_FIELD(Blk, blk_incomplete_gpu_bytes);
+    LD_FIELD(Blk, blk_affirmed);
     LD_FIELD(Calls, invalidate_calls);
     LD_FIELD(Calls, invalidate_empty);
     LD_FIELD(Calls, gather_overlapped);

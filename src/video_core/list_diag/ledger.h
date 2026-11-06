@@ -42,6 +42,16 @@ constexpr u64 Tag(u64 generation) {
     return generation % 65535 + 1;
 }
 
+/// Coverage floor (docs/list-diag-design.md, 3.7.3): every lot of this core up to `h` has incomplete
+/// coverage. One writer per core (pi4), so a load and a store; monotonic. seq_cst: the applier reads
+/// it after its sweep and the argument rests on the total order.
+inline void RaiseIncomplete(WriterShared& shared, WriterCounters& counters, u64 h) {
+    if (shared.incomplete_floor.load(std::memory_order_seq_cst) < h) {
+        shared.incomplete_floor.store(h, std::memory_order_seq_cst);
+        counters.Bump(counters.floor_raises);
+    }
+}
+
 enum class MarkKind { Popped, Applied, Checked, Late };
 enum class MarkResult { Ok, Already, Lost };
 
@@ -157,7 +167,12 @@ public:
     }
 
     /// Writer side (one writer per core). Bounded: it never waits.
-    Handle Register(unsigned core, u64 addr, u32 size, u64 lot, bool ambiguous, Reclaimed* reclaimed) {
+    /// `now` is the ONE clock read of the notice (docs/list-diag-design.md, 3.7.5): the expiry test of
+    /// every slot examined and the time of the record. `lot` of an ambiguous record is its ceiling `hi`.
+    /// Before a record that is published, expired and NOT finished is recycled, the coverage floor
+    /// rises to its lot (3.7.3, step 5); an overflow is declared by the caller, which knows `hi`.
+    Handle Register(unsigned core, u64 addr, u32 size, u64 lot, bool ambiguous, u64 now, Reclaimed* reclaimed,
+                    WriterCounters& wc, WriterShared& ws) {
         Slot* ring = rings_[core].get();
         for (unsigned tries = 0; tries < kScan && tries < per_core_; ++tries) {
             const unsigned index = (cursor_[core] + tries) % per_core_;
@@ -166,7 +181,7 @@ public:
             const u64 phase = st & 3;
             const u64 gen = st >> 2;
             bool reclaim = false;
-            if (phase == kPublished && Expired(s)) {
+            if (phase == kPublished && Expired(s, now)) {
                 reclaim = true;
             } else if (phase != kFree) {
                 continue;
@@ -175,6 +190,17 @@ public:
             const u64 old_meta = s.meta.load(std::memory_order_relaxed);
             const u64 old_lot = s.lot.load(std::memory_order_relaxed);
             const u64 next_gen = gen + 1;
+            bool skip_coverage = false;
+            if constexpr (Hooks::kTest) {
+                skip_coverage = Hooks::NaiveNoCoverage();
+            }
+            if (reclaim && !skip_coverage &&
+                (s.marks.load(std::memory_order_seq_cst) & (kBitApplied | kBitLate)) == 0) {
+                // Not finished: its notice may be lost to the applier from here on. Raise BEFORE the
+                // CAS, so a sweep that sees the new state also sees the floor.
+                RaiseIncomplete(ws, wc, old_lot);
+            }
+            Hooks::At("r.before_reclaim_cas");
             if (!s.state.compare_exchange_strong(st, (next_gen << 2) | kWriting,
                                                  std::memory_order_seq_cst)) {
                 continue;
@@ -182,7 +208,7 @@ public:
             s.addr.store(addr, std::memory_order_relaxed);
             s.meta.store(size | (u64{core} << 32) | (u64{ambiguous} << 40), std::memory_order_relaxed);
             s.lot.store(lot, std::memory_order_relaxed);
-            s.t_write.store(Hooks::NowUs(), std::memory_order_relaxed);
+            s.t_write.store(now, std::memory_order_relaxed);
             s.pop1.store(0, std::memory_order_relaxed);
             s.pop2.store(0, std::memory_order_relaxed);
             // Seals the old marks: a reader that marks later fails on the label, and the value
@@ -191,7 +217,7 @@ public:
             // count a retired record twice (the retirement and the reuse).
             const u64 old_marks = s.marks.exchange(Tag(next_gen), std::memory_order_seq_cst);
             if (reclaim && (old_marks & (kBitApplied | kBitLate)) == 0) {
-                Inc(counters_.notice_expired);
+                wc.Bump(wc.expired);
                 if (reclaimed != nullptr) {
                     reclaimed->happened = true;
                     reclaimed->was_popped = (old_marks & kBitPopped) != 0;
@@ -206,7 +232,7 @@ public:
             cursor_[core] = (index + 1) % per_core_;
             return Handle{&s, next_gen, true};
         }
-        Inc(counters_.notice_overflow);
+        wc.Bump(wc.overflow);
         return Handle{};
     }
 
@@ -227,6 +253,7 @@ public:
         v.lot = s.lot.load(std::memory_order_relaxed);
         v.t_write = s.t_write.load(std::memory_order_relaxed);
         Hooks::At("r.after_payload_read");
+        Hooks::At("r.between_state_loads");
 #if defined(__SANITIZE_THREAD__)
         // ThreadSanitizer does not model fences (and GCC refuses them with -Werror=tsan): an
         // acq_rel read-modify-write of +0 gives the same ordering and is understood by it.
@@ -247,8 +274,12 @@ public:
         Hooks::At(kind == MarkKind::Popped    ? "m.before_pop_cas"
                   : kind == MarkKind::Applied ? "m.before_apply_cas"
                                               : "m.before_check_cas");
-        const u64 now = Hooks::NowUs();
-        const u64 dt = std::min<u64>(now >= t_write ? (now - t_write) / 2 : 0, kTimeMax);
+        // Only the marks that record a width read the clock; Checked and Late (the writer's) do not.
+        u64 dt = 0;
+        if (kind == MarkKind::Popped || kind == MarkKind::Applied) {
+            const u64 now = Hooks::NowUs();
+            dt = std::min<u64>(now >= t_write ? (now - t_write) / 2 : 0, kTimeMax);
+        }
         for (int attempt = 0; attempt < 2; ++attempt) {
             u64 m = s.marks.load(std::memory_order_seq_cst);
             if ((m & 0xffff) != tag) {
@@ -345,14 +376,15 @@ private:
     /// Clears the bit and then looks again: a writer may have reused the slot between the Free and
     /// the clear (its own set would be lost), in which case the bit goes back.
     void ClearLive(unsigned core, unsigned index) {
+        Hooks::At("l.before_clear");
         live_[core][index / 64].fetch_and(~(u64{1} << (index % 64)), std::memory_order_seq_cst);
+        Hooks::At("l.after_clear");
         if ((rings_[core][index].state.load(std::memory_order_seq_cst) & 3) == kPublished) {
             SetLive(core, index);
         }
     }
 
-    bool Expired(Slot& s) const {
-        const u64 now = Hooks::NowUs();
+    bool Expired(Slot& s, u64 now) const {
         const u64 t = s.t_write.load(std::memory_order_relaxed);
         return now > t && now - t > expiry_us;
     }

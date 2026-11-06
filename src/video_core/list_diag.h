@@ -62,6 +62,56 @@ inline std::atomic<u32> g_parts{ParseParts(std::getenv("EDEN_LIST_DIAG"))};
     return (g_parts.load(std::memory_order_relaxed) & (PartPop | PartBlk)) != 0;
 }
 
+/// EDEN_LIST_DIAG_SAMPLE (one page of every N, default 8, 1 = all) and EDEN_LIST_DIAG_SEED (decimal or
+/// 0x..., default 1): read once, fixed for the session, printed in the "ligado" line and the summary
+/// (docs/list-diag-design.md, 3.7.1). An invalid value falls back to the default and the line says so.
+struct SampleConfig {
+    u64 n = 8;
+    u64 seed = 1;
+    bool n_invalid = false;
+    bool seed_invalid = false;
+    std::string n_text;
+    std::string seed_text;
+};
+
+inline SampleConfig ParseSampleConfig(const char* sample, const char* seed) {
+    SampleConfig config;
+    const auto parse = [](const char* text, u64& out) {
+        if (text == nullptr || text[0] == '\0') {
+            return false;
+        }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text, &end, 0);
+        if (end == text || *end != '\0' || text[0] == '-') {
+            return false;
+        }
+        out = value;
+        return true;
+    };
+    if (sample != nullptr) {
+        config.n_text = sample;
+        u64 n = 0;
+        if (parse(sample, n) && n >= 1 && n <= (u64{1} << 32)) {
+            config.n = n;
+        } else {
+            config.n_invalid = true;
+        }
+    }
+    if (seed != nullptr) {
+        config.seed_text = seed;
+        u64 value = 0;
+        if (parse(seed, value)) {
+            config.seed = value;
+        } else {
+            config.seed_invalid = true;
+        }
+    }
+    return config;
+}
+
+inline const SampleConfig g_sample_config =
+    ParseSampleConfig(std::getenv("EDEN_LIST_DIAG_SAMPLE"), std::getenv("EDEN_LIST_DIAG_SEED"));
+
 using Impl = Protocol<Core::Hardware::NUM_CPU_CORES, ProdHooks>;
 
 /// Where the log lines go: the emulator's log (list_diag.cpp), or the standard error without it.
@@ -91,6 +141,10 @@ inline Impl& State() {
         const u32 parts = g_parts.load(std::memory_order_relaxed);
         impl->pop_on = (parts & PartPop) != 0;
         impl->blk_on = (parts & PartBlk) != 0;
+        impl->sample_n = g_sample_config.n;
+        impl->sample_seed = g_sample_config.seed;
+        const char* const merge = std::getenv("EDEN_HELD_WRITE_MERGE"); // as gpu.cpp reads it
+        impl->merge_on = merge == nullptr || merge[0] != '0';
         g_state.store(impl, std::memory_order_release);
         return impl;
     }();
@@ -146,8 +200,14 @@ inline void LogStartup() {
         return;
     }
     State(); // creates the state and installs the log sink
+    char sample[256];
+    std::snprintf(sample, sizeof(sample), "; amostra=1/%llu de paginas de 4 KiB (semente=0x%llx, hash=splitmix64)%s%s",
+                  static_cast<unsigned long long>(g_sample_config.n),
+                  static_cast<unsigned long long>(g_sample_config.seed),
+                  g_sample_config.n_invalid ? (" [EDEN_LIST_DIAG_SAMPLE='" + g_sample_config.n_text + "' invalido: padrao 8]").c_str() : "",
+                  g_sample_config.seed_invalid ? (" [EDEN_LIST_DIAG_SEED='" + g_sample_config.seed_text + "' invalido: padrao 1]").c_str() : "");
     Emit("[ListDiag] ligado: partes=" + PartsText() + (Enabled(PartList) ? " (list: T3b, ainda nao implementada)" : "") +
-         "; resumo ao fechar o jogo e totais a cada 30 s");
+         sample + "; resumo ao fechar o jogo e totais a cada 30 s (aproximados: lidos com a execucao em andamento)");
 }
 
 /// gpu.cpp, after an application: the log, at most once per second, outside every cache lock; and

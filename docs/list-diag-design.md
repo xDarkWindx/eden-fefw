@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página e caminho quente) com desenho escrito na seção 3.7, sem código; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a (partes `pop` e `blk`) implementado no emulador, desligado por padrão, medido (8.4: −20% de draws/s no FE, cobertura de ~20%); T3a.1 (amostragem por página, cobertura declarada e caminho quente) implementado em `5a7a869`, aguardando a medição do usuário (desenho na seção 3.7); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -763,6 +763,25 @@ chamada). **Experimento que separa as duas, só com variável de ambiente:** `ED
 quase nada amostrado) deixa só o custo fixo; se a perturbação persiste, é do caminho fora da amostra. Para (3),
 proponho (**fora do escopo aprovado, a decidir**) dois contadores só no `BackStats`, sem o diagnóstico:
 chamadas de `InvalidateGPUCache` e chamadas vazias.
+
+#### 3.7.10 Notas da implementação (`5a7a869`)
+
+Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto deixava margem:
+- `cov_expired` dos textos é o contador `notice_expired` (a reciclagem de registro não encerrado); não há um segundo.
+- O piso é um teto sobre **lotes** (`lote <= piso`): ao subir para `hi`, os lotes anteriores ainda não aplicados também ficam
+  incompletos. Os testes 3 e 4 mostram os dois efeitos (um estouro declara incompleto o lote inteiro do núcleo, mesmo o bloco
+  que tem registro; o lote `s2 + 2` fica completo).
+- `Counters` perdeu os campos do escritor; `Protocol::Sums()` os soma e `Snapshot()` junta os dois grupos para o relatório e o
+  instantâneo da violação. As leituras com a execução em andamento levam o prefixo `(aprox.)`.
+- Em `ledger.h`: `Register` recebe `now` (a única leitura de relógio) e os contadores/`WriterShared` do núcleo; `Mark` só lê o
+  relógio para `Popped` e `Applied`. Pontos de parada novos: `w.after_open`, `w.after_overflow`, `w.before_open_clear`,
+  `r.before_reclaim_cas`, `r.between_state_loads`, `a.after_open_read`, `a.after_sweep`, `l.before_clear`, `l.after_clear`.
+- Mutantes (só nos testes): `NaiveNoCoverage` (nunca sobe o piso) e `NaiveNoOpenFlag` (nunca liga `open`).
+  `LIST_DIAG_FORCE_MUTANT=coverage|open` liga um em todos os testes: o primeiro derruba 6 dos 52 casos, o segundo 2.
+- Teste 9: `src/tests/video_core/list_diag_t3a_frozen.h` é a cópia congelada do T3a (`1d41515`) em `namespace T3aFrozen`; ela usa
+  o mesmo gerenciador real, então os dois lados têm o D1.
+- Teste 13 é só "o contador do escritor não se mexe com o diagnóstico desligado"; o resto do desligado já era coberto por
+  "off, nothing changes".
 
 #### 3.7.9 O que não muda e o que fica em aberto
 

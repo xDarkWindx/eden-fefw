@@ -486,7 +486,7 @@ contra o `gpu_dirty_memory_manager.h` real (stub de página do harness, `g++ -st
 
 ### 7.4.1 D1: desenho da correção e da contagem (sem código)
 
-**Estado: implementado em `dee6963`, aguardando o A/B do usuário** (o revisor vê o diff antes de o usuário compilar). O texto
+**Estado: implementado em `dee6963`; A/B feito (resultado abaixo); chave removida em `7addd24`** (o revisor vê o diff antes de o usuário compilar). O texto
 abaixo é o desenho; os três ajustes do revisor (marcados **AJUSTE**) já estão incorporados. Números de linha: os de `72e41f1`.
 
 **Recorte, dentro de `CollectT` (`core/gpu_dirty_memory_manager.h:60-85`), nas duas variantes.** O corpo atual

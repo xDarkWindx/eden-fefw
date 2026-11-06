@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include "video_core/list_diag/protocol.h"
 
 #include "list_diag_legacy_manager.h"
+#include "list_diag_t3a_frozen.h"
 
 namespace {
 
@@ -91,6 +93,16 @@ inline std::atomic<u64> g_clock{0};
 inline std::atomic<bool> g_skip_overlap{false};
 inline std::atomic<long long> g_mutant{0};
 inline std::atomic<bool> g_naive{false};
+inline std::atomic<bool> g_no_coverage{false};  // mutant NaiveNoCoverage
+inline std::atomic<bool> g_no_open_flag{false}; // mutant NaiveNoOpenFlag
+inline std::atomic<u64> g_clock_reads{0};
+/// LIST_DIAG_FORCE_MUTANT=coverage|open turns a mutant on in EVERY test: the harness is run that way to
+/// count the tests that notice it (they must fail).
+inline bool ForcedMutant(const char* which) {
+    const char* value = std::getenv("LIST_DIAG_FORCE_MUTANT");
+    return value != nullptr && std::strcmp(value, which) == 0;
+}
+inline std::function<void(u64, u64, u32, const u64*, const std::vector<std::pair<u64, u64>>&)> g_on_affirmed;
 inline std::function<void(u64, u32)> g_on_window_flag;
 
 /// The hooks of the tests: the same members as ProdHooks, with `kTest` on.
@@ -110,12 +122,25 @@ struct TestHooks {
     static bool NaiveNoLateCheck() {
         return g_naive.load();
     }
+    static void OnAffirmed(u64 addr, u64 size, u32 mask, const u64* lots,
+                           const std::vector<std::pair<u64, u64>>& exact) {
+        if (g_on_affirmed) {
+            g_on_affirmed(addr, size, mask, lots, exact);
+        }
+    }
+    static bool NaiveNoCoverage() {
+        return g_no_coverage.load();
+    }
+    static bool NaiveNoOpenFlag() {
+        return g_no_open_flag.load();
+    }
     static void OnWindowFlag(u64 addr, u32 size) {
         if (g_on_window_flag) {
             g_on_window_flag(addr, size);
         }
     }
     static u64 NowUs() {
+        g_clock_reads.fetch_add(1, std::memory_order_relaxed);
         return g_clock.load(std::memory_order_relaxed);
     }
 };
@@ -133,6 +158,10 @@ struct Fx {
         g_skip_overlap = false;
         g_mutant = 0;
         g_naive = false;
+        g_no_coverage = ForcedMutant("coverage");
+        g_no_open_flag = ForcedMutant("open");
+        g_clock_reads = 0;
+        g_on_affirmed = nullptr;
         g_on_window_flag = nullptr;
         g_gates = &gates;
         read_guest = [](u64, u8* out, size_t len) { std::memset(out, kGuestFill, len); };
@@ -143,6 +172,9 @@ struct Fx {
         g_skip_overlap = false;
         g_mutant = 0;
         g_naive = false;
+        g_no_coverage = false;
+        g_no_open_flag = false;
+        g_on_affirmed = nullptr;
     }
 
     std::array<Manager, kCores> managers;
@@ -157,6 +189,9 @@ struct Fx {
 
     Counters& c() {
         return proto.counters;
+    }
+    Proto::NoticeSums W() const {
+        return proto.Sums();
     }
     u64 C(const Counter& counter) const {
         return Get(counter);
@@ -230,8 +265,8 @@ struct Fx {
         if (proto.ledger.LiveBits() != PublishedSlots()) {
             return false;
         }
-        return Get(c().notice_registered) ==
-               Get(c().notice_applied) + Get(c().notice_late) + Get(c().notice_expired) + PublishedSlots();
+        const auto w = W();
+        return w.registered == Get(c().notice_applied) + w.late + w.expired + PublishedSlots();
     }
 
     std::vector<std::string> Lines() {
@@ -481,7 +516,7 @@ TEST_CASE("list diag: a notice published after the application of its lot is nev
         wt.join();
         CHECK((c.registered && !c.ambiguous));
         CHECK(c.lot == 1);
-        CHECK(f.C(f.c().notice_late) == 1);
+        CHECK(f.W().late == 1);
         CHECK(f.PublishedSlots() == 0);
         f.Pop(0x8000, 0x8004);
         CHECK(f.C(f.c().pop_over_notice) == 0); // no false window
@@ -511,7 +546,7 @@ TEST_CASE("list diag: a notice published after the application of its lot is nev
         CHECK(f.C(f.c().notice_applied) == 1);
         f.gates.Release("w.after_publish");
         wt.join();
-        CHECK(f.C(f.c().notice_late) == 0); // already retired: exactly one end state
+        CHECK(f.W().late == 0); // already retired: exactly one end state
         CHECK(f.C(f.c().notice_applied) == 1);
         CHECK(f.PublishedSlots() == 0);
     }
@@ -529,7 +564,7 @@ TEST_CASE("list diag: a notice published after the application of its lot is nev
         wt.join();
         f.gates.Release("a.after_astore"); // the sweep finds nothing
         at.join();
-        CHECK(f.C(f.c().notice_late) == 1);
+        CHECK(f.W().late == 1);
         CHECK(f.C(f.c().notice_applied) == 0);
         CHECK(f.PublishedSlots() == 0);
     }
@@ -540,7 +575,7 @@ TEST_CASE("list diag: a notice published after the application of its lot is nev
         CHECK(f.C(f.c().pop_over_notice) == 1);
         f.Invalidate();
         CHECK(f.C(f.c().notice_applied) == 1);
-        CHECK(f.C(f.c().notice_late) == 0);
+        CHECK(f.W().late == 0);
     }
 }
 
@@ -558,7 +593,7 @@ TEST_CASE("list diag: the slot is reused while a reader reads, marks the pop, ma
         f.gates.WaitReached("r.after_payload_read");
         g_clock += 200;
         f.Collect(0, 0x9100); // reclaims the expired slot
-        CHECK(f.C(f.c().notice_expired) == 1);
+        CHECK(f.W().expired == 1);
         f.gates.Release("r.after_payload_read");
         pt.join();
         CHECK(f.C(f.c().observation_lost) >= 1);
@@ -669,7 +704,7 @@ TEST_CASE("list diag: the label of a generation is never zero and the slot keeps
             f.Invalidate();
             f.gates.Release("w.after_s2");
             wt.join();
-            CHECK(f.C(f.c().notice_late) == 1);
+            CHECK(f.W().late == 1);
             CHECK(f.PublishedSlots() == 0); // the release must succeed past generation 65535
             CHECK(f.Conserved());
         }
@@ -682,7 +717,7 @@ TEST_CASE("list diag: the label of a generation is never zero and the slot keeps
             const auto c2 = f.Collect(0, 0x1300);
             CHECK(c2.registered);
             CHECK(c2.handle.gen == gen + 1);
-            CHECK(f.C(f.c().notice_expired) == 1);
+            CHECK(f.W().expired == 1);
             f.Invalidate(); // lot 2 holds both; only the live record is retired
             CHECK(f.PublishedSlots() == 0);
             CHECK(f.Conserved());
@@ -749,9 +784,9 @@ TEST_CASE("list diag: two Gathers at once are counted, the lots up to there are 
     REQUIRE(!report.empty());
     CHECK(Contains(report, "P0 VIOLATED"));
     // The counters go on after the violation.
-    const u64 before = f.C(f.c().notice_registered);
+    const u64 before = f.W().registered;
     f.Collect(1, 0xC800);
-    CHECK(f.C(f.c().notice_registered) == before + 1);
+    CHECK(f.W().registered == before + 1);
 }
 
 TEST_CASE("list diag: an application out of order is a violation of P0 too", "[list-diag]") {
@@ -857,7 +892,7 @@ TEST_CASE("list diag: a notice that a pop reached and that expired without being
     f.Pop(0xA000, 0xA004);
     g_clock += 200;
     f.Collect(0, 0xA100); // reclaims the slot
-    CHECK(f.C(f.c().notice_expired) == 1);
+    CHECK(f.W().expired == 1);
     CHECK(Contains(f.Lines(), "apply=never"));
 }
 
@@ -1027,10 +1062,11 @@ TEST_CASE("list diag: off, nothing changes; on, the production hooks work", "[li
     // On (pop and blk): the production protocol, with the steady clock.
     g_parts = PartPop | PartBlk;
     Manager manager;
+    Impl& state = State();
+    state.sample_n = 1; // the test uses one page; the production default is 1/8 of the pages
     CollectNotice(manager, 0, 0x31008, 4);
     REQUIRE(g_state.load() != nullptr);
-    Impl& state = State();
-    CHECK(Get(state.counters.notice_registered) == 1);
+    CHECK(state.Sums().registered == 1);
     NotePopHook(0x31008, 0x3100c, kBytes);
     CHECK(Get(state.counters.pop_over_notice) == 1);
     CHECK(!ReportLines(1.0).empty());
@@ -1074,6 +1110,9 @@ struct StressConfig {
     u64 expiry = 1'000'000;
     unsigned seed = 1;
     long long mutant = 0; // claim the wrong lot: the ground truth must notice
+    u64 sample_n = 1;
+    bool no_coverage = false;  // mutant NaiveNoCoverage
+    bool no_open_flag = false; // mutant NaiveNoOpenFlag
 };
 
 struct Recorded {
@@ -1086,13 +1125,33 @@ struct StressResult {
     u64 overlapped = 0;
     bool conserved = false;
     u64 total = 0;
+    u64 affirmed = 0;       ///< ranges the protocol claimed complete
+    u64 false_complete = 0; ///< ... in which a delivered notice of the sample is NOT in `exact`
+    u64 sampled_seen = 0, sampled_ok = 0;
 };
 
 StressResult RunStress(const StressConfig& cfg) {
     auto fx = std::make_unique<Fx>(cfg.slots);
     Fx& f = *fx;
     f.proto.ledger.expiry_us = cfg.expiry;
+    f.proto.sample_n = cfg.sample_n;
     g_mutant = cfg.mutant;
+    g_no_coverage = cfg.no_coverage || ForcedMutant("coverage");
+    g_no_open_flag = cfg.no_open_flag || ForcedMutant("open");
+    struct Affirmed {
+        u64 addr, size;
+        u32 mask;
+        std::array<u64, kCores> lots;
+        std::vector<std::pair<u64, u64>> exact;
+    };
+    std::vector<Affirmed> affirmed; // filled under cache_mutex (NoteApply)
+    g_on_affirmed = [&](u64 addr, u64 size, u32 mask, const u64* lots, const std::vector<std::pair<u64, u64>>& exact) {
+        Affirmed a{addr, size, mask, {}, exact};
+        for (unsigned c = 0; c < kCores; ++c) {
+            a.lots[c] = lots != nullptr ? lots[c] : 0;
+        }
+        affirmed.push_back(std::move(a));
+    };
     std::unordered_set<u64> applied_blocks; // under cache_mutex
     std::atomic<u64> false_windows{0};
     f.on_range_applied = [&](u64 addr, u64 size) {
@@ -1106,6 +1165,7 @@ StressResult RunStress(const StressConfig& cfg) {
         }
     };
 
+    f.gpu_modified.Add(0x100000, 0x10000000); // GPU bytes everywhere: every range is accounted
     std::vector<std::vector<Recorded>> recorded(kCores);
     std::array<std::unordered_map<u64, u64>, kCores> first_lot; // block -> first lot that delivered it
     std::mutex invalidate_mutex; // the precondition: one Gather at a time (models the Drain)
@@ -1198,8 +1258,32 @@ StressResult RunStress(const StressConfig& cfg) {
     }
     res.false_windows = false_windows.load();
     res.total = static_cast<u64>(cfg.notices) * kCores;
-    res.conserved = f.Conserved() && res.registered + Get(f.c().notice_overflow) == res.total &&
-                    res.registered == Get(f.c().notice_registered);
+    res.conserved = f.Conserved() && res.registered + f.W().overflow == f.W().sampled &&
+                    f.W().seen == res.total && res.registered == f.W().registered;
+    // No false "complete": every notice of the sample that the Gather delivered for an affirmed range
+    // has its bytes inside the exact writes.
+    res.affirmed = affirmed.size();
+    for (const Affirmed& a : affirmed) {
+        for (unsigned core = 0; core < kCores; ++core) {
+            if (((a.mask >> core) & 1) == 0) {
+                continue;
+            }
+            for (const Recorded& r : recorded[core]) {
+                if (!f.proto.Sampled(r.addr) || r.addr < a.addr || r.addr + 4 > a.addr + a.size) {
+                    continue;
+                }
+                const auto it = first_lot[core].find(r.addr & ~u64{63});
+                if (it == first_lot[core].end() || it->second != a.lots[core]) {
+                    continue;
+                }
+                bool inside = false;
+                for (const auto& [es, ee] : a.exact) {
+                    inside = inside || (es <= r.addr && r.addr + 4 <= ee);
+                }
+                res.false_complete += inside ? 0 : 1;
+            }
+        }
+    }
     for (unsigned core = 0; core < kCores; ++core) {
         res.overlapped += f.proto.lots[core].gather_overlapped.load();
     }
@@ -1426,7 +1510,7 @@ TEST_CASE("list diag D1: a Gather between the two pieces of a notice makes it am
         CHECK(second.pre[0].addr == 0x10800);
         f.ApplyBatchRanges(second);
         // Neither lot retires or affirms it.
-        CHECK(f.C(f.c().notice_ambiguous) == 1);
+        CHECK(f.W().ambiguous == 1);
         CHECK(f.C(f.c().notice_applied) == 0);
         CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);
     }
@@ -1440,4 +1524,789 @@ TEST_CASE("list diag D1: a Gather between the two pieces of a notice makes it am
         f.ApplyBatchRanges(b);
         CHECK(f.C(f.c().notice_applied) == 1);
     }
+}
+
+// =============================================================================================
+// T3a.1 (docs/list-diag-design.md, 3.7): the sample, declared coverage, the pop by page, the hot path.
+
+namespace {
+
+/// First page number >= `from` whose Sampled() verdict is `want`.
+u64 PickPage(const Proto& proto, bool want, u64 from = 0x40) {
+    for (u64 page = from;; ++page) {
+        if (proto.Sampled(page << 12) == want) {
+            return page;
+        }
+    }
+}
+
+/// Applies one batch by hand: BeginApply, the ranges, EndApply (the gate tests interleave around it).
+void ApplyAll(Fx& f, const Proto::Batch& batch) {
+    f.ApplyBatchRanges(batch);
+}
+
+} // namespace
+
+TEST_CASE("T3a.1 [1]: sampled and excluded pages mixed in the three paths of Collect", "[list-diag][t3a1]") {
+    Fx f(4096);
+    f.proto.sample_n = 4;
+    Manager reference; // the Collect<false> of before, same sequence
+    std::mt19937 rng{31};
+    u64 gathers = 0, sampled_count = 0, steps = 0;
+    for (int i = 0; i < 3000; ++i) {
+        if (rng() % 9 == 0) {
+            std::vector<std::pair<u64, u64>> expected;
+            std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { expected.emplace_back(a, s); };
+            reference.Gather(cb);
+            const Proto::Batch b = f.GatherAll();
+            std::vector<std::pair<u64, u64>> got;
+            for (const Range& r : b.pre) {
+                got.emplace_back(r.addr, r.size);
+            }
+            REQUIRE(got == expected); // what the manager delivers is unchanged by the sample
+            ++gathers;
+        } else {
+            const u64 addr = 0x40000 + (rng() % 6) * 4096 + (rng() % 64) * 64 + (rng() % 16) * 4;
+            const auto c = f.Collect(0, addr);
+            reference.Collect(addr, 4);
+            ++steps;
+            CHECK(c.sampled == f.proto.Sampled(addr));
+            if (c.sampled) {
+                ++sampled_count;
+                REQUIRE(c.registered);
+                REQUIRE(!c.ambiguous);
+                CHECK(c.lot == gathers + 1); // the identity of each notice, from the script
+            } else {
+                CHECK(!c.registered);
+            }
+        }
+    }
+    CHECK(f.W().seen == steps);
+    CHECK(f.W().sampled == sampled_count);
+    CHECK(f.proto.ledger.LiveBits() == sampled_count); // only the sampled notices have a record
+    CHECK(sampled_count > 0);
+    CHECK(sampled_count < steps);
+}
+
+TEST_CASE("T3a.1 [2]: a notice outside the sample never touches the ledger or the lot counters", "[list-diag][t3a1]") {
+    Fx f(64);
+    f.proto.sample_n = 8;
+    const u64 page = PickPage(f.proto, false);
+    constexpr unsigned kNotices = 200;
+    for (unsigned i = 0; i < kNotices; ++i) {
+        const auto c = f.Collect(i % kCores, (page << 12) + (i % 64) * 64);
+        CHECK(!c.sampled);
+        CHECK(!c.registered);
+    }
+    for (unsigned core = 0; core < kCores; ++core) {
+        for (unsigned i = 0; i < f.proto.ledger.SlotsPerCore(); ++i) {
+            const Slot& s = f.proto.ledger.SlotAt(core, i);
+            CHECK(s.state.load() == 0);
+            CHECK(s.marks.load() == 0);
+            CHECK(s.addr.load() == 0);
+        }
+        const auto& st = f.proto.lots[core];
+        CHECK(st.lot_started.load() == 0);
+        CHECK(st.lot_done.load() == 0);
+        CHECK(st.apply_started_lot.load() == 0);
+        CHECK(st.gather_active.load() == 0);
+        const auto& sh = f.proto.writer_shared[core];
+        CHECK(sh.open.load() == 0);
+        CHECK(sh.incomplete_floor.load() == 0);
+    }
+    CHECK(f.proto.ledger.LiveBits() == 0);
+    for (const FieldRef& field : Fields(f.c())) {
+        INFO(field.name);
+        CHECK(Get(*field.counter) == 0); // no shared counter moved
+    }
+    const auto w = f.W();
+    CHECK(w.seen == kNotices);
+    CHECK(w.sampled + w.registered + w.overflow + w.late + w.expired + w.ambiguous + w.floor_raises == 0);
+    CHECK(g_clock_reads.load() == 0);
+}
+
+TEST_CASE("T3a.1 [3]: partial and total overflow in the same block and lot", "[list-diag][t3a1]") {
+    SECTION("partial: a record found, another lost") {
+        Fx f(2);
+        f.gpu_modified.Add(0x20000, 64);
+        const auto a = f.Collect(0, 0x20000);
+        const auto b = f.Collect(0, 0x20010);
+        const auto c = f.Collect(0, 0x20020); // the ring has 2 slots: lost
+        CHECK(a.registered);
+        CHECK(b.registered);
+        CHECK(!c.registered);
+        CHECK(f.W().overflow == 1);
+        ApplyAll(f, f.GatherAll());
+        CHECK(f.C(f.c().blk_incomplete) == 1);
+        CHECK(f.C(f.c().blk_incomplete_floor) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+        CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);          // not claimed
+        CHECK(f.C(f.c().blk_incomplete_gpu_bytes) == 64 - 8);  // what T3a would have claimed
+    }
+    SECTION("the mutant NaiveNoCoverage claims it (the test can see the failure)") {
+        Fx f(2);
+        g_no_coverage = true;
+        f.gpu_modified.Add(0x20000, 64);
+        f.Collect(0, 0x20000);
+        f.Collect(0, 0x20010);
+        f.Collect(0, 0x20020);
+        ApplyAll(f, f.GatherAll());
+        CHECK(f.C(f.c().blk_affirmed) == 1);
+        CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 64 - 8);
+    }
+    SECTION("total: no record at all in the block is ambiguous, as 5 says") {
+        Fx f(1);
+        f.gpu_modified.Add(0x21000, 64);
+        f.gpu_modified.Add(0x22000, 64);
+        CHECK(f.Collect(0, 0x21000).registered);
+        CHECK(!f.Collect(0, 0x22000).registered); // same lot, the only slot is taken
+        ApplyAll(f, f.GatherAll());
+        CHECK(f.C(f.c().blk_ambiguous) == 1); // 0x22000: no record in the block
+        // 0x21000 has its record, but the overflow of the same (core, lot) declares the lot incomplete:
+        // the granularity is (core, lot), a false "incomplete" that is accepted and counted.
+        CHECK(f.C(f.c().blk_incomplete) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+        CHECK(f.C(f.c().blk_ambiguous_no_record) >= 1);
+        CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);
+    }
+}
+
+TEST_CASE("T3a.1 [4]: overflow with an ambiguous lot raises the floor to s2 + 1 and not beyond", "[list-diag][t3a1]") {
+    Fx f(1);
+    for (u64 page : {0x30u, 0x31u, 0x32u, 0x33u}) {
+        f.gpu_modified.Add(page << 12, 64);
+    }
+    const auto r0 = f.Collect(0, 0x30000); // lot 1, fills the only slot
+    REQUIRE(r0.registered);
+    const Proto::Batch b1 = f.GatherAll(); // lot 1 taken, not applied: the slot stays published
+    f.gates.Arm("w.after_collect");
+    Proto::Claim claim;
+    std::thread wt([&] { claim = f.Collect(0, 0x31000); });
+    f.gates.WaitReached("w.after_collect");
+    const Proto::Batch b2 = f.GatherAll(); // lot 2 takes the block of 0x31000 while the writer is open
+    f.gates.Release("w.after_collect");
+    wt.join();
+    CHECK(claim.ambiguous);
+    CHECK(!claim.registered); // overflow
+    CHECK(f.proto.writer_shared[0].incomplete_floor.load() == 3); // s2 + 1 (s2 = 2)
+    ApplyAll(f, b1); // retires r0
+    ApplyAll(f, b2); // lot 2: incomplete
+    // Lot 1 (r0) is <= floor: incomplete (the floor is a ceiling on lots). Lot 2 has no record for its block
+    // at all (the notice overflowed): ambiguous, which has precedence.
+    CHECK(f.C(f.c().blk_incomplete_floor) == 1);
+    CHECK(f.C(f.c().blk_ambiguous) == 1);
+    const auto c3 = f.Collect(0, 0x32000); // lot 3 <= floor: incomplete (a false "incomplete", accepted)
+    CHECK(c3.lot == 3);
+    ApplyAll(f, f.GatherAll());
+    CHECK(f.C(f.c().blk_incomplete_floor) == 2);
+    const auto c4 = f.Collect(0, 0x33000); // lot 4 > floor: complete
+    CHECK(c4.lot == 4);
+    ApplyAll(f, f.GatherAll());
+    CHECK(f.C(f.c().blk_incomplete_floor) == 2);
+    CHECK(f.C(f.c().blk_affirmed) == 1); // only lot 4: the floor does not poison the future
+}
+
+TEST_CASE("T3a.1 [5]: expiry before the application", "[list-diag][t3a1]") {
+    SECTION("an unfinished record recycled: the lot is incomplete") {
+        Fx f(2);
+        f.gpu_modified.Add(0x23000, 64);
+        f.Collect(0, 0x23000);
+        f.Collect(0, 0x23010);
+        const Proto::Batch b = f.GatherAll();
+        g_clock += 6'000'000;
+        f.Collect(0, 0x24000); // recycles the first record, not finished
+        CHECK(f.W().expired == 1);
+        CHECK(f.proto.writer_shared[0].incomplete_floor.load() == 1);
+        ApplyAll(f, b);
+        CHECK(f.C(f.c().blk_incomplete_floor) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+    }
+    SECTION("a record already applied is recycled without marking") {
+        Fx f(2);
+        f.gpu_modified.Add(0x23000, 64);
+        f.Collect(0, 0x23000);
+        f.Collect(0, 0x23010);
+        ApplyAll(f, f.GatherAll());
+        g_clock += 6'000'000;
+        f.Collect(0, 0x24000);
+        CHECK(f.proto.writer_shared[0].incomplete_floor.load() == 0);
+        CHECK(f.W().expired == 0);
+    }
+    SECTION("the application between the rise of the floor and the CAS is never complete") {
+        for (const bool apply_while_blocked : {true, false}) {
+            INFO("apply_while_blocked=" << apply_while_blocked);
+            Fx f(2);
+            f.gpu_modified.Add(0x23000, 64);
+            f.Collect(0, 0x23000);
+            f.Collect(0, 0x23010);
+            const Proto::Batch b = f.GatherAll();
+            g_clock += 6'000'000;
+            f.gates.Arm("r.before_reclaim_cas");
+            std::thread wt([&] { f.Collect(0, 0x24000); });
+            f.gates.WaitReached("r.before_reclaim_cas");
+            if (apply_while_blocked) {
+                ApplyAll(f, b);
+                f.gates.Release("r.before_reclaim_cas");
+                wt.join();
+            } else {
+                f.gates.Release("r.before_reclaim_cas");
+                wt.join();
+                ApplyAll(f, b);
+            }
+            CHECK(f.C(f.c().blk_incomplete) == 1);
+            CHECK(f.C(f.c().blk_affirmed) == 0);
+        }
+    }
+}
+
+TEST_CASE("T3a.1 [6]: the open flag, deterministic", "[list-diag][t3a1]") {
+    SECTION("writer stopped after the Collect: the range is incomplete") {
+        Fx f(16);
+        f.gpu_modified.Add(0x24000, 64);
+        f.Collect(0, 0x24000); // a record of the same block and lot
+        f.gates.Arm("w.after_collect");
+        std::thread wt([&] { f.Collect(0, 0x24010); });
+        f.gates.WaitReached("w.after_collect");
+        f.Invalidate();
+        CHECK(f.C(f.c().blk_incomplete_open) == 1);
+        CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);
+        f.gates.Release("w.after_collect");
+        wt.join();
+        // The second notice was ambiguous (the Gather came before its s2): its record stays pending and
+        // never retires. A block it does not touch, in the next lot with no writer open, is complete.
+        f.gpu_modified.Add(0x24100, 64);
+        f.Collect(0, 0x24100);
+        f.Invalidate();
+        CHECK(f.C(f.c().blk_affirmed) == 1);
+    }
+    SECTION("writer stopped before O2: incomplete too") {
+        Fx f(16);
+        f.gpu_modified.Add(0x24000, 64);
+        f.Collect(0, 0x24000);
+        f.gates.Arm("w.before_open_clear");
+        std::thread wt([&] { f.Collect(0, 0x24010); });
+        f.gates.WaitReached("w.before_open_clear");
+        f.Invalidate();
+        CHECK(f.C(f.c().blk_incomplete_open) == 1);
+        f.gates.Release("w.before_open_clear");
+        wt.join();
+    }
+    SECTION("the mutant NaiveNoOpenFlag: the false completeness appears") {
+        Fx f(16);
+        g_no_open_flag = true;
+        f.gpu_modified.Add(0x24000, 64);
+        f.Collect(0, 0x24000);
+        f.gates.Arm("w.after_collect");
+        std::thread wt([&] { f.Collect(0, 0x24010); });
+        f.gates.WaitReached("w.after_collect");
+        f.Invalidate();
+        CHECK(f.C(f.c().blk_affirmed) == 1); // wrongly: the second notice has no record yet
+        f.gates.Release("w.after_collect");
+        wt.join();
+    }
+}
+
+TEST_CASE("T3a.1 [7]: late publication and a late ambiguous record", "[list-diag][t3a1]") {
+    SECTION("published after the application began: late, the lot is incomplete") {
+        Fx f(16);
+        f.gpu_modified.Add(0x25000, 64);
+        f.Collect(0, 0x25000);
+        f.gates.Arm("w.after_s2");
+        std::thread wt([&] { f.Collect(0, 0x25010); });
+        f.gates.WaitReached("w.after_s2");
+        const Proto::Batch b = f.GatherAll();
+        f.proto.BeginApply(b);
+        f.gates.Release("w.after_s2");
+        wt.join(); // registers, sees apply_started_lot >= its lot: late
+        CHECK(f.W().late == 1);
+        for (const Range& r : b.merged) {
+            std::lock_guard lock{f.cache_mutex};
+            f.proto.NoteApply(r.addr, r.size, f.gpu_modified, f.cpu_read, false, f.read_guest);
+        }
+        f.proto.EndApply();
+        CHECK(f.C(f.c().blk_incomplete_floor) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+    }
+    SECTION("ambiguous and published after the sweep: open or the floor declares it") {
+        Fx f(16);
+        f.gpu_modified.Add(0x25000, 64);
+        f.Collect(0, 0x25000);
+        f.gates.Arm("w.after_collect");
+        f.gates.Arm("w.after_s2");
+        std::thread wt([&] { f.Collect(0, 0x25010); });
+        f.gates.WaitReached("w.after_collect");
+        const Proto::Batch b = f.GatherAll(); // a Gather between the Collect and s2: ambiguous
+        f.gates.Release("w.after_collect");
+        f.gates.WaitReached("w.after_s2");
+        ApplyAll(f, b); // the sweep finds no record for the second notice
+        CHECK(f.C(f.c().blk_incomplete) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+        f.gates.Release("w.after_s2");
+        wt.join();
+    }
+}
+
+TEST_CASE("T3a.1 [8]: a pop across selected and excluded pages", "[list-diag][t3a1]") {
+    // N = 2: find four consecutive pages with exactly two in the sample.
+    auto make = [](Fx& f, u64& base) {
+        f.proto.sample_n = 2;
+        for (base = 0x60;; ++base) {
+            unsigned n = 0;
+            for (u64 p = base; p < base + 4; ++p) {
+                n += f.proto.Sampled(p << 12) ? 1 : 0;
+            }
+            if (n == 2) {
+                return;
+            }
+        }
+    };
+    std::vector<u8> bytes(4 * 4096);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<u8>(i % 251);
+    }
+    Fx f(64), ref(64);
+    u64 base = 0;
+    make(f, base);
+    u64 base_ref = 0;
+    make(ref, base_ref);
+    REQUIRE(base == base_ref);
+    const u64 start = (base << 12) + 8;
+    const u64 end = ((base + 4) << 12) - 8; // starts and ends inside a page
+    for (Fx* x : {&f, &ref}) {
+        x->read_guest = [&](u64 a, u8* out, size_t len) { std::memcpy(out, &bytes[a - (base << 12)], len); };
+        for (u64 p = base; p < base + 4; ++p) {
+            if (x->proto.Sampled(p << 12)) {
+                x->Collect(0, (p << 12) + 16);
+            }
+        }
+    }
+    f.Pop(start, end, &bytes[8]); // ONE original pop
+    CHECK(f.C(f.c().pop_ranges) == 1);
+    CHECK(f.C(f.c().pop_fragments) == 4);
+    CHECK(f.C(f.c().pop_fragments_selected) == 2);
+    CHECK(f.C(f.c().pop_over_notice) == 1); // per original pop, not 2
+    CHECK(f.C(f.c().pop_over_notice_fragments) == 2);
+    CHECK(f.C(f.c().pop_over_notice_records) == 2);
+    // The reference: one pop per page fragment, each with its own pointer.
+    for (u64 p = base; p < base + 4; ++p) {
+        const u64 lo = std::max(start, p << 12);
+        const u64 hi = std::min(end, (p + 1) << 12);
+        ref.Pop(lo, hi, &bytes[lo - (base << 12)]);
+    }
+    CHECK(f.C(f.c().pop_over_notice_records) == ref.C(ref.c().pop_over_notice_records));
+    CHECK(f.C(f.c().pop_over_notice_bytes) == ref.C(ref.c().pop_over_notice_bytes));
+    // The offset of the pointer: with the right bytes the guest agrees, so every sample is equal.
+    f.Invalidate();
+    ref.Invalidate();
+    CHECK(f.C(f.c().window_sample_equal) == 2);
+    CHECK(f.C(f.c().window_sample_different) == 0);
+    CHECK(ref.C(ref.c().window_sample_equal) == 2);
+    // A pointer that is not shifted for the second fragment is seen: the hash of the wrong bytes differs.
+    Fx wrong(64);
+    wrong.proto.sample_n = 2;
+    wrong.read_guest = f.read_guest;
+    wrong.read_guest = [&](u64 a, u8* out, size_t len) { std::memcpy(out, &bytes[a - (base << 12)], len); };
+    for (u64 p = base; p < base + 4; ++p) {
+        if (wrong.proto.Sampled(p << 12)) {
+            wrong.Collect(0, (p << 12) + 16);
+        }
+    }
+    wrong.Pop(start, end, &bytes[0]); // pointer of the wrong offset (8 bytes off)
+    wrong.Invalidate();
+    CHECK(wrong.C(wrong.c().window_sample_different) == 2);
+}
+
+TEST_CASE("T3a.1 [8b]: a pop over excluded pages only does not sweep", "[list-diag][t3a1]") {
+    Fx f(64);
+    f.proto.sample_n = 8;
+    const u64 page = PickPage(f.proto, false);
+    f.Pop(page << 12, (page << 12) + 64);
+    CHECK(f.C(f.c().pop_ranges) == 1);
+    CHECK(f.C(f.c().pop_fragments) == 1);
+    CHECK(f.C(f.c().pop_fragments_selected) == 0);
+    CHECK(f.C(f.c().pop_over_notice) == 0);
+}
+
+// ---- 9: N = 1 against the frozen T3a (with the D1 in both: they share the real manager).
+
+namespace {
+
+struct FrozenHooks : TestHooks {};
+
+template <class P>
+struct Script {
+    explicit Script(unsigned slots) : proto(slots) {}
+    std::array<Manager, kCores> managers;
+    P proto;
+    Common::RangeSet<u64> gpu_modified;
+    Common::RangeSet<u64> cpu_read;
+
+    template <class G, class B>
+    void Round(std::mt19937& rng, std::vector<std::pair<u64, u64>>& ranges_scratch) {
+        G gathered;
+        proto.GatherAll(std::span<Manager>{managers}, gathered);
+        ranges_scratch.clear();
+        for (const auto& r : gathered.pre) {
+            ranges_scratch.emplace_back(r.addr, r.size);
+        }
+        if (ranges_scratch.size() > 1) {
+            std::sort(ranges_scratch.begin(), ranges_scratch.end());
+            size_t out = 0;
+            for (size_t in = 1; in < ranges_scratch.size(); ++in) {
+                auto& last = ranges_scratch[out];
+                const auto& [address, size] = ranges_scratch[in];
+                const u64 last_end = last.first + last.second;
+                if ((address >> 12) == (last.first >> 12) && address <= last_end) {
+                    last.second = std::max(last_end, address + size) - last.first;
+                } else {
+                    ranges_scratch[++out] = ranges_scratch[in];
+                }
+            }
+            ranges_scratch.resize(out + 1);
+        }
+        const B batch = proto.MakeBatch(std::move(gathered), ranges_scratch);
+        proto.BeginApply(batch);
+        for (const auto& r : batch.merged) {
+            proto.NoteApply(r.addr, r.size, gpu_modified, cpu_read, false,
+                            [](u64, u8* out, size_t len) { std::memset(out, 0xEE, len); });
+        }
+        proto.EndApply();
+        (void)rng;
+    }
+};
+
+template <class P, class G, class B>
+std::map<std::string, u64> RunScript(P& proto_unused, Script<P>& sc, unsigned seed) {
+    (void)proto_unused;
+    std::mt19937 rng{seed};
+    std::vector<std::pair<u64, u64>> scratch;
+    std::array<u8, 2048> bytes{}; // a pop here spans up to ~1 KiB
+    for (int step = 0; step < 4000; ++step) {
+        const unsigned op = rng() % 20;
+        if (op < 12) {
+            const unsigned core = rng() % kCores;
+            const u64 addr = 0x80000 + (rng() % 6) * 4096 + (rng() % 8) * 64 + (rng() % 16) * 4;
+            sc.proto.CollectObserved(sc.managers[core], core, addr, 4);
+        } else if (op < 15) {
+            sc.template Round<G, B>(rng, scratch);
+        } else if (op < 18) {
+            const u64 page = 0x80000 + (rng() % 6) * 4096;
+            sc.proto.NotePop(page + (rng() % 8) * 64, page + 512 + (rng() % 8) * 64, bytes.data());
+        } else if (op == 18) {
+            const u64 page = 0x80000 + (rng() % 6) * 4096;
+            sc.gpu_modified.Add(page + (rng() % 8) * 64, 64);
+        } else {
+            g_clock += 400'000; // 0.4 s: now and then a record expires
+        }
+        g_clock += 7;
+    }
+    return {};
+}
+
+} // namespace
+
+TEST_CASE("T3a.1 [9]: N = 1 equals the frozen T3a (both with the D1), except the new coverage counters",
+          "[list-diag][t3a1]") {
+    for (const unsigned seed : {1u, 2u, 3u}) {
+        INFO("seed " << seed);
+        for (const unsigned slots : {4u, 64u}) {
+            INFO("slots " << slots);
+            Script<Proto> fresh(slots);
+            Script<T3aFrozen::Protocol<kCores, TestHooks>> frozen(slots);
+            fresh.proto.sample_n = 1;
+            fresh.proto.ledger.expiry_us = 1'500'000;
+            frozen.proto.ledger.expiry_us = 1'500'000;
+            g_clock = 0;
+            RunScript<Proto, Proto::Gathered, Proto::Batch>(fresh.proto, fresh, seed);
+            g_clock = 0;
+            RunScript<T3aFrozen::Protocol<kCores, TestHooks>, T3aFrozen::Protocol<kCores, TestHooks>::Gathered,
+                      T3aFrozen::Protocol<kCores, TestHooks>::Batch>(frozen.proto, frozen, seed);
+            std::map<std::string, u64> now;
+            for (const auto& v : fresh.proto.Snapshot()) {
+                now[v.name] = v.value;
+            }
+            for (const auto& field : T3aFrozen::Fields(frozen.proto.counters)) {
+                const std::string name = field.name;
+                if (name == "blk_gpu_bytes_at_risk" || name.rfind("blk_at_risk_", 0) == 0) {
+                    continue; // these move to blk_incomplete_gpu_bytes when coverage is incomplete
+                }
+                INFO(name);
+                CHECK(now.at(name) == T3aFrozen::Get(*field.counter));
+            }
+            CHECK(T3aFrozen::Get(frozen.proto.counters.blk_gpu_bytes_at_risk) ==
+                  now.at("blk_gpu_bytes_at_risk") + now.at("blk_incomplete_gpu_bytes"));
+            // The script produced something to compare.
+            CHECK(now.at("blk_applies") > 0);
+            CHECK(now.at("notice_registered") > 0);
+        }
+    }
+}
+
+TEST_CASE("T3a.1 [10]: conservation in the sample with the execution stopped, and no false complete",
+          "[list-diag][t3a1][stress]") {
+    const unsigned notices = StressNotices();
+    for (const u64 n : {u64{1}, u64{8}, u64{64}}) {
+        INFO("N=" << n);
+        for (unsigned round = 1; round <= 2; ++round) {
+            const StressResult roomy = RunStress({notices, 4096, 1'000'000'000ull, round, 0, n});
+            CHECK(roomy.conserved);
+            CHECK(roomy.false_complete == 0);
+            CHECK(roomy.bad_claims == 0);
+            CHECK(roomy.missing == 0);
+            const StressResult tight = RunStress({notices, 8, 400, round + 50, 0, n});
+            CHECK(tight.conserved);
+            CHECK(tight.false_complete == 0);
+            CHECK(tight.bad_claims == 0);
+        }
+    }
+    // The ground truth is not vacuous: without the declared coverage a false complete is seen.
+    u64 seen = 0, affirmed = 0;
+    for (unsigned round = 1; round <= 3; ++round) {
+        const StressResult mutant = RunStress({notices, 8, 400, round + 70, 0, 1, true, false});
+        seen += mutant.false_complete;
+        affirmed += mutant.affirmed;
+    }
+    CHECK(affirmed > 0);
+    CHECK(seen > 0);
+}
+
+TEST_CASE("T3a.1 [10b]: the fraction of sampled NOTICES, on distinct pages used once each", "[list-diag][t3a1]") {
+    for (const u64 n : {u64{2}, u64{8}, u64{64}}) {
+        INFO("N=" << n);
+        Fx f(8);
+        f.proto.sample_n = n;
+        const u64 pages = n * 1500;
+        for (u64 page = 0x1000; page < 0x1000 + pages; ++page) {
+            f.Collect(0, page << 12);
+            f.proto.ledger.ForEachLive([&](unsigned c, unsigned i) { // keep the small ring free
+                f.proto.ledger.Free(c, f.proto.ledger.SlotAt(c, i), f.proto.ledger.SlotAt(c, i).state.load() >> 2);
+            });
+        }
+        const double p = 1.0 / static_cast<double>(n);
+        const double mean = static_cast<double>(pages) * p;
+        const double sigma = std::sqrt(static_cast<double>(pages) * p * (1 - p));
+        CHECK(f.W().seen == pages);
+        CHECK(std::abs(static_cast<double>(f.W().sampled) - mean) < 4 * sigma);
+    }
+}
+
+template <class C>
+concept HasRegistered = requires(C c) { c.notice_registered; };
+template <class C>
+concept HasOverflow = requires(C c) { c.notice_overflow; };
+template <class C>
+concept HasExpired = requires(C c) { c.notice_expired; };
+
+TEST_CASE("T3a.1 [11]: the counters of the writer are per core, 64 bytes, and not in the shared struct",
+          "[list-diag][t3a1]") {
+    STATIC_REQUIRE(sizeof(WriterCounters) == 64);
+    STATIC_REQUIRE(alignof(WriterCounters) == 64);
+    STATIC_REQUIRE(sizeof(WriterShared) == 64);
+    STATIC_REQUIRE(alignof(WriterShared) == 64);
+    STATIC_REQUIRE(!HasRegistered<Counters>);
+    STATIC_REQUIRE(!HasOverflow<Counters>);
+    STATIC_REQUIRE(!HasExpired<Counters>);
+    Fx f(64);
+    const u64 a = PickPage(f.proto, true);
+    for (unsigned i = 0; i < 5; ++i) {
+        f.Collect(1, (a << 12) + i * 64);
+    }
+    for (unsigned i = 0; i < 3; ++i) {
+        f.Collect(2, (a << 12) + 2048 + i * 64);
+    }
+    CHECK(f.proto.writer_counters[1].registered.load() == 5);
+    CHECK(f.proto.writer_counters[2].registered.load() == 3);
+    CHECK(f.proto.writer_counters[0].registered.load() == 0);
+    CHECK(f.W().registered == 8);
+}
+
+TEST_CASE("T3a.1 [12]: one clock read per Register", "[list-diag][t3a1]") {
+    SECTION("a normal registration") {
+        Fx f(64);
+        g_clock_reads = 0;
+        f.Collect(0, 0x90000);
+        CHECK(g_clock_reads.load() == 1);
+    }
+    SECTION("an overflow with 8 published, unexpired slots (it used to be 9)") {
+        Fx f(8);
+        for (unsigned i = 0; i < 8; ++i) {
+            CHECK(f.Collect(0, 0x90000 + i * 64).registered);
+        }
+        g_clock_reads = 0;
+        CHECK(!f.Collect(0, 0x91000).registered);
+        CHECK(g_clock_reads.load() == 1);
+    }
+}
+
+TEST_CASE("T3a.1 [14]: the sample size and the seed", "[list-diag][t3a1]") {
+    using namespace VideoCommon::ListDiag;
+    CHECK(ParseSampleConfig(nullptr, nullptr).n == 8);
+    CHECK(ParseSampleConfig("1", nullptr).n == 1);
+    CHECK(ParseSampleConfig("64", nullptr).n == 64);
+    CHECK(ParseSampleConfig("0x10", nullptr).n == 16);
+    for (const char* bad : {"0", "abc", "-3", "", "4x", "99999999999"}) {
+        const auto c = ParseSampleConfig(bad, nullptr);
+        INFO(bad);
+        CHECK(c.n == 8);
+        CHECK(c.n_invalid);
+    }
+    CHECK(ParseSampleConfig(nullptr, "42").seed == 42);
+    CHECK(ParseSampleConfig(nullptr, "0xff").seed == 255);
+    CHECK(ParseSampleConfig(nullptr, "zz").seed_invalid);
+    CHECK(ParseSampleConfig(nullptr, "zz").seed == 1);
+}
+
+TEST_CASE("T3a.1 [15]: one predicate, over the 4 KiB page, whatever the core or the hook", "[list-diag][t3a1]") {
+    for (const u64 n : {u64{2}, u64{8}, u64{64}}) {
+        Proto proto;
+        proto.sample_n = n;
+        std::mt19937_64 rng{n};
+        for (int i = 0; i < 4000; ++i) {
+            const u64 addr = (rng() & 0xfffffff000ull) + (rng() & 0xfff);
+            // Every address of the page, in either 2 KiB half, has the verdict of the page.
+            CHECK(proto.Sampled(addr) == proto.Sampled(addr & ~u64{0xfff}));
+            CHECK(proto.Sampled(addr) == proto.Sampled((addr & ~u64{0xfff}) + 0x800));
+        }
+        // What the Gather returns for a Collect (u32(a >> 11) round trip) has the verdict of the Collect.
+        Manager manager;
+        std::vector<std::pair<u64, bool>> collected;
+        for (int i = 0; i < 400; ++i) {
+            const u64 addr = 0x100000 + (rng() % 512) * 4096 + (rng() % 64) * 64;
+            manager.Collect(addr, 4);
+            collected.emplace_back(addr, proto.Sampled(addr));
+        }
+        std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t) {
+            bool found = false;
+            for (const auto& [addr, verdict] : collected) {
+                if (addr >> 12 == a >> 12) {
+                    found = true;
+                    CHECK(proto.Sampled(a) == verdict);
+                }
+            }
+            CHECK(found);
+        };
+        manager.Gather(cb);
+        // The seed changes the sample; the core is not an input (Sampled takes no core).
+        Proto other;
+        other.sample_n = n;
+        other.sample_seed = 7;
+        unsigned differ = 0;
+        for (u64 page = 0; page < 2000; ++page) {
+            differ += proto.Sampled(page << 12) != other.Sampled(page << 12) ? 1 : 0;
+        }
+        CHECK(differ > 0);
+        // Uniform over distinct pages.
+        unsigned hits = 0;
+        const u64 pages = n * 2000;
+        for (u64 page = 0; page < pages; ++page) {
+            hits += proto.Sampled(page << 12) ? 1 : 0;
+        }
+        const double p = 1.0 / static_cast<double>(n);
+        CHECK(std::abs(static_cast<double>(hits) - static_cast<double>(pages) * p) <
+              4 * std::sqrt(static_cast<double>(pages) * p * (1 - p)));
+    }
+}
+
+TEST_CASE("T3a.1 [16]: a record recycled while the application reads it", "[list-diag][t3a1]") {
+    SECTION("between the two loads of state") {
+        Fx f(2);
+        f.gpu_modified.Add(0x25000, 64);
+        f.Collect(0, 0x25000);
+        f.Collect(0, 0x25010);
+        const Proto::Batch b = f.GatherAll();
+        g_clock += 6'000'000;
+        f.gates.Arm("r.between_state_loads");
+        std::thread at([&] { ApplyAll(f, b); });
+        f.gates.WaitReached("r.between_state_loads");
+        f.Collect(0, 0x26000); // recycles the slot being read: the floor rises BEFORE the CAS
+        f.gates.Release("r.between_state_loads");
+        at.join();
+        CHECK(f.C(f.c().observation_lost) >= 1);
+        CHECK(f.C(f.c().blk_incomplete) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+    }
+    SECTION("after the Read, rejected by the generation in marks") {
+        Fx f(2);
+        f.gpu_modified.Add(0x25000, 64);
+        f.Collect(0, 0x25000);
+        f.Collect(0, 0x25010);
+        const Proto::Batch b = f.GatherAll();
+        g_clock += 6'000'000;
+        f.gates.Arm("m.before_apply_cas");
+        std::thread at([&] { ApplyAll(f, b); });
+        f.gates.WaitReached("m.before_apply_cas");
+        f.Collect(0, 0x26000);
+        f.gates.Release("m.before_apply_cas");
+        at.join();
+        CHECK(f.C(f.c().blk_incomplete) == 1);
+        CHECK(f.C(f.c().blk_affirmed) == 0);
+    }
+    SECTION("the mutant without the floor: the false completeness appears") {
+        Fx f(2);
+        g_no_coverage = true;
+        f.gpu_modified.Add(0x25000, 64);
+        f.Collect(0, 0x25000);
+        f.Collect(0, 0x25010);
+        const Proto::Batch b = f.GatherAll();
+        g_clock += 6'000'000;
+        f.gates.Arm("r.between_state_loads");
+        std::thread at([&] { ApplyAll(f, b); });
+        f.gates.WaitReached("r.between_state_loads");
+        f.Collect(0, 0x26000);
+        f.gates.Release("r.between_state_loads");
+        at.join();
+        CHECK(f.C(f.c().blk_affirmed) == 1);
+    }
+}
+
+TEST_CASE("T3a.1 [17]: a Gather between the 2 KiB pieces of a sampled notice", "[list-diag][t3a1]") {
+    Fx f(16);
+    f.gpu_modified.Add(0x107c0, 128);
+    f.gates.Arm("c.between_pieces");
+    Proto::Claim c;
+    std::thread wt([&] { c = f.Collect(0, 0x107c0, 128); });
+    f.gates.WaitReached("c.between_pieces");
+    const Proto::Batch first = f.GatherAll(); // piece 1: lot 1
+    f.gates.Release("c.between_pieces");
+    wt.join();
+    CHECK(c.ambiguous);
+    CHECK(c.registered);
+    CHECK(c.handle.slot->lot.load() == 2); // the ceiling hi = s2 + 1, not a lot of the notice
+    const Proto::Batch second = f.GatherAll(); // piece 2: lot 2
+    ApplyAll(f, first);
+    ApplyAll(f, second);
+    CHECK(f.C(f.c().blk_affirmed) == 0); // neither lot affirms it
+    CHECK(f.C(f.c().blk_gpu_bytes_at_risk) == 0);
+}
+
+TEST_CASE("T3a.1 [18]: an old ClearLive does not hide a new record", "[list-diag][t3a1]") {
+    for (const char* point : {"l.before_clear", "l.after_clear"}) {
+        INFO(point);
+        Fx f(1);
+        f.Collect(0, 0x27000);
+        const Proto::Batch b = f.GatherAll();
+        f.gates.Arm(point);
+        std::thread at([&] { ApplyAll(f, b); }); // retires the record, Free -> ClearLive stops at `point`
+        f.gates.WaitReached(point);
+        // The slot is free (the Free CAS happened before ClearLive): a new notice reuses it.
+        const auto n = f.Collect(0, 0x28000);
+        CHECK(n.registered);
+        f.gates.Release(point);
+        at.join();
+        CHECK(f.proto.ledger.LiveBits() == 1);
+        unsigned visited = 0;
+        f.proto.ledger.ForEachLive([&](unsigned, unsigned) { ++visited; });
+        CHECK(visited == 1);
+    }
+}
+
+TEST_CASE("T3a.1 [13]: diagnostic off, the writer counters do not move and nothing is allocated", "[list-diag][t3a1]") {
+    const u32 saved = g_parts.load();
+    g_parts = 0;
+    const u64 before = g_state.load() != nullptr ? State().Sums().seen : 0;
+    Manager manager;
+    CollectNotice(manager, 0, 0x30000, 4); // CollectT<false>: the flag is read and nothing else
+    const u64 after = g_state.load() != nullptr ? State().Sums().seen : 0;
+    CHECK(after == before);
+    g_parts = saved;
 }
