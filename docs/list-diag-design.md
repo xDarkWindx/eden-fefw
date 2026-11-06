@@ -799,7 +799,7 @@ Nada do protocolo dos slots, dos lotes ou da P0 mudou. Escolhas onde o texto dei
 
 ### 3.8 T3a.2: `blkcmp`, o que a GPU tinha contra o que o upload manda (implementado)
 
-Escopo: o bloco "T3a.2" da seção 11 (revisões 5 e 6). **Implementado em `T32HASH`, versão síncrona, aguardando o build do usuário; a revisão 6 manda sobre este texto onde divergiam, e a seção abaixo descreve o que foi implementado.** Não muda: o protocolo dos slots e dos lotes, a P0, a
+Escopo: o bloco "T3a.2" da seção 11 (revisões 5 e 6). **Implementado em `e574de8`, versão síncrona, aguardando o build do usuário; a revisão 6 manda sobre este texto onde divergiam, e a seção abaixo descreve o que foi implementado.** Não muda: o protocolo dos slots e dos lotes, a P0, a
 cobertura da 3.7, nem o que o emulador faz com o guest, `gpu_modified_ranges`, `ClearDownload` e o rastreio de downloads.
 Muda, **só para as faixas sorteadas**, o que acontece entre a sincronização do buffer e o upload: uma cópia diagnóstica
 do que a GPU tem, com um `Finish`. Graus de certeza como no resto; números de linha são os de `47e4a8a`.
