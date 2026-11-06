@@ -116,6 +116,7 @@ private:
                 return;
             }
             tmp.mask |= t.mask;
+            Hooks::At("c.before_cas"); // test stop point (folds away): between the read of `current` and the CAS
         } while (!current.compare_exchange_weak(original, tmp, cas_success, cas_failure));
     }
 

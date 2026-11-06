@@ -2723,6 +2723,7 @@ constexpr u64 kPageBase = 0x20000;
 constexpr u8 kOldGuest = 0x11; ///< what the guest holds for everything the CPU did not write (stale for GPU bytes)
 constexpr u8 kGpuByte = 0x77;  ///< what the GPU wrote into the host
 constexpr u8 kCpuByte = 0x99;  ///< what the CPU wrote
+constexpr u8 kGpuByteTail = 0x66; ///< what the GPU wrote into [40, 48) in the residual scenarios
 
 struct T4World {
     std::array<u8, 4096> host{};  ///< the buffer on the GPU
@@ -2776,17 +2777,24 @@ struct T4World {
     }
 };
 
-/// The script of every scenario: the GPU writes [0, 32), the CPU writes [offset, offset + size).
-std::unique_ptr<T4World> AssembleB(u64 offset, u64 size) { // the manager is not movable
+/// The script of every scenario: the GPU writes [0, 32), the CPU writes [offset, offset + size). With
+/// `divergent_tail` the GPU also wrote [40, 48) with values the guest does NOT have (host != guest there), which
+/// the residual scenarios need: a write of [41, 45) or [41, 42) makes a grain of 4 or 8 bytes take the
+/// neighbours [40, 48) or [40, 44), and if host and guest began equal there the loss would be invisible.
+std::unique_ptr<T4World> AssembleB(u64 offset, u64 size, bool divergent_tail = false) { // the manager is not movable
     auto w = std::make_unique<T4World>();
     w->GpuWrites(0, 32);
+    if (divergent_tail) {
+        std::fill(w->host.begin() + 40, w->host.begin() + 48, kGpuByteTail);
+        w->gpu_modified.Add(kPageBase + 40, 8);
+    }
     w->CpuWrites(offset, size);
     w->Apply();
     return w;
 }
 
 /// The preparation, common to (a) of each scenario. `lost` says the current behaviour: the host lost [0, 32).
-void CheckPreparation(const T4World& w, u64 offset, u64 size) {
+void CheckPreparation(const T4World& w, u64 offset, u64 size, bool divergent_tail = false) {
     // The bytes written: the guest holds the CPU's bytes and the old values elsewhere.
     for (u64 i = 0; i < 64; ++i) {
         const bool written = i >= offset && i < offset + size;
@@ -2809,6 +2817,19 @@ void CheckPreparation(const T4World& w, u64 offset, u64 size) {
     for (u64 i = 0; i < 32; ++i) {
         REQUIRE(w.host[i] == kOldGuest);
     }
+    if (divergent_tail) {
+        // The divergence was built: the host held the GPU's values in [40, 48) and the guest did not have them
+        // (outside the CPU's own bytes); and the GPU's neighbours of the write are the ones lost today.
+        for (u64 i = 40; i < 48; ++i) {
+            REQUIRE(w.host_before_apply[i] == kGpuByteTail);
+            const bool written = i >= offset && i < offset + size;
+            REQUIRE(w.guest[i] == (written ? kCpuByte : kOldGuest));
+            REQUIRE(w.guest[i] != w.host_before_apply[i]);
+            if (!written) {
+                REQUIRE(w.host[i] == kOldGuest); // lost at the 64-byte grain
+            }
+        }
+    }
 }
 
 } // namespace
@@ -2828,18 +2849,20 @@ TEST_CASE("t4 [b]: B, the main script: C1, the host keeps [0,32) and receives [4
 // The residual. With the manager at 64 B this only shows the current defect. It will show the residual of O1
 // (a write smaller than or misaligned to the grain still takes its neighbours) only when it runs with the
 // candidate grain, after O1 exists.
+// The GPU's data is divergent in [0, 32) AND [40, 48) here (revision 2 of the T4 plan), so the bytes outside the
+// exact write but inside the rounding to a grain of 4 or 8 bytes ([40, 48) and [40, 44)) show the loss.
 TEST_CASE("t4 [a]: residual, a misaligned 4-byte write [41,45) and a 1-byte write", "[list-diag][t4]") {
-    CheckPreparation(*AssembleB(41, 4), 41, 4);
-    CheckPreparation(*AssembleB(41, 1), 41, 1);
+    CheckPreparation(*AssembleB(41, 4, true), 41, 4, true);
+    CheckPreparation(*AssembleB(41, 1, true), 41, 1, true);
 }
 
 TEST_CASE("t4 [b]: residual, a misaligned 4-byte write [41,45): C1", "[list-diag][t4][!shouldfail]") {
-    const auto w = AssembleB(41, 4);
+    const auto w = AssembleB(41, 4, true);
     CHECK(w->OnlyCpuBytesChanged(41, 4));
 }
 
 TEST_CASE("t4 [b]: residual, a 1-byte write at 41: C1", "[list-diag][t4][!shouldfail]") {
-    const auto w = AssembleB(41, 1);
+    const auto w = AssembleB(41, 1, true);
     CHECK(w->OnlyCpuBytesChanged(41, 1));
 }
 
@@ -2849,15 +2872,23 @@ TEST_CASE("t4 [b]: residual, a 1-byte write at 41: C1", "[list-diag][t4][!should
 // true and nothing is lost. The case has to run again with the candidate grain when O1 is implemented. The
 // manager is not changed here.
 TEST_CASE("t4: two runs of bits in one transformation give both ranges (current behaviour)", "[list-diag][t4]") {
+    // The addresses come from the GRAIN, not from literals: bits 0-3 of the mask are the first four grains and
+    // bit 8 is the ninth, in the SAME transformation (32 grains) whatever the grain is. kTestGrain is the grain of
+    // the manager today (its align_size, private); when O1 exists it becomes the candidate grain (4 or 8) and the
+    // case then runs with the smaller grain, where the Gather loop condition "continuous_bits < align_size"
+    // (gpu_dirty_memory_manager.h:195) is what must be fixed. The base is aligned to the transformation.
+    constexpr u64 kTestGrain = 64;
+    constexpr u64 kTransformation = 32 * kTestGrain;
+    static_assert(kPageBase % kTransformation == 0);
     Manager manager;
-    manager.Collect(kPageBase, 256);       // bits 0-3
-    manager.Collect(kPageBase + 512, 64);  // bit 8
+    manager.Collect(kPageBase, 4 * kTestGrain);                       // bits 0-3
+    manager.Collect(kPageBase + 8 * kTestGrain, kTestGrain);          // bit 8
     std::vector<std::pair<u64, u64>> got;
     std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { got.emplace_back(a, s); };
     manager.Gather(cb);
     REQUIRE(got.size() == 2);
-    CHECK(got[0] == std::pair<u64, u64>{kPageBase, 256});
-    CHECK(got[1] == std::pair<u64, u64>{kPageBase + 512, 64});
+    CHECK(got[0] == std::pair<u64, u64>{kPageBase, 4 * kTestGrain});
+    CHECK(got[1] == std::pair<u64, u64>{kPageBase + 8 * kTestGrain, kTestGrain});
 }
 
 // =============================================================================================
@@ -3034,5 +3065,46 @@ TEST_CASE("t4.0 [5]: collect and Gather interleaved in threads: coverage is kept
         CHECK(roomy.conserved);
         CHECK(roomy.overlapped == 0);
         CHECK(roomy.false_complete == 0);
+    }
+}
+
+// T4.0, the ABA, deterministic (revision 2 of the T4 plan). The writer reads the EMPTY `current`; a Gather takes
+// and puts the empty back (current holds the same value again); the writer's CAS then succeeds, publishing after
+// that Gather. Stress and serial equivalence do not guarantee that this interleaving happened; the stop point
+// "c.before_cas" does. No write is lost (the next Gather delivers it) and, with the diagnostic, the notice is
+// ambiguous (the Gather changed lot_started between the reads s and s2).
+TEST_CASE("t4.0 [ABA]: the empty read, a Gather puts the empty back, the CAS publishes", "[list-diag][t40]") {
+    SECTION("the manager alone: nothing is lost") {
+        Fx f(16);
+        f.gates.Arm("c.before_cas");
+        std::thread writer([&] { f.managers[0].CollectT<false, TestHooks>(0x50000, 64); });
+        f.gates.WaitReached("c.before_cas");
+        Out between;
+        std::function<void(PAddr, size_t)> cb = [&](PAddr a, size_t s) { between.emplace_back(a, s); };
+        f.managers[0].Gather(cb); // the empty goes out and the empty comes back
+        CHECK(between.empty());
+        f.gates.Release("c.before_cas");
+        writer.join(); // the CAS found the same empty and published
+        const Out later = GatherOf(f.managers[0]);
+        REQUIRE(later.size() == 1);
+        CHECK(later[0] == std::pair<u64, u64>{0x50000, 64});
+        CHECK(GatherOf(f.managers[0]).empty());
+    }
+    SECTION("with the diagnostic the notice is ambiguous and the block comes in the next lot") {
+        Fx f(16);
+        f.gates.Arm("c.before_cas");
+        Proto::Claim claim;
+        std::thread writer([&] { claim = f.Collect(0, 0x50000); });
+        f.gates.WaitReached("c.before_cas");
+        const Proto::Batch first = f.GatherAll(); // lot 1: nothing to deliver
+        CHECK(first.pre.empty());
+        f.gates.Release("c.before_cas");
+        writer.join();
+        CHECK(claim.ambiguous); // s2 != s: the Gather started in between
+        CHECK(claim.registered);
+        const Proto::Batch second = f.GatherAll(); // lot 2: the write comes out here
+        REQUIRE(second.pre.size() == 1);
+        CHECK(second.pre[0].addr == 0x50000);
+        CHECK(second.pre[0].size == 64);
     }
 }
