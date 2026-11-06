@@ -2190,11 +2190,17 @@ void BufferCache<P>::BlkcmpCapture(DAddr dest_address, size_t copy_size, std::sp
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
         // The memory of the staging buffer is only host coherent if its type says so; when it is not, the data the GPU
         // wrote is not visible to the CPU until it is invalidated (docs/list-diag-design.md, 3.8.10; inventory 7.7).
-        const bool staging_coherent = runtime.StagingIsCoherent(download_staging);
-        if (!staging_coherent) {
+        const Diag::StagingState staging_state = runtime.StagingCoherence(download_staging);
+        if (staging_state == Diag::StagingState::NotFound) {
+            // Without the pool entry nothing shows that the mapped span is valid: cancel, do not read the bytes.
+            Diag::BlkcmpDiscard(Diag::BlkcmpReason::NoStaging);
+            return;
+        }
+        if (staging_state == Diag::StagingState::NonCoherent) {
             runtime.InvalidateStaging(download_staging);
         }
-        Diag::BlkcmpCompare(download_staging.mapped_span.data(), offsets, inlined_buffer, finish_us, staging_coherent);
+        Diag::BlkcmpCompare(download_staging.mapped_span.data(), offsets, inlined_buffer, finish_us,
+                            staging_state == Diag::StagingState::Coherent);
     }
 }
 

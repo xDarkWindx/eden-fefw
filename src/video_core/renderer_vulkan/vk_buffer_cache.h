@@ -13,6 +13,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
+#include "video_core/list_diag/counters.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
@@ -138,7 +139,7 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     /// EDEN_LIST_DIAG blkcmp: see StagingBufferPool::IsCoherent / Invalidate.
-    [[nodiscard]] bool StagingIsCoherent(const StagingBufferRef& ref);
+    [[nodiscard]] VideoCommon::ListDiag::StagingState StagingCoherence(const StagingBufferRef& ref);
     void InvalidateStaging(const StagingBufferRef& ref);
 
     void PreCopyBarrier();

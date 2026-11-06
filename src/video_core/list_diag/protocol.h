@@ -46,7 +46,7 @@ constexpr unsigned kEventKinds = 6;
 constexpr unsigned kBlkcmpParts = 16;
 constexpr u64 kBlkcmpAlign = 64;
 
-enum class BlkcmpReason : u8 { NoUpload, NoMemoryMaps, NoSingleBuffer, Stale };
+enum class BlkcmpReason : u8 { NoUpload, NoMemoryMaps, NoSingleBuffer, Stale, NoStaging };
 
 struct Event {
     EventKind kind = EventKind::PopHit;
@@ -176,6 +176,7 @@ public:
         case BlkcmpReason::NoMemoryMaps: Inc(counters.blkcmp_discard_no_memory_maps); break;
         case BlkcmpReason::NoSingleBuffer: Inc(counters.blkcmp_discard_no_single_buffer); break;
         case BlkcmpReason::Stale: Inc(counters.blkcmp_discard_stale); break;
+        case BlkcmpReason::NoStaging: Inc(counters.blkcmp_discard_staging); break;
         }
         request.valid = false;
     }
@@ -912,7 +913,7 @@ public:
                           "[ListDiag][%s]%s blkcmp: bytes antigos da GPU diferentes do payload que os substituiu: %llu de %llu "
                           "bytes comparados (%llu de %llu faixas); sorteadas %llu de %llu elegiveis (as afirmadas com at_risk>0, "
                           "1/%llu, semente=0x%llx; NAO sao amostra aleatoria de todas as aplicacoes); descartadas: faixa=%llu "
-                          "tamanho=%llu sem_upload=%llu sem_mapas=%llu sem_buffer_unico=%llu orcamento=%llu obsoleto=%llu; "
+                          "tamanho=%llu sem_upload=%llu sem_mapas=%llu sem_buffer_unico=%llu orcamento=%llu obsoleto=%llu staging_nao_achado=%llu; "
                           "balde %llu/s rajada %llu, teto %llu B; por thread: back=%llu front=%llu other/unknown=%llu; "
                           "Finish n=%llu soma=%lluus max=%lluus (perturbacao: um Finish sob o buffer_cache.mutex por comparacao); "
                           "staging: coerente em %llu de %llu comparacoes, invalidado em %llu (coerente numa rodada nova vale para as "
@@ -925,6 +926,7 @@ public:
                           n(counters.blkcmp_discard_size), n(counters.blkcmp_discard_no_upload),
                           n(counters.blkcmp_discard_no_memory_maps), n(counters.blkcmp_discard_no_single_buffer),
                           n(counters.blkcmp_discard_budget), n(counters.blkcmp_discard_stale),
+                          n(counters.blkcmp_discard_staging),
                           static_cast<unsigned long long>(blkcmp_rate), static_cast<unsigned long long>(blkcmp_burst),
                           static_cast<unsigned long long>(blkcmp_max_bytes), n(counters.blkcmp_compared_back),
                           n(counters.blkcmp_compared_front), n(counters.blkcmp_compared_other), n(counters.blkcmp_finish_n),
@@ -959,7 +961,7 @@ public:
                              Get(counters.blkcmp_discard_size) + Get(counters.blkcmp_discard_no_upload) +
                              Get(counters.blkcmp_discard_no_memory_maps) +
                              Get(counters.blkcmp_discard_no_single_buffer) + Get(counters.blkcmp_discard_budget) +
-                             Get(counters.blkcmp_discard_stale));
+                             Get(counters.blkcmp_discard_stale) + Get(counters.blkcmp_discard_staging));
                 identity("blkcmp_compared = equal + different", Get(counters.blkcmp_compared),
                          Get(counters.blkcmp_equal) + Get(counters.blkcmp_different));
                 identity("blkcmp_compared = staging_coherent + staging_invalidated", Get(counters.blkcmp_compared),

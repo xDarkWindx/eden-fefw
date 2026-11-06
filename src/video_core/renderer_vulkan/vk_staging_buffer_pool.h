@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 
+#include "video_core/list_diag/counters.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -42,8 +43,10 @@ public:
 
     /// EDEN_LIST_DIAG blkcmp (docs/list-diag-design.md, 3.8.10): whether the memory behind a staging buffer is
     /// host coherent, and the invalidation that reading it after the GPU wrote it needs when it is not.
-    [[nodiscard]] bool IsCoherent(const StagingBufferRef& ref);
-    void Invalidate(const StagingBufferRef& ref);
+    /// Three states (VideoCommon::ListDiag::StagingState): coherent, not coherent (the caller then invalidates), or NotFound
+    /// (no entry for the ref: nothing shows that the mapped span is valid, so the caller must not read it).
+    [[nodiscard]] VideoCommon::ListDiag::StagingState Coherence(const StagingBufferRef& ref);
+    void Invalidate(const StagingBufferRef& ref); // only meaningful after Coherence() == NonCoherent
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;

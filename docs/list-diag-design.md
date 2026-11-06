@@ -1062,8 +1062,10 @@ da gravação. `RecordWithUploadBuffer` só grava no chunk ou chama `DispatchWor
 (revisão de `29ea216`): o `Record` mexe em estado compartilhado do scheduler (o chunk, o contexto), e um tick que só cresce não torna seguras
 chamadas concorrentes. A captura grava a cópia sob o `buffer_cache.mutex`, na thread que aplica, e só é correta se **nenhuma outra
 thread grava no scheduler ao mesmo tempo**: é a convenção que o resto do código do rasterizador já segue (a trás, ou a frente depois de
-`DrainBack`; 3.3). A implementação assíncrona a declara como precondição, como a P0, e a vigia (uma asserção de diagnóstico de que o
-tick lido não mudou entre antes e depois da gravação); ela **não** a faz valer. A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
+`DrainBack`; 3.3). A implementação assíncrona a declara como precondição, como a P0, e **não** a faz valer, nem a detecta por completo. A comparação
+"tick antes == tick depois da gravação" detecta **só mudança de contexto durante a captura** (uma submissão no meio); **não**
+detecta toda violação da exclusão, porque dois produtores podem gravar ao mesmo tempo sem mudar o tick. A exclusão continua
+sendo precondição, sem mecanismo novo. A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
 `vk_master_semaphore.h:42`), a mesma regra pela qual o pool reaproveita um staging (`vk_staging_buffer_pool.cpp:187-189`).
 **Nunca** o syncpoint do guest nem um callback de fence do jogo (em Fast eles correm cedo), e **nunca** forçar uma submissão:
 `Finish`, `Flush` e `Wait` ficam fora. Uma entrada cujo tick não passou fica pendente, sem custo.

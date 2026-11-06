@@ -3446,3 +3446,54 @@ TEST_CASE("T4.1 [7]: the temporary switch picks the tracker once, for Track and 
     VideoCommon::UsageTracker by_default{kUtBuffer};
     CHECK(by_default.IsOldMode() == VideoCommon::UsageTrackerOldMode());
 }
+
+TEST_CASE("blkcmp [10]: a staging entry not found cancels the comparison (counters and identities)", "[list-diag][blkcmp]") {
+    // The protocol side only: the pool answers NotFound, the caller discards with NoStaging and does NOT call the comparison
+    // (the bytes are not read). The real pool lookup (StagingBufferPool::Coherence) is confirmed only in the user's build.
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    b.f.proto.blkcmp_burst = 100;
+    unsigned page = 0xE900;
+    // One good comparison, coherent.
+    {
+        const auto* request = AffirmedCycle(b.f, page++);
+        REQUIRE(request != nullptr);
+        std::array<u64, kBlkcmpParts> offsets{};
+        std::vector<u8> payload(64, 1), staging(Proto::BlkcmpLayout(*request, offsets), 1);
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 2, true);
+    }
+    // Two requests whose staging was not found.
+    for (int i = 0; i < 2; ++i) {
+        REQUIRE(AffirmedCycle(b.f, page++) != nullptr);
+        b.f.proto.BlkcmpDiscard(BlkcmpReason::NoStaging);
+        CHECK(b.f.proto.BlkcmpPending(0, 0) == nullptr); // the request ended
+    }
+    const auto& c = b.f.c();
+    CHECK(Get(c.blkcmp_discard_staging) == 2);
+    // Nothing was compared, nor counted as coherent / invalidated, equal or different, for the cancelled ones.
+    CHECK(Get(c.blkcmp_compared) == 1);
+    CHECK(Get(c.blkcmp_equal) == 1);
+    CHECK(Get(c.blkcmp_different) == 0);
+    CHECK(Get(c.blkcmp_staging_coherent) == 1);
+    CHECK(Get(c.blkcmp_staging_invalidated) == 0);
+    CHECK(Get(c.blkcmp_bytes_compared) == 60);
+    // The identities still close: drawn = compared + discards (with the new one); compared = coherent + invalidated.
+    const u64 discards = Get(c.blkcmp_discard_ranges) + Get(c.blkcmp_discard_size) + Get(c.blkcmp_discard_no_upload) +
+                         Get(c.blkcmp_discard_no_memory_maps) + Get(c.blkcmp_discard_no_single_buffer) +
+                         Get(c.blkcmp_discard_budget) + Get(c.blkcmp_discard_stale) + Get(c.blkcmp_discard_staging);
+    CHECK(Get(c.blkcmp_drawn) == Get(c.blkcmp_compared) + discards);
+    CHECK(Get(c.blkcmp_compared) == Get(c.blkcmp_staging_coherent) + Get(c.blkcmp_staging_invalidated));
+    bool drawn_identity = false, staging_identity = false, text = false;
+    for (const auto& line : b.f.proto.SummaryLines()) {
+        drawn_identity = drawn_identity ||
+                         line.find("blkcmp_drawn = compared + descartes: 3 vs 3 (residuo 0)") != std::string::npos;
+        staging_identity = staging_identity || line.find("blkcmp_compared = staging_coherent + staging_invalidated: 1 vs 1 (residuo 0)") !=
+                                                   std::string::npos;
+        text = text || line.find("staging_nao_achado=2") != std::string::npos;
+    }
+    CHECK(drawn_identity);
+    CHECK(staging_identity);
+    CHECK(text);
+    // The state type has three values, the third being a failure and not "not coherent".
+    CHECK(StagingState::NotFound != StagingState::NonCoherent);
+}

@@ -342,7 +342,8 @@ void Report() {
                  "Upload reordering (usage tracker: {}). PERMISSION (CanReorderUpload at MappedUploadMemory/InlineMemoryImplementation): "
                  "can {:.1f}/s ({:.1f} KiB/s), cannot {:.1f}/s ({:.1f} KiB/s). EFFECT (CopyBuffer path): to the "
                  "upload command buffer {:.1f}/s ({:.1f} KiB/s), in order from the stream buffer {:.1f}/s ({:.1f} KiB/s), "
-                 "in order, other copies {:.1f}/s ({:.1f} KiB/s)",
+                 "in order from any source other than the stream buffer (uploads from other staging included, not only "
+                 "non-upload copies) {:.1f}/s ({:.1f} KiB/s)",
                  VideoCommon::UsageTrackerOldMode() ? "OLD, EDEN_USAGE_TRACKER_OLD=1, temporary, keeps a known UB"
                                                     : "new (T4.1)",
                  per_s(Take(shared.reorder_can_n)), bps(Take(shared.reorder_can_bytes)),

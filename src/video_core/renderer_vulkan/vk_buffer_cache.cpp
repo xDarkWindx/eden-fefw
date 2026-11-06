@@ -397,8 +397,8 @@ VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat f
     return MaxwellToVK::SurfaceFormat(device, FormatType::Buffer, false, format).format;
 }
 
-bool BufferCacheRuntime::StagingIsCoherent(const StagingBufferRef& ref) {
-    return staging_pool.IsCoherent(ref);
+VideoCommon::ListDiag::StagingState BufferCacheRuntime::StagingCoherence(const StagingBufferRef& ref) {
+    return staging_pool.Coherence(ref);
 }
 
 void BufferCacheRuntime::InvalidateStaging(const StagingBufferRef& ref) {

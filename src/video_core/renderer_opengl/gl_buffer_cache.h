@@ -13,6 +13,7 @@
 #include "common/common_types.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
+#include "video_core/list_diag/counters.h"
 #include "video_core/renderer_opengl/gl_device.h"
 #include "video_core/renderer_opengl/gl_resource_manager.h"
 #include "video_core/renderer_opengl/gl_staging_buffer_pool.h"
@@ -74,8 +75,8 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferMap& buffer);
 
     /// EDEN_LIST_DIAG blkcmp (docs/list-diag-design.md, 3.8.10): the generic code calls these; OpenGL has nothing to invalidate.
-    [[nodiscard]] bool StagingIsCoherent(const StagingBufferMap&) const {
-        return true;
+    [[nodiscard]] VideoCommon::ListDiag::StagingState StagingCoherence(const StagingBufferMap&) const {
+        return VideoCommon::ListDiag::StagingState::Coherent;
     }
     void InvalidateStaging(const StagingBufferMap&) {}
 

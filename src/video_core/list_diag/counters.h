@@ -19,6 +19,11 @@ constexpr unsigned kMaxCores = 8; ///< Upper bound of Core::Hardware::NUM_CPU_CO
 
 using Counter = std::atomic<u64>;
 
+/// What the staging pool answers about the memory behind a staging buffer (docs/list-diag-design.md, 3.8.10): three states,
+/// not a bool, because "the entry was not found" is not "not coherent": without the entry nothing shows that the mapped span is
+/// valid, so the comparison is cancelled instead of read.
+enum class StagingState : u8 { Coherent, NonCoherent, NotFound };
+
 inline void Inc(Counter& counter, u64 amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
 }
@@ -122,6 +127,7 @@ struct Counters {
     Counter blkcmp_discard_no_memory_maps{};   ///< the backend has no memory maps (USE_MEMORY_MAPS false)
     Counter blkcmp_discard_no_single_buffer{}; ///< no one buffer holds the range
     Counter blkcmp_discard_budget{};   ///< no token in the bucket
+    Counter blkcmp_discard_staging{};  ///< the pool did not find the staging entry: the bytes were not read
     Counter blkcmp_discard_stale{};    ///< the request was not of this call (should not happen)
     Counter blkcmp_compared{};
     Counter blkcmp_compared_back{};    ///< ... on the thread marked back
@@ -213,6 +219,7 @@ inline std::vector<FieldRef> Fields(Counters& c) {
     LD_FIELD(Blkcmp, blkcmp_discard_no_memory_maps);
     LD_FIELD(Blkcmp, blkcmp_discard_no_single_buffer);
     LD_FIELD(Blkcmp, blkcmp_discard_budget);
+    LD_FIELD(Blkcmp, blkcmp_discard_staging);
     LD_FIELD(Blkcmp, blkcmp_discard_stale);
     LD_FIELD(Blkcmp, blkcmp_compared);
     LD_FIELD(Blkcmp, blkcmp_compared_back);

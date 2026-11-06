@@ -119,12 +119,15 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     it->deferred = false;
 }
 
-bool StagingBufferPool::IsCoherent(const StagingBufferRef& ref) {
+VideoCommon::ListDiag::StagingState StagingBufferPool::Coherence(const StagingBufferRef& ref) {
+    using VideoCommon::ListDiag::StagingState;
     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
     const auto it = std::find_if(entries.begin(), entries.end(),
                                  [&ref](const StagingBuffer& entry) { return entry.index == ref.index; });
-    // Not found: say it is not coherent, so the caller invalidates (which then finds nothing to do).
-    return it != entries.end() && it->buffer.IsHostCoherent();
+    if (it == entries.end()) {
+        return StagingState::NotFound; // not "not coherent": the caller cancels instead of reading
+    }
+    return it->buffer.IsHostCoherent() ? StagingState::Coherent : StagingState::NonCoherent;
 }
 
 void StagingBufferPool::Invalidate(const StagingBufferRef& ref) {
