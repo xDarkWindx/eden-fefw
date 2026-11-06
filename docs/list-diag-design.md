@@ -1632,6 +1632,58 @@ linhas de log:
   aleatória.
 - **Sobra uma limitação do T3a inteiro (3.5):** o aviso registrado não é escrita concluída.
 
+### 8.7 Medições do T4.1 e do `blkcmp` com staging conferido (rodada 5, 2026-11-06)
+
+**Rodadas (medido pelo usuário; uma de cada; o build `927077a` compilou no MSVC).** FE, `EDEN_BACK_THREAD_STATS=1`:
+5a com o rastreador novo; 5b com `EDEN_USAGE_TRACKER_OLD=1`; 5c com `pop,blk,blkcmp` e o rastreador novo. A linha
+`Upload reordering` diz o rastreador ativo em cada uma. Sem P0; todas as identidades fecham com resíduo 0.
+
+**Custo do T4.1: ainda sem conclusão.** Na 5a o jogo só chega à cena por volta de 100 s (na 5b, aos 36 s), e os draws/s
+oscilam de 73 mil a 94 mil depois disso. Com as amostras de trás ≥ 85%: 5a 76 803 (3 amostras), 5b 80 302 (5): −4,4%, mas a
+5a não é comparável assim. **Pedido ao usuário:** confirmar o que foi diferente na 5a e repetir a rodada do rastreador
+novo nas mesmas condições da 5b.
+
+**Reordenação (trecho estável, medido):**
+
+| | Rastreador | Permitidas e feitas pelo `upload_cmdbuf` | Em ordem do stream buffer | Fração reordenada |
+| --- | --- | --- | --- | --- |
+| 5a | novo | ~2 100/s (~9,9 MiB/s) | ~8 400/s | ~20% |
+| 5b | antigo | ~1 100/s (~6,5 MiB/s) | ~10 500/s | ~9% |
+| 5c | novo, com diagnóstico | ~1 700/s | ~8 700/s | ~16% |
+
+O rastreador novo **reordena mais**. É o esperado: o antigo, com o UB do tamanho < 64 B saindo `~0` no x86, marcava a
+palavra inteira (4 KiB) e tirava a reordenação de uploads vizinhos (`t4-coherence-fix-plan.md` 9.2, casos 1 e 4). Permissão e
+efeito batem nas três rodadas: toda cópia permitida vem do stream buffer.
+
+**`blkcmp` (5c):**
+- **staging coerente em 203 de 203 comparações**, invalidado em 0, nenhum `staging_nao_achado`. Isso vale para as
+  alocações desta rodada (revisão de `29ea216`).
+- Diferenças: **6 de 203 faixas** (91 de 7 732 bytes), de novo nas páginas `0x810bb000` a `0x8111f000`, com floats próximos
+  (por exemplo `0xc0f8aa87` contra `0xc0f9142e`).
+- O `Finish` teve máximo de 5,2 ms (na rodada 4, 20 a 30 ms).
+- O resultado da 8.6 deixa de depender de supor coerência **nesta máquina**: com staging coerente medido, o mesmo padrão
+  aparece.
+
+**Quando as diferenças aparecem (medido, nas quatro rodadas com `blkcmp`):** todas antes de a cena estabilizar, durante a
+carga do save. Pelos totais de 30 s:
+
+| Rodada | Até o primeiro total (fim da carga) | Depois, na cena estável |
+| --- | --- | --- |
+| 4c (FE) | 125 comparadas, 6 diferentes (até 46 s) | 68 comparadas, 0 diferentes |
+| 4d (FE) | 124 comparadas, 4 diferentes (até 45 s) | 64 comparadas, 0 diferentes |
+| 5c (FE) | 59 comparadas, 6 diferentes (até 46 s) | 130 comparadas, 0 diferentes |
+| Bananza (rodada 4) | 35 comparadas, 4 diferentes (até 33 s) | 30 comparadas, 0 diferentes |
+
+São ~240 comparações com 20 diferenças na carga, contra ~290 comparações com nenhuma diferença na cena estável.
+**Leitura (hipótese):**
+- O B aparece quando a cena é montada: dados que a GPU produz uma vez (ou nos primeiros frames) são sobrescritos pela
+  cópia velha do guest.
+- No regime estável, as escritas seguradas não pegam esses dados.
+- Como o resultado da carga pode persistir (um buffer montado errado continua errado), isso não diminui a importância
+  do B, mas muda onde procurar o efeito: na montagem da cena, não no custo por frame.
+- As faixas sorteadas não são amostra aleatória, e o orçamento limita as comparações por segundo. A falta de diferenças
+  na cena estável não prova que elas não existam ali.
+
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 
 - **Correções** (T4): nenhuma direção da seção 12 do plano, nenhuma mudança de política de fence.

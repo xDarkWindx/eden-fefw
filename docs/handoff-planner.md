@@ -233,7 +233,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   disso, o build único e as três rodadas (novo, `EDEN_USAGE_TRACKER_OLD=1`, `pop,blk,blkcmp`).
 - `52e726b`: staging não achado cancela (`StagingState`, descarte `blkcmp_discard_staging`); o texto do Report e a nota
   do scheduler estão corrigidos. Conferido pelo planejador (82 casos, 79 passam e 3 falham como esperado; mutantes 6 e
-  2). O build está liberado para o usuário. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  2). O build está liberado para o usuário.
+- Rodada 5 (`list-diag-design.md` 8.7): o build compilou no MSVC. O rastreador novo reordena mais (~20% dos uploads contra
+  ~9%). O custo ainda não foi concluído, porque a 5a chegou à cena aos ~100 s e oscilou; pedi a repetição. O staging foi
+  coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
+  cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
