@@ -192,7 +192,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   Lichii do Frizti corrigiu. As fontes externas estão em `docs/future-optimizations-plan.md` 9.
 - Revisão 7: o `blkcmp` foi aprovado para compilar e rodar. A interpretação obrigatória está na 3.8: uma diferença vale
   para a execução instrumentada e precisa de confirmação sem a interferência das queries. O item das queries de
-  oclusão (inventário 7.5) tem testes definidos e vem depois do T3a.2. O usuário compila e roda as 7 rodadas. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  oclusão (inventário 7.5) tem testes definidos e vem depois do T3a.2.
+- Rodada 4 (`list-diag-design.md` 8.6): o `blkcmp` achou substituições divergentes nos dois jogos, com floats próximos no
+  FE e zeros no lugar de dados da GPU. O T3a.1b quase não mexeu no estouro (43,8%). Proposta: confirmar sem a
+  interferência das queries e começar o desenho do T4. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
@@ -202,5 +205,7 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - O servidor do Duck912 (git.eden-emu.dev) é bloqueado na rede da sessão.
 - Na frente do split nunca se consultam caches nem o scheduler, nem depois de uma espera parcial. **Exceção:** depois de um
   `DrainBack` completo, a frente pode usar o rasterizador até mandar mais trabalho (`puller.cpp:179-180`; revisão 5).
+- **Protocolo de rodadas (usuário, 2026-11-06):** uma rodada de cada configuração; repetir só quando algo for
+  inesperado ou precisar de confirmação. Um par só tem ruído de ~1%: dizer isso ao comparar.
 - Os nomes dos arquivos de log que o usuário manda nem sempre dizem a configuração: confira a linha
   `[ListDiag] ligado` (no primeiro par, o "desligado_b" estava com o diagnóstico ligado).

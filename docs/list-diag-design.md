@@ -1,6 +1,6 @@
 # T3: build de diagnóstico (`EDEN_LIST_DIAG`), desenho proposto
 
-**Estado: T3a medido (8.4: −20% de draws/s no FE); T3a.1 implementado em `c700e86` e medido (8.5: −1,3% com N=8; o B afirmado em ~40% das faixas amostradas sobre bytes da GPU; estouro ainda em 45% dos avisos amostrados); próximo: o desenho do T3a.2 (`blkcmp`); T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
+**Estado: T3a, T3a.1, T3a.1b e T3a.2 implementados e medidos (8.4 a 8.6). O `blkcmp` achou bytes antigos da GPU diferentes do payload que os substituiu, nos dois jogos, numa execução instrumentada; próximo: a confirmação sem a interferência das queries e o desenho do T4; T3b (`list`) e T3c (produtores estrangeiros) não começaram.** Revisão 3 (seção 11, linhas 10 a 13). Escrito em 2026-11-05 sobre `740b932`;
 revisado sobre `0fc35ad` e de novo sobre `2aafcf1` (branch `claude/bold-dirac-tppzm7`), como parte de `docs/handoff-contracts-prototype.md`,
 T3. As revisões incorporadas estão na seção 11.
 
@@ -1365,6 +1365,53 @@ Leitura:
   sendo um piso com cobertura de ~15%.
 - **Bananza:** ambíguo domina (74%), por sobreposição com outros lotes (`apply_overlap_ambiguous_lot` 9 265). As trocas
   de thread (24 mil) não violam a P0. Sem rodada desligada, não há custo.
+
+### 8.6 Medições do T3a.1b e do T3a.2 (rodada 4, 2026-11-06)
+
+**Rodadas (medido pelo usuário; uma de cada configuração, por escolha dele: repetição só para confirmar algo
+inesperado).** O build é de `cb3c982`: a linha `ligado` traz o `blkcmp`. FE no lugar de sempre, com
+`EDEN_BACK_THREAD_STATS=1`: 4a desligado, 4b `pop,blk`, 4c `pop,blk,blkcmp`, 4d `pop,blk,blkcmp` com
+`EDEN_LIST_DIAG_BLKCMP_SEED=2`. Bananza: `pop,blk,blkcmp`. Sem violação de P0. Todas as identidades de conservação,
+inclusive as do `blkcmp`, fecham com resíduo 0. Os `Unmapped Device ReadBlock` (213 por rodada no FE) e os 4
+`assert false` de `memory_manager.cpp:296` no encerramento do 4d são preexistentes: os mesmos números aparecem nas rodadas
+3 e no log `d` da rodada 1.
+
+**Custo (amostras com a trás ≥ 85%):** 4a 78 759; 4b 76 709 (**−2,6%**, um par só; na rodada 3, dois pares davam −1,3%);
+4c 77 058; 4d 77 186. O `blkcmp` não mostra custo próprio em draws/s nesta medida. O `Finish` dele soma 173 ms e 157 ms na
+sessão (~0,4% do tempo), **com picos de 20 e 30 ms**: isso perturba o frame, mas some na média.
+
+**T3a.1b (cursor):** os amostrados que estouram o ledger foram de 45% (rodada 3) para **43,8%** (4b). **A hipótese do cursor
+parado não explica o estouro.** Sobra a rajada, ou mais registros vivos do que a média sugere (**hipótese**). Ambíguas,
+incompletas e afirmadas ficam como antes: 47%, 14% e 40% em 4b.
+
+**T3a.2 (`blkcmp`):**
+
+| | 4c (FE) | 4d (FE, semente 2) | Bananza |
+| --- | --- | --- | --- |
+| Elegíveis (afirmadas com `at_risk > 0`) / sorteadas | 10 455 / 2 589 | 9 891 / 2 381 | 796 / 189 |
+| Comparadas / descartadas pelo orçamento | 193 / 2 396 | 188 / 2 193 | 65 / 122 (mais 2 por número de partes) |
+| **Faixas com bytes diferentes** | **6 de 193 (3,1%)** | **4 de 188 (2,1%)** | **4 de 65 (6,2%)** |
+| **Bytes diferentes / comparados** | **89 / 7 820 (1,1%)** | **65 / 7 724 (0,8%)** | **56 / 3 060 (1,8%)** |
+| Thread | trás 193 | trás 188 | trás 59, frente 6 |
+
+**Bytes antigos da GPU diferentes do payload que os substituiu: há ocorrências nos dois jogos.** Dois padrões nas
+linhas de log:
+- **FE, valores próximos.** Todas as faixas diferentes caem em poucas páginas (`0x810bb000` a `0x810ec000`). As palavras
+  parecem floats próximos: a GPU tinha 0,42512 e o upload trouxe 0,41862; −1,20754 e −1,20370; 14,59291 e 14,58794. É o
+  formato de um dado que a GPU atualiza a cada frame, sobrescrito por uma cópia mais velha que está no guest
+  (**hipótese**).
+- **Zeros por cima de dados da GPU.** Duas faixas no FE e as quatro do Bananza: o payload é zero onde a GPU tinha valor
+  (por exemplo, `0xb727c5ad` em duas faixas do Bananza, a 1 s de distância). É o formato de um guest que nunca recebeu o
+  dado da GPU (**hipótese**; ~90% dos bytes em risco estão fora de `cpu_read_ranges`).
+
+**Interpretação (revisão 7):**
+- **O que isto demonstra:** substituições divergentes **na execução instrumentada**. As faixas são afirmadas, então
+  todos os avisos daquele lote estão em `exact`, e os bytes comparados são os que a CPU não escreveu nele.
+- **O que isto não demonstra:** que a mesma ocorrência, frequência ou trajetória aconteceria sem o `blkcmp`, porque o
+  `Finish` dele zera queries de oclusão. Nem demonstra corrupção visível.
+- **As taxas** (2 a 6% das faixas comparadas) valem só para as afirmadas sorteadas, e as afirmadas não são amostra
+  aleatória.
+- **Sobra uma limitação do T3a inteiro (3.5):** o aviso registrado não é escrita concluída.
 
 ## 9. O que fica de fora e o que o diagnóstico não cobre
 
