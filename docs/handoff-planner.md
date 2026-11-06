@@ -189,7 +189,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   aceitas. Liberado para implementação.
 - `e574de8` (`blkcmp`, versão síncrona) e `99328ab` foram conferidos pelo planejador (nota na 3.8) e estão com o revisor.
   Achado: toda submissão zera o contador de oclusão (`docs/gpu-contract-inventory.md` 7.5), o mesmo defeito que o
-  Lichii do Frizti corrigiu. As fontes externas estão em `docs/future-optimizations-plan.md` 9. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  Lichii do Frizti corrigiu. As fontes externas estão em `docs/future-optimizations-plan.md` 9.
+- Revisão 7: o `blkcmp` foi aprovado para compilar e rodar. A interpretação obrigatória está na 3.8: uma diferença vale
+  para a execução instrumentada e precisa de confirmação sem a interferência das queries. O item das queries de
+  oclusão (inventário 7.5) tem testes definidos e vem depois do T3a.2. O usuário compila e roda as 7 rodadas. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas

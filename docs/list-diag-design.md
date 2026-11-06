@@ -832,6 +832,19 @@ casos); mutantes: `coverage` 6, `open` 2. O diff dos arquivos que não compilam 
 `blkcmp` acrescenta uma submissão no meio do frame e, com ela, um zeramento: as queries de oclusão do jogo podem mudar
 numa rodada com `blkcmp`. Não afeta a comparação, mas a rodada não serve para julgar a imagem. É o defeito que o
 Lichii do Frizti corrigiu pausando em vez de zerar (zortos293#121); está em `docs/gpu-contract-inventory.md` 7.5.
+
+**Revisão 7 (sobre `fa7c63d`): diff aprovado para a compilação completa e a rodada diagnóstica.** Interpretação
+obrigatória do resultado:
+- **O que a comparação mede:** a comparação local continua válida. Ela compara os bytes capturados antes do upload com
+  o payload preservado, e o reset das queries não escreve nesses bytes.
+- **O que ela não mostra:** as queries podem mudar decisões do jogo e, com elas, os draws, os produtores de dados e as
+  faixas elegíveis seguintes. **Uma diferença encontrada mostra uma substituição divergente na execução instrumentada.
+  Ela não mostra que a mesma ocorrência, com a mesma frequência ou no mesmo caminho, aconteceria sem o `blkcmp`.** Uma
+  diferença relevante tem de ser confirmada depois, com o contrato das queries corrigido (inventário 7.5) ou por uma
+  reprodução dirigida sem essa interferência.
+- **Ausência de diferença** continua não descartando o B.
+- **Marca de thread:** a marca `Front` fica na thread. Se o split parar no meio da sessão (`gpu_split.cpp:82-86`, mudança
+  de precisão), ela fica velha. Isso afeta só a classificação no relatório, e a marca não autoriza acesso ao scheduler.
 #### 3.8.1 Do `NoteApply` até `InlineMemoryImplementation` (implementado)
 
 Todos na **mesma thread** e dentro do mesmo `buffer_cache.mutex`: `RasterizerVulkan::OnCachedWrites` toma o mutex

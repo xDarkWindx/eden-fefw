@@ -669,6 +669,19 @@ desempenho no A/B seria custo de invalidações antes perdidas: investigar, não
   de quando o emulador decide submeter. Candidato a item próprio, lido no código do Lichii e portado com A/B.
 - **Para o diagnóstico:** o `blkcmp` faz um `Finish` por comparação, então numa rodada com ele há zeramentos a mais
   (`docs/list-diag-design.md` 3.8).
+- **Precisão (revisão 7, verificado):** `ResetCounter` (`vk_query_cache.cpp:195-209`) pausa a query, abandona a atual e
+  agenda o zeramento dos acumuladores. Toda submissão passa pelo reset; uma janela de contagem que atravesse a
+  submissão pode perder acumulação. Isso não quer dizer que toda submissão interrompa uma query relevante.
+- **O PR #121 do Lichii, pela leitura do revisor (a conferir pelo planejador quando o item começar):** são duas mudanças.
+  (1) `CounterReset` vira `CounterClose` na submissão, preservando a contagem. (2) Um limite em `CloseCounter`: acima de
+  `SamplesQueryBank::BANK_SIZE` slots, ele chama `ResetCounter` de novo. A (2) volta a descartar contagem por limite de
+  recurso e não satisfaz o contrato numa query legítima longa. **Não portar o PR inteiro:** separar a preservação da
+  contagem do controle de memória.
+- **Testes do item:** reset → draws → submissão no meio → mais draws → report; o mesmo trabalho dividido em
+  submissões diferentes dá o mesmo valor; query longa atravessando vários bancos; reset explícito do guest e retomada
+  depois de uma pausa. O A/B visual e de desempenho complementa esses testes e não substitui a conferência do valor
+  reportado.
+- **Ordem:** item próprio, depois do resultado do T3a.2.
 
 ### Pendências de localização
 
