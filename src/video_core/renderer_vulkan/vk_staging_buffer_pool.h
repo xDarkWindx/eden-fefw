@@ -40,6 +40,11 @@ public:
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
     void FreeDeferred(StagingBufferRef& ref);
 
+    /// EDEN_LIST_DIAG blkcmp (docs/list-diag-design.md, 3.8.10): whether the memory behind a staging buffer is
+    /// host coherent, and the invalidation that reading it after the GPU wrote it needs when it is not.
+    [[nodiscard]] bool IsCoherent(const StagingBufferRef& ref);
+    void Invalidate(const StagingBufferRef& ref);
+
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;
     }

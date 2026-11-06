@@ -254,8 +254,8 @@ inline void BlkcmpDiscard(BlkcmpReason reason) {
 }
 /// The comparison (3.8.2, steps 7): ends the request.
 inline void BlkcmpCompare(const u8* old_bytes, const std::array<u64, kBlkcmpParts>& offsets, std::span<const u8> payload,
-                          u64 finish_us) {
-    State().BlkcmpCompare(old_bytes, offsets, payload, finish_us);
+                          u64 finish_us, bool staging_coherent) {
+    State().BlkcmpCompare(old_bytes, offsets, payload, finish_us, staging_coherent);
 }
 
 /// buffer_cache.h, CachedWriteMemory, right after the NoteApplyHook: whatever request is still pending when the

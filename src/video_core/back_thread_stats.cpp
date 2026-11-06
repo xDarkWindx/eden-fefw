@@ -334,6 +334,21 @@ void Report() {
              per_s(unregistered), per_s(held), per_s(written), per_s(Take(shared.cpu_write_would_hit)),
              per_s(Take(shared.cpu_write_skipped)));
     {
+        // Two different things (docs/t4-coherence-fix-plan.md, 9.4): the PERMISSION is what CanReorderUpload said at its
+        // two callers; the EFFECT is the path CopyBuffer took (the upload_cmdbuf only for the stream buffer AND the permission).
+        const auto bps = [&](u64 bytes) { return static_cast<double>(bytes) / 1024.0 / seconds; };
+        LOG_INFO(Render_Vulkan,
+                 "Upload reordering. PERMISSION (CanReorderUpload at MappedUploadMemory/InlineMemoryImplementation): "
+                 "can {:.1f}/s ({:.1f} KiB/s), cannot {:.1f}/s ({:.1f} KiB/s). EFFECT (CopyBuffer path): to the "
+                 "upload command buffer {:.1f}/s ({:.1f} KiB/s), in order from the stream buffer {:.1f}/s ({:.1f} KiB/s), "
+                 "in order, other copies {:.1f}/s ({:.1f} KiB/s)",
+                 per_s(Take(shared.reorder_can_n)), bps(Take(shared.reorder_can_bytes)),
+                 per_s(Take(shared.reorder_cannot_n)), bps(Take(shared.reorder_cannot_bytes)),
+                 per_s(Take(shared.copy_upload_cmdbuf_n)), bps(Take(shared.copy_upload_cmdbuf_bytes)),
+                 per_s(Take(shared.copy_in_order_upload_n)), bps(Take(shared.copy_in_order_upload_bytes)),
+                 per_s(Take(shared.copy_in_order_other_n)), bps(Take(shared.copy_in_order_other_bytes)));
+    }
+    {
         const u64 dirty_held = Take(shared.dirty_held_calls);
         const u64 dirty_cross = Take(shared.dirty_cross_calls);
         const auto source = [&](BackStats::DirtySource s) {

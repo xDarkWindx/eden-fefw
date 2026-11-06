@@ -73,6 +73,12 @@ public:
 
     void FreeDeferredStagingBuffer(StagingBufferMap& buffer);
 
+    /// EDEN_LIST_DIAG blkcmp (docs/list-diag-design.md, 3.8.10): the generic code calls these; OpenGL has nothing to invalidate.
+    [[nodiscard]] bool StagingIsCoherent(const StagingBufferMap&) const {
+        return true;
+    }
+    void InvalidateStaging(const StagingBufferMap&) {}
+
     bool CanReorderUpload(const Buffer&, std::span<const VideoCommon::BufferCopy>) {
         return false;
     }

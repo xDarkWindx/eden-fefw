@@ -248,6 +248,12 @@ struct Shared {
     std::atomic<u64> invalidate_total{};
     std::atomic<u64> invalidate_empty{};
     std::atomic<u64> invalidate_data{};
+    // Upload reordering (docs/t4-coherence-fix-plan.md, 9.4). PERMISSION: CanReorderUpload at its two callers in
+    // buffer_cache.h. EFFECT: the path CopyBuffer took (BufferCacheRuntime::CopyBuffer). Different things.
+    std::atomic<u64> reorder_can_n{}, reorder_can_bytes{}, reorder_cannot_n{}, reorder_cannot_bytes{};
+    std::atomic<u64> copy_upload_cmdbuf_n{}, copy_upload_cmdbuf_bytes{};
+    std::atomic<u64> copy_in_order_upload_n{}, copy_in_order_upload_bytes{};
+    std::atomic<u64> copy_in_order_other_n{}, copy_in_order_other_bytes{};
     std::atomic<u64> gpu_modified_queries{};
     std::atomic<u64> gpu_modified_true{};
     std::atomic<u64> gpu_modified_one_page{}; ///< Queries within one 4 KiB page
@@ -305,6 +311,32 @@ inline thread_local bool in_draw_lock{};
 
 inline void Add(std::atomic<u64>& counter, u64 value) {
     counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+enum class CopyPath { UploadCmdbuf, InOrderUpload, InOrderOther };
+
+/// Permission to reorder an upload, counted by the callers of CanReorderUpload (only with the statistics on).
+inline void NoteReorderPermission(bool can, u64 bytes) {
+    Add(can ? shared.reorder_can_n : shared.reorder_cannot_n, 1);
+    Add(can ? shared.reorder_can_bytes : shared.reorder_cannot_bytes, bytes);
+}
+
+/// The path a CopyBuffer took (only with the statistics on).
+inline void NoteCopyPath(CopyPath path, u64 bytes) {
+    switch (path) {
+    case CopyPath::UploadCmdbuf:
+        Add(shared.copy_upload_cmdbuf_n, 1);
+        Add(shared.copy_upload_cmdbuf_bytes, bytes);
+        break;
+    case CopyPath::InOrderUpload:
+        Add(shared.copy_in_order_upload_n, 1);
+        Add(shared.copy_in_order_upload_bytes, bytes);
+        break;
+    case CopyPath::InOrderOther:
+        Add(shared.copy_in_order_other_n, 1);
+        Add(shared.copy_in_order_other_bytes, bytes);
+        break;
+    }
 }
 
 inline void Max(std::atomic<u64>& counter, u64 value) {

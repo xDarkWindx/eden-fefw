@@ -137,6 +137,10 @@ public:
 
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
+    /// EDEN_LIST_DIAG blkcmp: see StagingBufferPool::IsCoherent / Invalidate.
+    [[nodiscard]] bool StagingIsCoherent(const StagingBufferRef& ref);
+    void InvalidateStaging(const StagingBufferRef& ref);
+
     void PreCopyBarrier();
 
     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,

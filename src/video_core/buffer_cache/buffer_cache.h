@@ -2091,6 +2091,9 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             copy.src_offset += upload_staging.offset;
         }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        if (VideoCommon::BackStats::Enabled()) {
+            VideoCommon::BackStats::NoteReorderPermission(can_reorder, total_size_bytes);
+        }
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     }
 }
@@ -2138,6 +2141,9 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+        if (VideoCommon::BackStats::Enabled()) {
+            VideoCommon::BackStats::NoteReorderPermission(can_reorder, copy_size);
+        }
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {
         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
@@ -2182,7 +2188,13 @@ void BufferCache<P>::BlkcmpCapture(DAddr dest_address, size_t copy_size, std::sp
         runtime.Finish();
         const auto finish_us = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
-        Diag::BlkcmpCompare(download_staging.mapped_span.data(), offsets, inlined_buffer, finish_us);
+        // The memory of the staging buffer is only host coherent if its type says so; when it is not, the data the GPU
+        // wrote is not visible to the CPU until it is invalidated (docs/list-diag-design.md, 3.8.10; inventory 7.7).
+        const bool staging_coherent = runtime.StagingIsCoherent(download_staging);
+        if (!staging_coherent) {
+            runtime.InvalidateStaging(download_staging);
+        }
+        Diag::BlkcmpCompare(download_staging.mapped_span.data(), offsets, inlined_buffer, finish_us, staging_coherent);
     }
 }
 

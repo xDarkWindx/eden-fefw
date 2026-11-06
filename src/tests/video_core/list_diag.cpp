@@ -2498,7 +2498,7 @@ TEST_CASE("blkcmp [5]: the comparison with a fake staging", "[list-diag][blkcmp]
         }
         tweak(staging);
         MarkThread(ThreadRole::Back);
-        const bool different = b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1234);
+        const bool different = b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1234, true);
         MarkThread(ThreadRole::Unknown);
         CHECK(different == (expect_diff != 0));
         CHECK(b.f.C(b.f.c().blkcmp_bytes_compared) == 60); // only the at_risk bytes
@@ -2560,7 +2560,7 @@ TEST_CASE("blkcmp [6]: the discards by reason and the conservation", "[list-diag
         if (diff) {
             staging[0] = 8;
         }
-        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 10);
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 10, true);
     }
     // the size cap, and the budget
     b.f.proto.blkcmp_max_bytes = 8;
@@ -2677,7 +2677,7 @@ TEST_CASE("blkcmp [8]: the part, its configuration and the thread mark", "[list-
         std::array<u64, kBlkcmpParts> offsets{};
         std::vector<u8> payload(64, 1), staging(Proto::BlkcmpLayout(*request, offsets), 1);
         MarkThread(role);
-        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1);
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 1, true);
         MarkThread(ThreadRole::Unknown);
     };
     compare_with(ThreadRole::Unknown);
@@ -3107,4 +3107,52 @@ TEST_CASE("t4.0 [ABA]: the empty read, a Gather puts the empty back, the CAS pub
         CHECK(second.pre[0].addr == 0x50000);
         CHECK(second.pre[0].size == 64);
     }
+}
+
+TEST_CASE("blkcmp [9]: the staging coherence is counted, logged and conserved (3.8.10)", "[list-diag][blkcmp]") {
+    // Only the protocol part is here: the counters, the identity and the text. The calls IsCoherent / Invalidate of the
+    // pool and the Vulkan invalidation are read in the code and confirmed in the user's build.
+    BlkcmpFx b;
+    b.f.proto.blkcmp_odds = 1;
+    b.f.proto.blkcmp_burst = 100;
+    unsigned page = 0xE800;
+    const auto compare = [&](bool coherent, bool make_different) {
+        const auto* request = AffirmedCycle(b.f, page++);
+        REQUIRE(request != nullptr);
+        std::array<u64, kBlkcmpParts> offsets{};
+        std::vector<u8> payload(64, 5), staging(Proto::BlkcmpLayout(*request, offsets), 5);
+        if (make_different) {
+            staging[0] = 6;
+        }
+        b.f.proto.BlkcmpCompare(staging.data(), offsets, payload, 3, coherent);
+    };
+    compare(true, false);
+    compare(true, true);
+    compare(false, true);
+    compare(false, false);
+    compare(false, true);
+    const auto& c = b.f.c();
+    CHECK(Get(c.blkcmp_staging_coherent) == 2);
+    CHECK(Get(c.blkcmp_staging_invalidated) == 3);
+    CHECK(Get(c.blkcmp_compared) == Get(c.blkcmp_staging_coherent) + Get(c.blkcmp_staging_invalidated));
+    // The log line of a difference says which it was.
+    const auto lines = b.f.Lines();
+    unsigned coherent_lines = 0, invalidated_lines = 0;
+    for (const auto& line : lines) {
+        if (line.find("[blkcmp] different") == std::string::npos) {
+            continue;
+        }
+        coherent_lines += line.find("staging=coherent") != std::string::npos ? 1 : 0;
+        invalidated_lines += line.find("staging=invalidated") != std::string::npos ? 1 : 0;
+    }
+    CHECK(coherent_lines == 1);
+    CHECK(invalidated_lines == 2);
+    // The summary: the sentence and the identity.
+    bool text = false, identity = false;
+    for (const auto& line : b.f.proto.SummaryLines()) {
+        text = text || line.find("staging: coerente em 2 de 5 comparacoes, invalidado em 3") != std::string::npos;
+        identity = identity || line.find("blkcmp_compared = staging_coherent + staging_invalidated: 5 vs 5 (residuo 0)") != std::string::npos;
+    }
+    CHECK(text);
+    CHECK(identity);
 }

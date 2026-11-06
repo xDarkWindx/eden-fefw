@@ -57,7 +57,7 @@ struct Event {
     u64 lot = 0;
     u64 notice_addr = 0;
     u32 notice_size = 0;
-    std::array<u64, 10> v{};
+    std::array<u64, 11> v{};
 };
 
 /// The first kLogFirst events of each kind are logged, then one in kLogEvery; never more than
@@ -208,7 +208,7 @@ public:
     /// the upload sends (`payload` covers [request.addr, request.addr + request.size)). Ends the request.
     /// Returns whether any byte differs. `finish_us` is the time of the Finish. The guest is not read.
     bool BlkcmpCompare(const u8* old_bytes, const std::array<u64, kBlkcmpParts>& offsets,
-                       std::span<const u8> payload, u64 finish_us) {
+                       std::span<const u8> payload, u64 finish_us, bool staging_coherent) {
         BlkcmpRequest& request = blkcmp_request_;
         if (!request.valid || payload.size() < request.size) {
             BlkcmpDiscard(BlkcmpReason::Stale);
@@ -245,6 +245,8 @@ public:
         }
         Inc(counters.blkcmp_bytes_compared, compared);
         Inc(counters.blkcmp_bytes_different, different);
+        // Was the staging memory coherent, or did the caller have to invalidate it before this read (3.8.10)?
+        Inc(staging_coherent ? counters.blkcmp_staging_coherent : counters.blkcmp_staging_invalidated);
         Inc(counters.blkcmp_finish_n);
         Inc(counters.blkcmp_finish_us_sum, finish_us);
         Max(counters.blkcmp_finish_us_max, finish_us);
@@ -271,6 +273,7 @@ public:
             ev.v[7] = first_new;
             ev.v[8] = static_cast<u64>(t_role);
             ev.v[9] = finish_us;
+            ev.v[10] = staging_coherent ? 1 : 0;
             Push(ev);
         }
         request.valid = false;
@@ -911,7 +914,9 @@ public:
                           "1/%llu, semente=0x%llx; NAO sao amostra aleatoria de todas as aplicacoes); descartadas: faixa=%llu "
                           "tamanho=%llu sem_upload=%llu sem_mapas=%llu sem_buffer_unico=%llu orcamento=%llu obsoleto=%llu; "
                           "balde %llu/s rajada %llu, teto %llu B; por thread: back=%llu front=%llu other/unknown=%llu; "
-                          "Finish n=%llu soma=%lluus max=%lluus (perturbacao: um Finish sob o buffer_cache.mutex por comparacao). "
+                          "Finish n=%llu soma=%lluus max=%lluus (perturbacao: um Finish sob o buffer_cache.mutex por comparacao); "
+                          "staging: coerente em %llu de %llu comparacoes, invalidado em %llu (coerente numa rodada nova vale para as "
+                          "alocacoes dela, nao prova o tipo das antigas). "
                           "Isso nao prova corrupcao visivel nem exclui uma escrita legitima concorrente.",
                           tag, approx.c_str(), n(counters.blkcmp_bytes_different), n(counters.blkcmp_bytes_compared),
                           n(counters.blkcmp_different), n(counters.blkcmp_compared), n(counters.blkcmp_drawn),
@@ -923,7 +928,9 @@ public:
                           static_cast<unsigned long long>(blkcmp_rate), static_cast<unsigned long long>(blkcmp_burst),
                           static_cast<unsigned long long>(blkcmp_max_bytes), n(counters.blkcmp_compared_back),
                           n(counters.blkcmp_compared_front), n(counters.blkcmp_compared_other), n(counters.blkcmp_finish_n),
-                          n(counters.blkcmp_finish_us_sum), n(counters.blkcmp_finish_us_max));
+                          n(counters.blkcmp_finish_us_sum), n(counters.blkcmp_finish_us_max),
+                          n(counters.blkcmp_staging_coherent), n(counters.blkcmp_compared),
+                          n(counters.blkcmp_staging_invalidated));
             lines.push_back(b);
         }
         if (is_final) {
@@ -955,6 +962,8 @@ public:
                              Get(counters.blkcmp_discard_stale));
                 identity("blkcmp_compared = equal + different", Get(counters.blkcmp_compared),
                          Get(counters.blkcmp_equal) + Get(counters.blkcmp_different));
+                identity("blkcmp_compared = staging_coherent + staging_invalidated", Get(counters.blkcmp_compared),
+                         Get(counters.blkcmp_staging_coherent) + Get(counters.blkcmp_staging_invalidated));
             }
             if (pop_on) {
                 char b[200];
@@ -1054,9 +1063,10 @@ public:
             std::snprintf(b, sizeof(b),
                           "[ListDiag][blkcmp] different: range=[0x%llx,+%llu) cores=0x%x lot=%llu parts=%llu bytes=%llu "
                           "diff_bytes=%llu first=0x%llx gpu_old=0x%016llx payload=0x%016llx (8 bytes, little endian) "
-                          "thread=%s finish=%lluus",
+                          "thread=%s finish=%lluus staging=%s",
                           hex(ev.v[0]), hex(ev.v[1]), ev.core, hex(ev.lot), hex(ev.v[2]), hex(ev.v[3]), hex(ev.v[4]),
-                          hex(ev.v[5]), hex(ev.v[6]), hex(ev.v[7]), thread, hex(ev.v[9]));
+                          hex(ev.v[5]), hex(ev.v[6]), hex(ev.v[7]), thread, hex(ev.v[9]),
+                          ev.v[10] != 0 ? "coherent" : "invalidated");
             break;
         }
         case EventKind::P0Violated:

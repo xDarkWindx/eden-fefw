@@ -119,6 +119,23 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     it->deferred = false;
 }
 
+bool StagingBufferPool::IsCoherent(const StagingBufferRef& ref) {
+    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    const auto it = std::find_if(entries.begin(), entries.end(),
+                                 [&ref](const StagingBuffer& entry) { return entry.index == ref.index; });
+    // Not found: say it is not coherent, so the caller invalidates (which then finds nothing to do).
+    return it != entries.end() && it->buffer.IsHostCoherent();
+}
+
+void StagingBufferPool::Invalidate(const StagingBufferRef& ref) {
+    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    const auto it = std::find_if(entries.begin(), entries.end(),
+                                 [&ref](const StagingBuffer& entry) { return entry.index == ref.index; });
+    if (it != entries.end()) {
+        it->buffer.Invalidate(); // does nothing for coherent memory
+    }
+}
+
 void StagingBufferPool::TickFrame() {
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 

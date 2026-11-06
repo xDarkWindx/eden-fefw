@@ -131,6 +131,8 @@ struct Counters {
     Counter blkcmp_different{};
     Counter blkcmp_bytes_compared{};
     Counter blkcmp_bytes_different{};
+    Counter blkcmp_staging_coherent{};   ///< the staging memory was host coherent
+    Counter blkcmp_staging_invalidated{}; ///< it was not, and was invalidated before the read (3.8.10)
     Counter blkcmp_finish_n{};
     Counter blkcmp_finish_us_sum{};
     Counter blkcmp_finish_us_max{};
@@ -220,6 +222,8 @@ inline std::vector<FieldRef> Fields(Counters& c) {
     LD_FIELD(Blkcmp, blkcmp_different);
     LD_FIELD(Blkcmp, blkcmp_bytes_compared);
     LD_FIELD(Blkcmp, blkcmp_bytes_different);
+    LD_FIELD(Blkcmp, blkcmp_staging_coherent);
+    LD_FIELD(Blkcmp, blkcmp_staging_invalidated);
     LD_FIELD(Blkcmp, blkcmp_finish_n);
     LD_FIELD(Blkcmp, blkcmp_finish_us_sum);
     LD_FIELD(Blkcmp, blkcmp_finish_us_max);
