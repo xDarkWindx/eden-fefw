@@ -591,6 +591,26 @@ AJUSTE 3): `-O2`, TSan e ASan+UBSan, cada um **All tests passed (77312 assertion
 rodado de novo. **Não compilado aqui:** `core/memory.cpp` e `video_core/gpu.cpp` (faltam os cabeçalhos do ffmpeg); a
 `back_thread_stats.cpp` só dá os erros de versão do `fmt` que o arquivo sem a mudança já dá.
 
+**Conferência do planejador (`de5bc3d`).** Os três builds do harness foram reproduzidos na nuvem (GCC 13): os mesmos
+77 312 asserções em 32 casos, sem falha nem erro de UBSan. A sensibilidade também: forçando o recorte a desligado
+(edição temporária, revertida), 5 de 8 casos `[d1]` e 7 029 asserções falham. O diff foi lido.
+`memory.cpp` e `gpu.cpp` continuam sem compilação na nuvem; o build do usuário no MSVC é o primeiro.
+
+**Medição do A/B (decisão do planejador).** O custo é medido em **draws/s das estatísticas, ligadas nos dois braços**
+(`EDEN_BACK_THREAD_STATS=1`), e não pelo FPS da barra do Eden. Motivos:
+- É a única métrica que já foi validada: ruído de ~1% entre as rodadas iguais a e c (`docs/list-diag-design.md` 8.4).
+- O FPS anda em degraus (30/24/22/20) e não resolve diferenças de 5%, que é o orçamento.
+- O código das estatísticas, inclusive a contagem nova do D1, roda **igual nos dois braços**, porque a contagem não
+  depende da chave. A diferença entre os braços isola o recorte, e a mesma rodada dá a contagem dos cruzamentos.
+
+O que isso não mede: o custo absoluto sem as estatísticas. Isso fica declarado como limitação; não é preciso para
+decidir o D1. Se a diferença ficar acima do ruído, o `other busy` e a linha `Invalidation batches` dizem se o custo
+novo é aplicação de escritas que antes se perdiam.
+
+Protocolo: FE no mesmo lugar das rodadas a–d (25 s depois de carregar o save, parado), quatro rodadas alternadas,
+com `EDEN_DIRTY_SPLIT_2K=0` e sem ele, sem `EDEN_LIST_DIAG`. Bananza: duas rodadas, uma de cada, no mesmo ponto
+depois de carregar o save, anotando o chão.
+
 **Interação com o T3a.1 e o resto.** O D1 vem antes do T3a.1 (o bug contamina o que ele mede). A aplicação de um
 aviso recortado cobre as duas metades, e o `apply_partial` que o bug produzia deve cair (hipótese). Uma queda de
 desempenho no A/B seria custo de invalidações antes perdidas: investigar, não restaurar a perda.
