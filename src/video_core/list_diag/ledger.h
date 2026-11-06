@@ -232,6 +232,11 @@ public:
             cursor_[core] = (index + 1) % per_core_;
             return Handle{&s, next_gen, true};
         }
+        // The cursor only moved on success, so after an overflow the next notice would examine the SAME
+        // slots and overflow again even with the ring nearly empty (docs/list-diag-design.md, 8.5 and
+        // T3a.1b). Skip the kScan slots just examined. The cursor is private to the core's writer (pi4):
+        // not part of the proof, nothing else changes.
+        cursor_[core] = (cursor_[core] + kScan) % per_core_;
         wc.Bump(wc.overflow);
         return Handle{};
     }

@@ -2310,3 +2310,28 @@ TEST_CASE("T3a.1 [13]: diagnostic off, the writer counters do not move and nothi
     CHECK(after == before);
     g_parts = saved;
 }
+
+TEST_CASE("T3a.1b: after an overflow the cursor skips the slots examined, so the next notice registers", "[list-diag][t3a1b]") {
+    Fx f(16);
+    // 8 records of lot 1 (slots 0-7), 8 of lot 2 (slots 8-15): the ring is full and the cursor is back at 0.
+    for (unsigned i = 0; i < 8; ++i) {
+        REQUIRE(f.Collect(0, 0xA0000 + i * 4096).registered);
+    }
+    const Proto::Batch b1 = f.GatherAll(); // lot 1 taken, never applied: slots 0-7 stay published
+    for (unsigned i = 8; i < 16; ++i) {
+        REQUIRE(f.Collect(0, 0xA0000 + i * 4096).registered);
+    }
+    const Proto::Batch b2 = f.GatherAll();
+    ApplyAll(f, b2); // retires slots 8-15 (lot 2)
+    (void)b1;
+    CHECK(f.proto.ledger.LiveBits() == 8);
+    // The 8 slots from the cursor are published and not expired; the rest is free.
+    const auto first = f.Collect(0, 0xB0000);
+    CHECK(!first.registered);
+    CHECK(f.W().overflow == 1);
+    const auto second = f.Collect(0, 0xB1000);
+    CHECK(second.registered); // outside the 8 examined before
+    CHECK(f.W().overflow == 1);
+    CHECK(f.W().registered == 17);
+    CHECK(f.Conserved());
+}
