@@ -201,7 +201,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   condição. Há sete exigências do revisor para a assíncrona (staging diferido, payload próprio, fence física, fila
   limitada, barreiras nos dois sentidos, proteção contra todas as sobrescritas, captura na posição atual). Rascunho do
   T4: `docs/t4-coherence-fix-plan.md` (O1, grão menor no gerenciador, como candidata). Achado: `IsValid` sempre aceita.
-  O codador recebe a reprodução dirigida do B no harness e o desenho do T3a.2b. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  O codador recebe a reprodução dirigida do B no harness e o desenho do T3a.2b.
+- Revisão 1 do T4 (`t4-coherence-fix-plan.md` 8; corpo alinhado em `b17a131`): O1 vira mitigação; o laço do `Gather` e o
+  `UsageTracker` (T4.1) são pré-requisitos. Sequência: T4.0 (vazio pela máscara) → T4.1 → medição → decisão do usuário.
+  O T4.1 vem **antes** da implementação do `blkcmp` assíncrono (o `MarkUsage` depende dele); só o desenho vai agora.
+  Prompt do codador: reprodução, T4.0 e desenho do T3a.2b, em três commits. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
