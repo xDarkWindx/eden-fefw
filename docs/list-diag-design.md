@@ -992,7 +992,7 @@ registro da cópia e a sua execução, e como cada um fica atrás da cópia:
 | O upload final (`InlineMemoryImplementation`, `:2123-2133`) | `CanReorderUpload` (`vk_buffer_cache.cpp:448-458`) devolve `false` se `IsRegionUsed(dst_offset, size)` (`:455`); o upload vai pelo `Record` do cmdbuf principal (`:487-499`), depois da cópia, e não pelo `upload_cmdbuf`, que executa antes (`:480-486`) |
 | Os uploads do `SynchronizeBuffer` (`MappedUploadMemory`, `:2093-2094`, `CanReorderUpload` por cópia) | o mesmo teste, cópia a cópia, contra as faixas marcadas |
 | Outras escritas em ordem de comando (`CopyBuffer` do cache, `ClearBuffer`, DMA) | gravadas no cmdbuf principal **depois** da cópia, em ordem de gravação; a ordem entre elas é a das barreiras (ponto 3) |
-| Substituição do buffer (`JoinOverlap`, `buffer_cache.h:1891-1912`, `DeleteBuffer`, `:2254`) | a cópia lê o `VkBuffer` antigo; o novo recebe a cópia do antigo **depois** dela, em ordem. O antigo só é destruído pelo `delayed_destruction_ring` (`buffer_cache_base.h:529`, `TICKS_TO_DESTROY` ticks de frame). **A confirmar na implementação:** que o anel cobre o tempo até a cópia terminar (mesma premissa de toda gravação que cita um buffer apagado) |
+| Substituição do buffer (`JoinOverlap`, `buffer_cache.h:1891-1912`, `DeleteBuffer`, `:2254`) | a cópia lê o `VkBuffer` antigo; o novo recebe a cópia do antigo **depois** dela, em ordem. **Não há prova de que o anel de destruição cubra a cópia** (revisão de `825c5b3`, item 2): `DelayedDestructionRing::Tick()` (`delayed_destruction_ring.h:20-23`) avança um índice e destrói o vetor daquela posição **sem consultar fence nem tick da GPU**; o cache o avança uma vez por `TickFrame` (`buffer_cache.h:118`), e `TICKS_TO_DESTROY` é 6 ou 8 frames (`buffer_cache_base.h:525-527`). Frames não são ticks da GPU: com a GPU atrasada mais que isso, o `VkBuffer` pode ser destruído antes de a cópia executar. O staging diferido protege o **destino**, não a **fonte**. **Decisão:** segurar a fonte até o tick da cópia (abaixo, "Retenção da fonte") |
 
 **`MarkUsage` da região lida.** O mecanismo que alimenta `CanReorderUpload` é `Buffer::MarkUsage` (`vk_buffer_cache.cpp:125-128`,
 `usage_tracker.h:40`). A marca cobre **os bytes lidos (as partes `at_risk`)** e, para o upload final, o par exato
@@ -1010,9 +1010,18 @@ não reconhece a marca, **não se compara**.
 - *A cópia termina de ler antes das sobrescritas posteriores:* a barreira posterior (`WRITE_BARRIER`, de `TRANSFER` para
   gráficos/compute, `:492-499`) dá a dependência de execução. Uma leitura seguida de escrita (WAR) precisa só de dependência de
   execução, e ela existe no fim do `Record` da cópia; os `CopyBuffer` posteriores têm a barreira anterior própria.
-- *A escrita no staging fica visível à CPU:* não há barreira de host; vale a premissa do `DownloadBufferMemory` (lê o `mapped_span`
-  depois de esperar a GPU). **A confirmar:** que a memória `MemoryUsage::Download` do pool é coerente com o host ou que a espera
-  do tick a torna visível; se não for, a implementação precisa de uma invalidação e o desenho passa a pedi-la.
+- *A escrita no staging fica visível à CPU: invalidação (revisão de `825c5b3`, item 1).* A alternativa "a espera do tick a torna
+  visível" **sai**: a conclusão da GPU não substitui a invalidação de memória não coerente (a memória de download só *prefere*
+  `HOST_CACHED | HOST_COHERENT`, `vulkan_memory_allocator.cpp:96-99`, e a alocação usa `requiredFlags = 0`, `:289-293`; inventário 7.7).
+  Depois de `IsFree(tick)` e **antes** da comparação, o `blkcmp` invalida o staging por `StagingBufferPool::Invalidate(ref)` (3.8.10).
+
+**Retenção da fonte (revisão de `825c5b3`, item 2).** A entrada guarda o `buffer_id` da fonte, **não** um ponteiro, e a lista de
+`BufferCache::blkcmp_held_` guarda `{Buffer, tick}`. `DeleteBuffer` (`buffer_cache.h:2254`, o `delayed_destruction_ring.Push` está em `:2312`),
+só quando o modo assíncrono tem entrada pendente com esse `buffer_id`, sem `source_released` e com `!IsFree(tick)`, **move o `Buffer`
+para a lista de retenção em vez de para o anel**, e marca a entrada `source_released` (o `buffer_id` pode ser reaproveitado pelo
+`SlotVector` depois, e a entrada não pode segurar o buffer novo). A lista é esvaziada nos mesmos pontos de conclusão, quando `IsFree(tick)`.
+O caminho normal do `DeleteBuffer` (sem entrada pendente, ou diagnóstico desligado) **não muda**. `JoinOverlap` (`:1911`) e o coletor de lixo
+(`:79`) chegam por `DeleteBuffer`, então estão cobertos. A retenção não força submissão: o tick passa com o fluxo normal.
 
 **4. Staging reservado até a comparação na CPU terminar, com o mecanismo diferido.** `runtime.DownloadStagingBuffer(total, true)`
 (`vk_buffer_cache.cpp:392`, `vk_staging_buffer_pool.cpp:103-108`): o `TryGetReservedBuffer` marca a entrada com `tick = max` e
@@ -1033,7 +1042,12 @@ para um `Buffer` (que `DeleteBuffer` pode remover): a comparação só precisa d
 **6. Conclusão ligada à submissão que contém a cópia.** Depois de gravar a cópia, a entrada guarda `tick = runtime.CurrentTick()`
 (`vk_buffer_cache.cpp:431-433`), lido **depois** do `Record` (a cópia está no contexto desse tick; nenhuma submissão acontece
 dentro de `Record`: ela é explícita, `vk_scheduler.cpp:67-75`; **a conferir na implementação**, com uma asserção de que o tick não
-mudou entre antes e depois da gravação). A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
+mudou entre antes e depois da gravação). **Por que a leitura depois do `Record` basta** (revisão de `825c5b3`, item 4): os ticks só
+crescem; a cópia foi gravada no contexto de tick `T0`, e `T1 = CurrentTick()` lido depois é `>= T0`, então esperar `IsFree(T1)` é
+conservador (no pior caso uma submissão alheia entre a gravação e a leitura atrasa a conclusão). O que seria **inseguro** é ler antes
+da gravação. `RecordWithUploadBuffer` só grava no chunk ou chama `DispatchWork()` (`vk_scheduler.h:107-113`); quem avança o tick é o
+`SubmitExecution`, explícito (`vk_scheduler.cpp:67-75`). A exclusão entre os produtores do scheduler continua sendo premissa só para
+a asserção "o tick não mudou", que é diagnóstica. A cópia terminou quando `runtime.IsFree(tick)` (`KnownGpuTick() >= tick`,
 `vk_master_semaphore.h:42`), a mesma regra pela qual o pool reaproveita um staging (`vk_staging_buffer_pool.cpp:187-189`).
 **Nunca** o syncpoint do guest nem um callback de fence do jogo (em Fast eles correm cedo), e **nunca** forçar uma submissão:
 `Finish`, `Flush` e `Wait` ficam fora. Uma entrada cujo tick não passou fica pendente, sem custo.
@@ -1048,10 +1062,17 @@ mudou entre antes e depois da gravação). A cópia terminou quando `runtime.IsF
   O `papel da thread` contado é o da **captura**, guardado na entrada, não o de quem conclui. **Não** se usa o `PopAsyncBuffers`
   (`buffer_cache.h:728-736`) para processar a comparação: ele é o caminho do download publicado (problema A) e acoplar um ao
   outro misturaria os dois diagnósticos.
-- *Encerramento:* o resumo (no `NotifyShutdown`) imprime **comparados**, **pendentes** (entradas ainda na fila, com o tick ainda
-  não livre) e, na destruição do `BufferCache`, **cancelados**: entre os pendentes, os que a GPU já terminou são comparados e
-  liberados; os que não terminaram **não são liberados** (o staging e o pool pertencem ao destruidor do pool, que só o faz com a
-  GPU ociosa) e contam `blkcmp_cancelled`. Só se libera o que a GPU não usa mais.
+- *Encerramento (revisão de `825c5b3`, itens 2 e 3).* Ordem: (1) no resumo (`NotifyShutdown`, `gpu.cpp:255`), **primeiro** processa toda
+  entrada cujo tick já é livre (invalida, compara, libera), e **depois** classifica o que sobra na fila como **pendente** (tick ainda
+  não livre). "Pendente" nunca inclui uma entrada concluída e não processada. A identidade impressa ali sai marcada
+  **fotografia intermediária** (pendentes ainda podem completar). (2) Na destruição do `BufferCache`, o corpo de
+  `RasterizerVulkan::~RasterizerVulkan` já executou `scheduler.WaitWorker()` e `scheduler.Finish()` (`vk_rasterizer.cpp:249-252`) e o
+  `RendererVulkan::~RendererVulkan` faz `WaitIdle` (`renderer_vulkan.cpp:201-204`); os membros são destruídos em ordem inversa da
+  declaração, então `buffer_cache` (`vk_rasterizer.h:230`) vai antes de `staging_pool` (`:219`), os dois **depois** do `Finish`. É esse caminho,
+  e não o destrutor do pool sozinho, que garante a GPU ociosa. Ali: o que tem tick livre é comparado e liberado; o que sobra (tick
+  que não ficou livre, por exemplo dispositivo perdido) conta `blkcmp_cancelled` e **não é liberado** nem comparado, e as
+  retenções da fonte seguem o mesmo critério. A **identidade final** é a impressa por essa destruição (`blkcmp final: drawn = compared
+  + descartes + pendentes + cancelados`), depois de classificar os três.
 
 **Contadores novos:** `blkcmp_pending` (medidor: entradas em voo agora, e `blkcmp_pending_max`), `blkcmp_cancelled`,
 `blkcmp_discard_queue_full`, `blkcmp_discard_reorder_unprotected`, `blkcmp_latency_us_sum/_max/_n` (da captura à conclusão). A
@@ -1060,8 +1081,10 @@ linha "ligado" e no resumo (`blkcmp=async inflight=.. bytes=..`).
 
 **Perturbação declarada (hipótese, a medir):** uma cópia de até 4 KiB, duas barreiras, a perda da reordenação **das faixas
 marcadas**, o adiamento do reset do rastreador desse buffer até o `TickFrame` seguinte, e a comparação na CPU depois. Sem `Finish`,
-o custo por comparação não cresce com a fila da GPU, então o orçamento padrão pode subir: **proposta 20/s sustentado, rajada 20**,
-a confirmar pela medição de `blkcmp_latency_us_*` e pelo `other busy`.
+o custo por comparação não cresce com a fila da GPU, então o orçamento padrão pode subir: **20/s sustentado, rajada 20 é um orçamento
+experimental, não uma conclusão** (revisão de `825c5b3`, item 5): tirar o `Finish` remove aquela espera, **não toda a interferência**; continuam as
+barreiras, as restrições de reordenação e a pressão na fila. A confirmar pela medição de `blkcmp_latency_us_*`, do `other busy` e do
+`blkcmp_pending_max`.
 
 **Testes.**
 *No harness* (a máquina de estados é código de `list_diag/`, sem Vulkan, com um **relógio de ticks falso** e um **pool falso que
@@ -1077,7 +1100,8 @@ zero, `blkcmp_pending_max` abaixo do limite, `cancelled` zero em encerramento li
 reaparecendo (ou não) com o mesmo padrão.
 
 
-**Revisão de `825c5b3` (pelo revisor, conferida pelo planejador): o que falta antes de implementar o assíncrono.**
+**Revisão de `825c5b3` (pelo revisor, conferida pelo planejador): o que falta antes de implementar o assíncrono. Os cinco pontos estão
+incorporados acima (3.8.9, pontos 2, 3, 6 e 7, "Retenção da fonte" e o orçamento) e a invalidação está desenhada na 3.8.10.**
 1. **Visibilidade do staging:** a memória de download não tem coerência garantida (`vulkan_memory_allocator.cpp:96-99`,
    `:289-293`; inventário 7.7). Sai a alternativa "a espera do tick a torna visível": a conclusão da GPU não substitui a
    invalidação de memória não coerente. O pool passa a dar acesso a `vk::Buffer::Invalidate()` (`vulkan_wrapper.cpp:534-538`)
@@ -1096,6 +1120,41 @@ reaparecendo (ou não) com o mesmo padrão.
    continua dependendo da exclusão entre os produtores do scheduler.
 5. **20/s** é orçamento experimental. Tirar o `Finish` remove aquela espera, não toda a interferência: continuam as
    barreiras, as restrições de reordenação e a pressão na fila.
+#### 3.8.10 Invalidação do staging, também no `blkcmp` síncrono (desenho, sem código)
+
+**O problema (inventário 7.7).** O `blkcmp` lê o `mapped_span` do staging de download sem invalidar, e o resultado da rodada 4 (8.6) **supõe
+que o staging é coerente**; o log não diz. É a menor mudança para o resultado deixar de supor: invalidar antes de comparar e **registrar** se a
+memória era coerente. A correção geral dos downloads do cache de buffers e de texturas (7.7) é **item próprio, depois**; não está aqui.
+
+**Como o pool expõe a operação.** `vk::Buffer::Invalidate()` (`vulkan_wrapper.cpp:534-538`) chama `vmaInvalidateAllocation` só se `!is_coherent`,
+e `IsHostCoherent()` (`vulkan_wrapper.h:813-815`) diz o tipo. O `StagingBufferRef` (`vk_staging_buffer_pool.h:22-30`) só tem o `VkBuffer`
+e o mapeamento, mas a `StagingBuffer` do pool tem o `vk::Buffer` (`:55-76`). Duas funções novas, no mesmo estilo de `FreeDeferred`
+(`vk_staging_buffer_pool.cpp:110-120`, que acha a entrada por `usage`, `log2_level` e `index`):
+- `bool StagingBufferPool::IsCoherent(const StagingBufferRef&)`: acha a entrada e devolve `buffer.IsHostCoherent()`;
+- `void StagingBufferPool::Invalidate(const StagingBufferRef&)`: acha a entrada e chama `buffer.Invalidate()` (não faz nada se coerente).
+`BufferCacheRuntime` as repassa (`InvalidateStaging`, `StagingIsCoherent`), e o `gl_buffer_cache.h` ganha versões vazias (`true`/nada), porque o
+código genérico do cache as chama. O custo é uma busca linear por entrada, só quando o `blkcmp` compara (poucas vezes por segundo).
+
+**Onde chamar.** Em `BufferCache::BlkcmpCapture` (3.8.2), passo 6→7: **depois** do `runtime.Finish()` e **antes** do `BlkcmpCompare`:
+```
+const bool coherent = runtime.StagingIsCoherent(download_staging);
+if (!coherent) runtime.InvalidateStaging(download_staging);
+BlkcmpCompare(mapped, offsets, payload, finish_us, coherent);
+```
+No assíncrono, o mesmo, **depois** de `IsFree(tick)` e antes da comparação (3.8.9, ponto 3). O `Invalidate()` cobre a alocação inteira
+(`VK_WHOLE_SIZE`); o staging é pequeno (poucas centenas de bytes a 4 KiB), então não vale uma versão por faixa.
+
+**Campo no log e no resumo.** `Protocol::BlkcmpCompare` ganha o parâmetro `bool staging_coherent`. Contadores novos:
+`blkcmp_staging_coherent` e `blkcmp_staging_invalidated` (`compared = coherent + invalidated`, uma identidade a mais no resumo final). A
+linha de diferença do log ganha `staging=coherent|invalidated`. O resumo diz: `staging: coerente em N de M comparações, invalidado em K`.
+Interpretação: **se K for zero**, a memória do usuário era coerente e o resultado da 8.6 não dependia disso; **se K for maior que zero**, as
+diferenças da 8.6 podem incluir leitura de dados velhos do próprio staging (nesse caso o resultado se repete com a invalidação antes de se
+tirar conclusão). Até a primeira rodada com o campo, a 8.6 continua dizendo que **supõe coerência**.
+
+**Testes.** *No harness:* o parâmetro e os dois contadores (identidade `compared = coherent + invalidated`), o campo do log e o texto do resumo, com
+uma chamada de comparação falsa que passa `true` e `false`. *Só por leitura e no build do usuário:* `StagingBufferPool::IsCoherent/Invalidate` e
+a chamada real do Vulkan (o harness não tem pool nem `vk::Buffer`); que `Invalidate` cobre o `mapped_span` lido.
+
 ## 4. Problema A: janela do pop (contadores e logs próprios)
 
 **Definição do evento** (item 1a): *um pop (download antigo publicado) que grava bytes cobertos por um **aviso
