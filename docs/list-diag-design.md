@@ -1169,19 +1169,24 @@ cruzamentos de 2 KiB. **Todas as identidades de conservação fecham com resídu
 | Trocas de thread no `InvalidateGPUCache` | 1 | 1 | 1 | 24 249 |
 
 Leitura:
+- **As afirmadas não são amostra aleatória** (revisão 5): rajadas, lotes sobrepostos e estouro decidem quem chega lá.
+  Uma diferença encontrada nelas confirma uma ocorrência; nenhuma diferença não descarta o B fora delas; a proporção
+  nelas não vale para todas as aplicações.
 - **O B existe nas faixas afirmadas.** São faixas com cobertura completa demonstrada: 43% e 38% das faixas amostradas
   do FE que cobrem bytes da GPU. Nelas a aplicação sobe por cima de bytes da GPU que a CPU não escreveu, ~40 B por
   faixa afirmada em média, e ~90% desses bytes estão fora de `cpu_read_ranges`. **Continua sendo limite superior**:
   falta saber se os bytes do guest diferem dos da GPU, que é o que o T3a.2 (`blkcmp`) mede.
 - **O T3a superestimava o B.** Nas faixas que o T3a.1 declara incompletas, o T3a teria afirmado mais `at_risk` (404 KB) do
   que existe nas afirmadas (387 KB). Era o buraco do overflow parcial que o revisor apontou (revisão 4).
-- **O estouro continua alto, por rajada.** Com N=8 são ~78 mil avisos amostrados/s e vida média de 7,5 ms: pela lei de
-  Little, ~570 registros vivos em média, abaixo dos 1 024 slots por núcleo. Mesmo assim, 45% estouram. Os avisos devem
-  chegar em rajadas, muitos de uma vez antes de uma aplicação (**hipótese**). Como `floor_raises` é pequeno (1 860), o
+- **O estouro continua alto.** Com N=8 são ~78 mil avisos amostrados/s e vida média de 7,5 ms: pela lei de Little,
+  ~570 registros vivos em média, abaixo dos 1 024 slots por núcleo. Mesmo assim, 45% estouram. **Causa provável
+  (revisão 5, verificado no código):** `Register` examina no máximo 8 slots a partir de `cursor_` e só avança o cursor
+  quando registra (`ledger.h:178`, `:232`). Depois de um estouro, o aviso seguinte examina os **mesmos** 8 slots
+  ocupados, mesmo com o anel quase vazio. Então o estouro não prova anel cheio. Rajadas são a outra hipótese. Como `floor_raises` é pequeno (1 860), o
   estouro se concentra em poucos lotes, e por isso só 10% das faixas saem incompletas.
-- **Muitos avisos repetem o mesmo bloco** (**hipótese**): ~650 mil avisos/s contra ~11 mil trechos finais por segundo,
-  ~60 avisos por trecho. Cada aviso ocupa um registro próprio. Juntar os registros por `(núcleo, lote, bloco de 64 B)`, com
-  máscara dos bytes escritos, deve eliminar quase todo o estouro. Isso muda o protocolo dos slots e é candidato a T3a.3.
+- **~60 avisos por trecho final** (~650 mil avisos/s contra ~11 mil trechos/s) **não** prova repetição no mesmo bloco de
+  64 B, porque um trecho tem vários blocos (revisão 5). Juntar registros por `(núcleo, lote, bloco)` (T3a.3) fica
+  **condicional**: só se o estouro continuar depois do avanço do cursor e o resultado do `blkcmp` pedir mais cobertura.
 - **A, com todas as páginas (3e):** 24 pops sobre 1 144 registros, todos `sample_equal`, com 85% de estouro. Continua
   sendo um piso com cobertura de ~15%.
 - **Bananza:** ambíguo domina (74%), por sobreposição com outros lotes (`apply_overlap_ambiguous_lot` 9 265). As trocas
@@ -1238,6 +1243,34 @@ custo do T3a.
 | 12 (revisão 3, C) | P0 violada invalida o diagnóstico da sessão, não só alguns lotes: na primeira ocorrência o relatório diz, em destaque e uma vez no log, que os resultados a partir dali não são confiáveis, e o resumo repete | Sim. O `violation_floor` só tornava ambíguos alguns lotes | 3.3: `CheckViolation` (primeira ocorrência de `gather_overlapped` ou `apply_out_of_order`): uma linha no log, o prefixo `[P0 VIOLATED]` no relatório, o aviso no resumo e um **instantâneo dos contadores** no instante da violação; os contadores continuam. Sem trava corretiva |
 | 13 (achado ao implementar) | (não veio da revisão) a varredura do livro-razão por faixa lia 6 × 1024 slots, sob o `buffer_cache.mutex` | Sim, e é custo que perturba justamente o que o diagnóstico mede: a praça tem centenas de faixas por lote | 3.4: índice de slots vivos (bitmap) com a ordem publicar-depois-ligar e a releitura em `Free`; o teste confere o índice contra os slots publicados |
 | 14 (revisão 4, sobre `dc4d0a9`) | (1) Com o diagnóstico ligado, um aviso de página não amostrada deve continuar em `CollectT<true>`: misturar com `CollectT<false>` no mesmo gerenciador quebra as premissas da prova, porque os avisos não amostrados também mexem no mesmo `current` e empurram dados para `back_buffer`. (2) Overflow parcial no mesmo bloco e lote deixa `exact` incompleta sem marcar ambíguo; pede teste e mecanismo conservador. (3) Amostra por página, sim; predicado pelo mesmo endereço em todos os hooks, independente do núcleo, com `N` e semente fixos e registrados; resultados observados em primeiro lugar, sem multiplicar tudo por `N`. (4) Recorte do pop por página só no diagnóstico, com o deslocamento do ponteiro, o vínculo `(núcleo, lote)` intacto e contagens separadas (pops originais, fragmentos, fragmentos selecionados). (5) A ociosidade da trás não localiza o custo: o `other busy` sobe de 15,2% para 20,2%. (6) Contadores por núcleo continuam atômicos; conservação só com a execução parada | (1) Sim: `CollectT<true>` só troca as ordens de memória de `current` para `seq_cst` (`gpu_dirty_memory_manager.h:56-85`), e a prova da 3.3 assume essa ordem em todo acesso a `current`. No x86-64, CAS e `exchange` já são instruções com trava nas duas variantes, e a carga `seq_cst` é um `mov`: a economia perdida deve ser pequena (mapeamento padrão, não conferido no binário). (2) Sim, no caso parcial (`protocol.h:265-300`). O caso "sem nenhum registro" que eu acrescentei não procede: `protocol.h:695` já o torna ambíguo (corrigido na 3.7.3). Achado meu: a reciclagem por expiração (`ledger.h:166-201`) também perde um registro antes da aplicação dele, e cai no mesmo caso. (3) e (4) Sim. (5) Sim, conferido nos logs; achado meu: o diagnóstico reparte a aplicação em 2,6 vezes mais lotes (8.4). (6) Sim | 8.4 corrigido (custo distribuído, `at_risk` não confiável, A não mostrado como raro). Escopo do T3a.1 abaixo |
+
+| 15 (revisão 5, sobre `d348ace`) | (1) T3a.1 sem bloqueador. (2) T3a.2 antes de T3a.3; T3a.3 condicional; o cursor de `Register` só avança no sucesso, e o estouro pode vir daí; "60 avisos por trecho" não prova o mesmo bloco. (3) O `blkcmp` compara com o payload **efetivamente enviado** no upload: não usar `DownloadBufferMemory` (ele mexe no rastreio e escreve no guest), não reler o guest depois, só declarar substituição se o caminho chegar ao upload; o upload pode passar à frente da cópia diagnóstica pela reordenação. (4) A versão síncrona, amostrada e limitada, serve para achar uma ocorrência; a perturbação deve ser declarada. A frente usa o rasterizador depois de `DrainBack`. (5) Seleção pseudoaleatória com semente, com denominadores; o resultado diz "bytes antigos da GPU diferentes do payload que os substituiu" | Sim, tudo conferido: o hook antes de `:148-150` e `:154-156`; o payload é o `tmp_buffer` (`buffer_cache.h:159-162`); `DownloadBufferMemory` em `:2145-2191`; a reordenação depende de `IsRegionUsed` (`vk_buffer_cache.cpp:455`), então um `MarkUsage` da cópia diagnóstica a impede; `puller.cpp:179-180`; `ledger.h:178`/`:232` | 8.5 corrigido (amostra não aleatória, causa provável do estouro, T3a.3 condicional). Escopo do T3a.1b e do T3a.2 abaixo |
+
+**T3a.1b (decidido pelo planejador; pequeno, sem mudar o protocolo dos slots):** quando `Register` estoura, o cursor do
+núcleo avança `kScan` posições, para o aviso seguinte examinar outros slots. O cursor é privado do escritor do
+núcleo (π4) e não entra na prova. Um teste: 8 slots seguidos ocupados e não expirados, o resto livre; o primeiro aviso
+estoura e o segundo registra fora deles.
+
+**T3a.2 (`blkcmp`; escopo aprovado pelo revisor, revisão 5; desenho a cargo do codador):**
+- **Parte nova `blkcmp`** de `EDEN_LIST_DIAG` (exige `blk`). Só considera faixas **afirmadas com `at_risk > 0`**, e
+  sorteia entre elas com semente própria, de forma reproduzível (não "1 de cada M"). Tem também um orçamento por
+  segundo e um teto de tamanho, ambos declarados.
+- **Onde:** em `InlineMemoryImplementation`, depois de `SynchronizeBuffer` e **antes** da cópia de upload. Nenhum outro
+  caminho: se `CachedWriteMemory` retorna antes (`:148-150`) ou vai para `WriteMemory` (`:154-156`), a faixa sorteada
+  conta como descartada, "sem upload".
+- **Primeira versão síncrona:** staging **próprio** de download; `MarkUsage` da região, para a reordenação não passar o
+  upload à frente; cópia buffer → staging com barreira; `Finish`; cópia dos bytes antigos. **Nada** de
+  `DownloadBufferMemory`, escrita no guest, `ClearDownload` ou mudança em `gpu_modified_ranges`. A referência é o
+  `inlined_buffer` que o upload vai enviar, nos bytes `at_risk`. A perturbação (um `Finish` sob o `buffer_cache.mutex`
+  por comparação) é declarada no relatório. A versão assíncrona, por fence, fica para depois, se a síncrona
+  perturbar demais.
+- **Thread:** a mesma que hoje grava o upload (a de trás, ou a da frente depois de um `DrainBack` completo,
+  `puller.cpp:179-180`). Conta as duas separadamente.
+- **Saída:** elegíveis, sorteadas, comparadas, descartadas por motivo (orçamento, sem upload, sem mapas de memória,
+  tamanho); faixas iguais e diferentes; bytes comparados e diferentes. As primeiras diferenças vão ao log com
+  endereço, lote, deslocamentos e amostra dos bytes. O texto do resultado: "bytes antigos da GPU diferentes do
+  payload que os substituiu". Isso **não** prova corrupção visível, nem exclui uma escrita legítima concorrente.
+- **Fora:** T3a.3 e a versão assíncrona.
 
 **T3a.1 (escopo aprovado pelo revisor, revisão 4; desenho na seção 3.7, sem código):**
 - **Três caminhos no escritor:** desligado = `CollectT<false>` (como hoje); ligado e página fora da amostra =

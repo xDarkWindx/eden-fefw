@@ -179,12 +179,16 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   resíduo 0; o B aparece nas faixas afirmadas (limite superior); o estouro continua em 45% por rajadas. Proposta do
   planejador: T3a.2 (`blkcmp`) agora, para medir se os bytes da GPU que a aplicação sobrescreve diferem do guest; a
   junção de registros por `(núcleo, lote, bloco)` vira candidata a T3a.3, porque muda o protocolo dos slots.
+- Revisão 5 (`list-diag-design.md` seção 11, linha 15): o T3a.1 não tem bloqueador. O `blkcmp` compara com o payload
+  real do upload, com staging próprio e a ordem garantida por `MarkUsage`. Vêm o T3a.1b (avanço do cursor no estouro)
+  e o desenho do T3a.2; o T3a.3 fica condicional.
 
 ## 8. Armadilhas
 
 - Arquivos com CRLF (por exemplo `texture_cache/texture_cache.h`): preserve as quebras de linha.
 - `pkill -f <padrão>` mata o próprio shell se o padrão estiver na linha de comando.
 - O servidor do Duck912 (git.eden-emu.dev) é bloqueado na rede da sessão.
-- Na frente do split nunca se consultam caches nem o scheduler, nem depois de uma espera parcial.
+- Na frente do split nunca se consultam caches nem o scheduler, nem depois de uma espera parcial. **Exceção:** depois de um
+  `DrainBack` completo, a frente pode usar o rasterizador até mandar mais trabalho (`puller.cpp:179-180`; revisão 5).
 - Os nomes dos arquivos de log que o usuário manda nem sempre dizem a configuração: confira a linha
   `[ListDiag] ligado` (no primeiro par, o "desligado_b" estava com o diagnóstico ligado).
