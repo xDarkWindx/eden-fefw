@@ -1245,17 +1245,6 @@ TEST_CASE("list diag: stress with threads, ground truth from the Gather", "[list
 
 namespace {
 
-/// Restores the temporary switch of the split (the tests change it with the system stopped).
-struct SplitKey {
-    explicit SplitKey(bool on) : old{Core::g_dirty_split_2k.load()} {
-        Core::g_dirty_split_2k.store(on ? 1 : 0);
-    }
-    ~SplitKey() {
-        Core::g_dirty_split_2k.store(old);
-    }
-    u8 old;
-};
-
 using Blocks = std::set<u64>; ///< 64-byte block numbers
 
 Blocks ExpectedBlocks(u64 addr, u64 size) {
@@ -1299,7 +1288,6 @@ void CollectAndCheck(u64 addr, u64 size) {
 
 template <bool Diag>
 void RunD1Cases() {
-    SplitKey on{true};
     // Exact 2 KiB, both halves; a whole 4 KiB page.
     CollectAndCheck<Diag>(0x10000, 2048);
     CollectAndCheck<Diag>(0x10800, 2048);
@@ -1323,7 +1311,6 @@ TEST_CASE("list diag D1: crossing and exact cases deliver the whole range, round
 }
 
 TEST_CASE("list diag D1: the short crossing is two ranges of 64 bytes", "[list-diag][d1]") {
-    SplitKey on{true};
     Manager manager;
     manager.CollectT<false>(0x107c0, 128);
     std::vector<std::pair<u64, u64>> ranges;
@@ -1336,7 +1323,6 @@ TEST_CASE("list diag D1: the short crossing is two ranges of 64 bytes", "[list-d
 
 TEST_CASE("list diag D1: random writes inside a 4 KiB page are covered, not more than the 64-byte rounding",
           "[list-diag][d1]") {
-    SplitKey on{true};
     std::mt19937 rng{777};
     for (int i = 0; i < 20000; ++i) {
         const u64 page = 0x40000 + (rng() % 4) * 4096;
@@ -1351,7 +1337,6 @@ TEST_CASE("list diag D1: random writes inside a 4 KiB page are covered, not more
 }
 
 TEST_CASE("list diag D1: several writes in one manager give the union", "[list-diag][d1]") {
-    SplitKey on{true};
     std::mt19937 rng{4242};
     for (int round = 0; round < 200; ++round) {
         Manager manager;
@@ -1368,21 +1353,17 @@ TEST_CASE("list diag D1: several writes in one manager give the union", "[list-d
     }
 }
 
-TEST_CASE("list diag D1: size zero changes nothing, with the switch on and off", "[list-diag][d1]") {
-    for (const bool key : {true, false}) {
-        SplitKey k{key};
-        for (const u64 addr : {u64{0x10000}, u64{0x107c0}, u64{0x107ff}, u64{0x10800}, u64{0x10fff}}) {
-            Manager manager;
-            manager.CollectT<false, TestHooks>(addr, 0);
-            manager.CollectT<true, TestHooks>(addr, 0);
-            CHECK(Delivered<false>(manager).empty());
-        }
+TEST_CASE("list diag D1: size zero changes nothing", "[list-diag][d1]") {
+    for (const u64 addr : {u64{0x10000}, u64{0x107c0}, u64{0x107ff}, u64{0x10800}, u64{0x10fff}}) {
+        Manager manager;
+        manager.CollectT<false, TestHooks>(addr, 0);
+        manager.CollectT<true, TestHooks>(addr, 0);
+        CHECK(Delivered<false>(manager).empty());
     }
 }
 
-TEST_CASE("list diag D1: switch off equals the manager of before for writes that do not cross 2 KiB",
+TEST_CASE("list diag D1: writes that do not cross 2 KiB equal the manager of before",
           "[list-diag][d1]") {
-    SplitKey off{false};
     Legacy::GPUDirtyMemoryManager legacy;
     Manager plain;
     Manager diagnostic;
@@ -1413,13 +1394,8 @@ TEST_CASE("list diag D1: switch off equals the manager of before for writes that
     CHECK(all_equal);
 }
 
-TEST_CASE("list diag D1: the switch is only read when the write crosses, and only changes with a store",
+TEST_CASE("list diag D1: CrossesTransform, by subtraction",
           "[list-diag][d1]") {
-    CHECK(Core::ParseDirtySplit2K(nullptr) == 1);
-    CHECK(Core::ParseDirtySplit2K("0") == 0);
-    CHECK(Core::ParseDirtySplit2K("1") == 1);
-    CHECK(Core::ParseDirtySplit2K("") == 1);
-    CHECK(Core::ParseDirtySplit2K("00") == 1);
     STATIC_REQUIRE(!Core::GPUDirtyMemoryManager::CrossesTransform(0x10000, 2048));
     STATIC_REQUIRE(!Core::GPUDirtyMemoryManager::CrossesTransform(0x10800, 2048));
     STATIC_REQUIRE(Core::GPUDirtyMemoryManager::CrossesTransform(0x107c0, 128));
@@ -1429,7 +1405,6 @@ TEST_CASE("list diag D1: the switch is only read when the write crosses, and onl
 }
 
 TEST_CASE("list diag D1: a Gather between the two pieces of a notice makes it ambiguous", "[list-diag][d1]") {
-    SplitKey on{true};
     SECTION("Gather between the pieces") {
         Fx f;
         f.gates.Arm("c.between_pieces");

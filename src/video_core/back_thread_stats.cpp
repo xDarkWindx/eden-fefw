@@ -7,7 +7,6 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
-#include "core/gpu_dirty_memory_manager.h"
 #include "video_core/back_thread_stats.h"
 #include "video_core/list_diag.h"
 
@@ -344,12 +343,10 @@ void Report() {
         const u64 inv_empty = Take(shared.invalidate_empty);
         const u64 inv_data = Take(shared.invalidate_data);
         LOG_INFO(Render_Vulkan,
-                 "Dirty 2 KiB crossings (EDEN_DIRTY_SPLIT_2K={}{}): held pieces {:.0f}/s, crossing 2 KiB "
+                 "Dirty 2 KiB crossings: held pieces {:.0f}/s, crossing 2 KiB "
                  "{:.1f}/s ({:.0f} B/s, {:.2f}% of held); by source: Write<T> {:.1f}/s, WriteBlock "
                  "{:.1f}/s, ZeroBlock {:.1f}/s, cache op {:.1f}/s, exclusive {:.1f}/s, other {:.1f}/s; "
                  "InvalidateGPUCache {:.0f}/s: empty {:.0f}/s, with data {:.0f}/s",
-                 Core::DirtySplit2K() ? "on" : "off",
-                 Core::DirtySplit2K() ? "" : ", temporary switch, removed after the A/B",
                  per_s(dirty_held), per_s(dirty_cross), per_s(Take(shared.dirty_cross_bytes)),
                  dirty_held != 0 ? static_cast<double>(dirty_cross) * 100.0 / static_cast<double>(dirty_held) : 0.0,
                  source(DirtySource::WriteT), source(DirtySource::WriteBlock),
