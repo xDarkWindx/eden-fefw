@@ -226,7 +226,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   `be1bbcb` (B: T4.1 com `EDEN_USAGE_TRACKER_OLD=1` temporária) e `d13579f` (C: 3.8.9). O planejador reproduziu o
   harness (81 casos, 78 passam e 3 falham como esperado) e os mutantes. Tirar a última página do laço do `Track` derruba
   7 casos. Ponto para o revisor: entrada do pool não achada conta como "invalidated". Com o revisor; depois, o build
-  do usuário. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  do usuário.
+- Revisão de A/B/C: o B (T4.1) foi aprovado. O A precisa de uma correção: staging não achado **cancela** a
+  comparação, como descarte contado, sem ler os bytes e sem entrar em compared/equal/different/invalidated. No C, ajustar
+  a redação: a asserção do tick detecta mudança de contexto durante a captura, não toda violação de exclusão. Depois
+  disso, o build único e as três rodadas (novo, `EDEN_USAGE_TRACKER_OLD=1`, `pop,blk,blkcmp`). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas
