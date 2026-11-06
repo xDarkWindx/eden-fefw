@@ -253,7 +253,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Rodada 6 (FE, `80fa234`): `stage buffers` voltou a ~6,7%, então a 9.6 está resolvida. O contador de tamanhos
   (`t4-coherence-fix-plan.md` 4.1) mostra 100% `Write<T>`, 100% alinhado a 4 B na cena e ~99,8% na carga, e só 17% a 8 B. O
   grão de 4 B é o candidato de O1; falta medir o custo do lado da aplicação (mais faixas) e ver o perfil do Bananza. A
-  decisão entre O1 e O2 é do usuário. O staging foi
+  decisão entre O1 e O2 é do usuário.
+- Rodada 7 (Bananza, caverna): 100% `Write<T>` de ~8 B, 100% alinhado a 4 B, 99% a 8 B, menores que 4 B em 0,04%. O grão
+  de 4 B serve aos dois jogos (`t4-coherence-fix-plan.md` 4.1). Aguardando a decisão do usuário entre O1 (grão de 4 B) e
+  O2. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.

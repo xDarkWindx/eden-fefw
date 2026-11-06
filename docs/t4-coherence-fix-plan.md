@@ -122,6 +122,30 @@ acima de 40 mil draws/s.
 - **Limites:** é um jogo e uma rodada. Isto dimensiona as escritas fora da garantia de O1; não mede quantos vizinhos
   divergentes elas teriam (revisão 4).
 
+**Bananza (rodada 7, mesmo build, uma rodada; medido pelo usuário).** A emulação do jogo não está completa: carrega, mostra
+as cutscenes e entra na caverna. O usuário ficou ~26 s dentro da caverna, andando e apertando botões. A cena começa aos
+~53 s.
+
+| | Carga (32-40 s) | Caverna (57-77 s) |
+| --- | --- | --- |
+| Pedaços segurados | ~2-28 mil/s, ~4 B cada | **~1,6-1,8 milhão/s, ~8 B cada** |
+| Fonte | 100% `Write<T>` | 100% `Write<T>` |
+| Menores que 4 B | 0,00% | 0,04% |
+| Endereço e tamanho alinhados a 4 B | 100,0% | 100,0% |
+| Endereço e tamanho alinhados a 8 B | 6,6% | 99,0-99,2% |
+| Pedaços do `CollectT` por escrita (grão 4 / 8 / 64 B) | 1,000 / 1,000 / 1,000 | 1,000 / 1,000 / 1,000 |
+| Grãos de 4 B tocados por escrita | 1,07 | 1,99 (escritas de 8 B: dois grãos contíguos) |
+
+**Nos dois jogos:**
+- 100% das escritas seguradas vêm de `Write<T>`.
+- Praticamente todas são alinhadas a 4 B, e as menores que 4 B não passam de 0,2% (FE na carga) e ficam em 0,02-0,04% na
+  cena.
+- O alinhamento a 8 B varia por jogo e por fase: 17% na cena do FE, 99% na caverna do Bananza, 6,6% na carga do Bananza.
+
+**Conclusão para a escolha:** o grão de 4 B põe ~99,7-100% das escritas seguradas dos dois jogos na garantia de O1, sem
+pedaço a mais no escritor. As escritas de 8 B do Bananza tocam dois grãos contíguos, que continuam numa faixa só. O de 8 B
+fica descartado pelo FE. Isto continua dimensionando, não medindo perda, e são dois jogos com uma rodada cada.
+
 ## 5. Confirmação e reprodução (em paralelo; não é condição para o desenho)
 
 - **Reprodução dirigida no harness (antes de qualquer código do T4).** O teste usa o `GPUDirtyMemoryManager` real, um
