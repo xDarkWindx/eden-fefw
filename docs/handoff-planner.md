@@ -245,7 +245,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   microbenchmark foi reproduzido pelo planejador: nas faixas grandes que não acertam o `recent`, o `Track` novo custa
   1 590-1 880 ns contra 140-270 ns do antigo; o `IsUsed` grande, 559 contra 307 ns. **Decisão do planejador:**
   implementar a correção proposta (primeira e última palavra com `PageMask`, o meio com `std::fill`, e o mesmo no
-  `IsUsed`), sem contador por chamador antes. Depois, um build: correção mais contador de tamanhos, numa rodada do FE. O staging foi
+  `IsUsed`), sem contador por chamador antes. Depois, um build: correção mais contador de tamanhos, numa rodada do FE.
+- `5aab322`: a correção (máscara só na primeira e na última palavra; `std::fill` e teste por palavra no meio) foi
+  conferida pelo planejador. Harness com 84 casos, 81 passam e 3 falham como esperado; mutantes 6 e 2. No benchmark, o
+  `Track` grande com erro no `recent` caiu para 261/101 ns (antigo 234/106) e o `IsUsed` grande para 170 ns (antigo 167).
+  O diff de `d5e7158`, `1b0d10d` e `5aab322` está com o revisor; depois, a rodada do usuário. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
