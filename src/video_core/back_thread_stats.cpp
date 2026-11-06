@@ -378,9 +378,9 @@ void Report() {
         const u64 guard_takes = guard_reader.ReadDelta(Core::SessionDirtyGuardRegistry());
         const size_t grain = Core::DirtyGrainBytes(Core::SessionDirtyGrain());
         LOG_INFO(Render_Vulkan,
-                 "Dirty grain {} B (transformation {} B{}): guard taken (transformation swaps) {:.1f}/s, {:.2f}% of the "
+                 "held_write_grain {} ({} B, transformation {} B): guard taken (transformation swaps) {:.1f}/s, {:.2f}% of the "
                  "held pieces; Collect-side only, the Gather ranges are in \"Invalidation batches\"",
-                 grain, grain * 32, grain == 4 ? ", EXPERIMENTAL EDEN_DIRTY_GRAIN=4" : ", default",
+                 Core::HeldWriteGrainName(Core::SessionDirtyGrain()), grain, grain * 32,
                  per_s(guard_takes),
                  dirty_held != 0 ? static_cast<double>(guard_takes) * 100.0 / static_cast<double>(dirty_held) : 0.0);
     }

@@ -70,10 +70,14 @@ seção 4; não é garantia de correção. O1 depende de dois consertos: o laço
 
 **Implementado (revisão 5): O1 com grão de 4 B, como mitigação EXPERIMENTAL, desligada por padrão.** Em
 `core/gpu_dirty_memory_manager.h`:
-- **Opt-in.** `EDEN_DIRTY_GRAIN=4` liga o grão de 4 B (`align_bits` 2, transformação de 128 B, 32 grãos na máscara `u32`); sem a
-  variável, ou com qualquer outro valor (inclusive `8`, descartado em 4.1), fica o de hoje (64 B, 2 KiB). Lida uma vez
-  (`SessionDirtyGrain`) e fixada na sessão: todos os gerenciadores sem grão explícito usam o mesmo. O `System::Impl` registra uma
-  linha na partida com o grão ativo.
+- **Opt-in e identidade (revisão 6).** A política tem o nome `held_write_grain`, com os modos `legacy-64` (o padrão) e
+  `experimental-4`. Hoje a única entrada é o apelido `EDEN_DIRTY_GRAIN`, que separa três casos: **ausente** (padrão,
+  `legacy-64`), **válido** (`4` → `experimental-4`; `64` → `legacy-64`, explícito) e **inválido** (qualquer outro valor, o vazio
+  inclusive): o padrão é mantido e a partida registra uma linha de **erro** com o valor recebido e dizendo que o padrão foi
+  mantido (regra 1 da 7.2 do handoff). Se a configuração inválida deve impedir a partida é decisão da L4; aqui o erro fica
+  visível. **Não há parser de `EDEN_POLICY`**: ele nasce com o resolvedor único da L4. Lida uma vez (`SessionHeldWriteGrain`) e
+  fixada na sessão: todos os gerenciadores sem grão explícito usam o mesmo. O `System::Impl` registra uma linha na partida com o
+  valor efetivo e a origem (`default` ou `EDEN_DIRTY_GRAIN=...`), e o relatório das estatísticas repete o nome da política.
 - **Mecanismo, e por quê.** O grão é um `const bool` do gerenciador (junto de `current`); `CollectT` e a iteração do `GatherT`
   escolhem entre **duas instanciações** dos corpos por ele, cada uma com os deslocamentos e máscaras como constantes de compilação.
   Alternativa descartada: deslocamentos em membros `const` e deslocamento variável; medi essa primeiro e o caminho de 64 B ficou

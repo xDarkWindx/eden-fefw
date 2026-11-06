@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,15 +25,75 @@ namespace Core {
 /// 4 B in address and size.
 enum class DirtyGrain : u8 { B64, B4 };
 
-/// EDEN_DIRTY_GRAIN=4 selects B4; unset, or any other value, selects B64 (the default).
-[[nodiscard]] inline DirtyGrain ParseDirtyGrain(const char* value) {
-    return value != nullptr && value[0] == '4' && value[1] == '\0' ? DirtyGrain::B4 : DirtyGrain::B64;
+/// The identity of the policy that picks the grain: `held_write_grain`, with the modes `legacy-64` (the default: 64 B, a
+/// transformation of 2 KiB) and `experimental-4` (4 B, 128 B). Its only input today is the alias EDEN_DIRTY_GRAIN; the general
+/// EDEN_POLICY is resolved by the single resolver of L4, not by a parser here (docs/t4-coherence-fix-plan.md, revision 6).
+[[nodiscard]] constexpr const char* HeldWriteGrainName(DirtyGrain grain) {
+    return grain == DirtyGrain::B4 ? "experimental-4" : "legacy-64";
+}
+
+/// Where the effective value came from. EDEN_DIRTY_GRAIN has three cases: absent (the default), valid ("4" or "64") and invalid.
+enum class HeldWriteGrainOrigin : u8 { Default, Alias, InvalidAlias };
+
+struct HeldWriteGrain {
+    DirtyGrain grain = DirtyGrain::B64;
+    HeldWriteGrainOrigin origin = HeldWriteGrainOrigin::Default;
+    std::string rejected; ///< the value received, when it was invalid
+};
+
+/// Pure: `value` is the content of EDEN_DIRTY_GRAIN (null: not set). "4" selects experimental-4, "64" selects legacy-64 (the
+/// default, now explicit); anything else, the empty string included, is an invalid configuration: the default is kept, and the
+/// result says so, so that the start-up can show it. Never silent.
+[[nodiscard]] inline HeldWriteGrain ResolveHeldWriteGrain(const char* value) {
+    HeldWriteGrain result;
+    if (value == nullptr) {
+        return result;
+    }
+    const std::string text{value};
+    if (text == "4") {
+        result.grain = DirtyGrain::B4;
+        result.origin = HeldWriteGrainOrigin::Alias;
+    } else if (text == "64") {
+        result.origin = HeldWriteGrainOrigin::Alias;
+    } else {
+        result.origin = HeldWriteGrainOrigin::InvalidAlias;
+        result.rejected = text;
+    }
+    return result;
+}
+
+/// The line of the start-up for a resolution: the effective value and its origin; for an invalid alias, the error that says the
+/// value received and that the default was kept.
+[[nodiscard]] inline std::string DescribeHeldWriteGrain(const HeldWriteGrain& resolved) {
+    const char* const name = HeldWriteGrainName(resolved.grain);
+    const size_t bytes = resolved.grain == DirtyGrain::B4 ? 4 : 64;
+    const std::string detail = std::string{"grain "} + std::to_string(bytes) + " B, transformation " +
+                               std::to_string(bytes * 32) + " B";
+    switch (resolved.origin) {
+    case HeldWriteGrainOrigin::Default:
+        return std::string{"held_write_grain = "} + name + " (origin: default, EDEN_DIRTY_GRAIN not set; " + detail + ")";
+    case HeldWriteGrainOrigin::Alias:
+        return std::string{"held_write_grain = "} + name + " (origin: EDEN_DIRTY_GRAIN=" + (bytes == 4 ? "4" : "64") + "; " +
+               detail + (resolved.grain == DirtyGrain::B4 ? "; EXPERIMENTAL" : "") + ")";
+    case HeldWriteGrainOrigin::InvalidAlias:
+        break;
+    }
+    return std::string{"EDEN_DIRTY_GRAIN='"} + resolved.rejected + "' is not valid (accepted: 4 or 64); the default was kept: " +
+           "held_write_grain = " + name + " (" + detail + ")";
+}
+
+[[nodiscard]] inline bool IsHeldWriteGrainError(const HeldWriteGrain& resolved) {
+    return resolved.origin == HeldWriteGrainOrigin::InvalidAlias;
 }
 
 /// Read once, at the first use, and fixed for the session: every manager made without an explicit grain gets this one.
+[[nodiscard]] inline const HeldWriteGrain& SessionHeldWriteGrain() {
+    static const HeldWriteGrain resolved = ResolveHeldWriteGrain(std::getenv("EDEN_DIRTY_GRAIN"));
+    return resolved;
+}
+
 [[nodiscard]] inline DirtyGrain SessionDirtyGrain() {
-    static const DirtyGrain grain = ParseDirtyGrain(std::getenv("EDEN_DIRTY_GRAIN"));
-    return grain;
+    return SessionHeldWriteGrain().grain;
 }
 
 [[nodiscard]] constexpr size_t DirtyGrainBytes(DirtyGrain grain) {

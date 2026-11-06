@@ -113,11 +113,14 @@ struct System::Impl {
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {
         // The grain of the dirty managers, read once from EDEN_DIRTY_GRAIN and fixed for the session (core/gpu_dirty_memory_manager.h).
-        const auto grain = SessionDirtyGrain();
-        LOG_INFO(Core, "GPU dirty memory grain: {} B (transformation {} B){}", DirtyGrainBytes(grain),
-                 32 * DirtyGrainBytes(grain),
-                 grain == DirtyGrain::B4 ? ", EXPERIMENTAL (EDEN_DIRTY_GRAIN=4): writes aligned to 4 B keep their GPU neighbours"
-                                         : ", default");
+        // The identity of the policy is `held_write_grain` (legacy-64 default, experimental-4); an invalid alias is an ERROR line that
+        // says the value received and that the default was kept. Whether an invalid configuration stops the start is for L4.
+        const HeldWriteGrain& held_write_grain = SessionHeldWriteGrain();
+        if (IsHeldWriteGrainError(held_write_grain)) {
+            LOG_ERROR(Core, "{}", DescribeHeldWriteGrain(held_write_grain));
+        } else {
+            LOG_INFO(Core, "{}", DescribeHeldWriteGrain(held_write_grain));
+        }
         // The statistics report (video_core/back_thread_stats.cpp) sums the guard counter of THESE managers, registered here
         // explicitly: a manager made elsewhere is never read, and there is no allocator of slots.
         dirty_guard_registration = SessionDirtyGuardRegistry().Register(gpu_dirty_memory_managers);

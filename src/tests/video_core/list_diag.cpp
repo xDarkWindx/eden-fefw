@@ -3398,14 +3398,50 @@ TEST_CASE("O1: managers created and destroyed with an older one alive do not mix
     CHECK(reader.ReadDelta(registry) == 0);
 }
 
-TEST_CASE("O1: ParseDirtyGrain, the session grain and the layout", "[list-diag][o1]") {
-    CHECK(Core::ParseDirtyGrain(nullptr) == k64);
-    CHECK(Core::ParseDirtyGrain("") == k64);
-    CHECK(Core::ParseDirtyGrain("0") == k64);
-    CHECK(Core::ParseDirtyGrain("64") == k64);
-    CHECK(Core::ParseDirtyGrain("8") == k64); // 8 B was ruled out (T4 plan, 4.1): not an option
-    CHECK(Core::ParseDirtyGrain("44") == k64);
-    CHECK(Core::ParseDirtyGrain("4") == k4);
+TEST_CASE("O1: held_write_grain: absent, valid and invalid EDEN_DIRTY_GRAIN, and the start-up lines", "[list-diag][o1][policy]") {
+    using Origin = Core::HeldWriteGrainOrigin;
+    CHECK(std::string{Core::HeldWriteGrainName(k64)} == "legacy-64");
+    CHECK(std::string{Core::HeldWriteGrainName(k4)} == "experimental-4");
+    // Absent: the default, origin default, no error.
+    const auto absent = Core::ResolveHeldWriteGrain(nullptr);
+    CHECK(absent.grain == k64);
+    CHECK(absent.origin == Origin::Default);
+    CHECK(!Core::IsHeldWriteGrainError(absent));
+    CHECK(Core::DescribeHeldWriteGrain(absent) ==
+          "held_write_grain = legacy-64 (origin: default, EDEN_DIRTY_GRAIN not set; grain 64 B, transformation 2048 B)");
+    // Valid: "4" and "64", from the alias.
+    const auto four = Core::ResolveHeldWriteGrain("4");
+    CHECK(four.grain == k4);
+    CHECK(four.origin == Origin::Alias);
+    CHECK(!Core::IsHeldWriteGrainError(four));
+    CHECK(Core::DescribeHeldWriteGrain(four) ==
+          "held_write_grain = experimental-4 (origin: EDEN_DIRTY_GRAIN=4; grain 4 B, transformation 128 B; EXPERIMENTAL)");
+    const auto sixty_four = Core::ResolveHeldWriteGrain("64");
+    CHECK(sixty_four.grain == k64);
+    CHECK(sixty_four.origin == Origin::Alias); // explicit, so it says so, and it is not an error
+    CHECK(!Core::IsHeldWriteGrainError(sixty_four));
+    CHECK(Core::DescribeHeldWriteGrain(sixty_four) ==
+          "held_write_grain = legacy-64 (origin: EDEN_DIRTY_GRAIN=64; grain 64 B, transformation 2048 B)");
+    // Invalid: the default is kept, the value received is in the result, and the line is an error that says both. Never silent.
+    for (const char* bad : {"", "0", "8", "44", "644", "four", "4 ", " 4", "-4", "0x4", "experimental-4", "legacy-64"}) {
+        INFO("value '" << bad << "'");
+        const auto result = Core::ResolveHeldWriteGrain(bad);
+        CHECK(result.grain == k64);
+        CHECK(result.origin == Origin::InvalidAlias);
+        CHECK(Core::IsHeldWriteGrainError(result));
+        CHECK(result.rejected == bad);
+        const std::string line = Core::DescribeHeldWriteGrain(result);
+        CHECK(line == std::string{"EDEN_DIRTY_GRAIN='"} + bad +
+                          "' is not valid (accepted: 4 or 64); the default was kept: held_write_grain = legacy-64 (grain 64 B, "
+                          "transformation 2048 B)");
+    }
+    // The session resolution is what a default-constructed manager follows (the variable is not set in the harness, or is the
+    // run's own choice: "4" at the second grain of run.sh).
+    CHECK(Core::SessionDirtyGrain() == Core::SessionHeldWriteGrain().grain);
+    CHECK(!Core::IsHeldWriteGrainError(Core::SessionHeldWriteGrain()));
+}
+
+TEST_CASE("O1: the grain in bytes, the explicit grain and the layout", "[list-diag][o1]") {
     CHECK(Core::DirtyGrainBytes(k64) == 64);
     CHECK(Core::DirtyGrainBytes(k4) == 4);
     Manager a{k4};
