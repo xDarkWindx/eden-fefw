@@ -28,7 +28,10 @@ Como trabalhar:
 
 - xDarkWindx. Windows, Ryzen 7 5700X, RTX 5060 Ti 16 GB. Compila com MSVC e testa em casa; a nuvem **não roda o
   jogo**. Jogos: **Fire Emblem: Fortune's Weave** (FE, `04007EF01F8AE000`, referência de desempenho) e **Donkey
-  Kong Bananza** (`040074A01BF12000`, terreno invisível/preto em Fast).
+  Kong Bananza** (`040074A01BF12000`, terreno invisível/preto em Fast). **O terreno é um exemplo** de erro difícil de
+  corrigir, mas corriqueiro, e não um critério nem uma base do trabalho (usuário, 2026-11-06): não se anota o chão
+  nem se planeja rodada para ele. O Bananza serve aqui como segundo jogo, com perfil diferente do FE (listas
+  produzidas pela GPU, muitas trocas de thread no `InvalidateGPUCache`).
 - **Segurança e generalidade antes de desempenho**, com orçamento (`docs/architecture-plan.md` 12.1: até 5% de
   draws/s por item, 10% no total, medido). Antecipar problemas antes que aconteçam.
 - **Nunca:** ligar correção pelo nome/ID do jogo; mudar um padrão de comportamento sem A/B; mexer no `main`;
@@ -135,7 +138,7 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
 - Item 3: o revisor aprovou o T3a.1 com condições (revisão 4, `docs/list-diag-design.md` seção 11, linha 14).
   As condições: `CollectT<true>` fora da amostra, cobertura incompleta declarada e custo distribuído (o `other
   busy` sobe; a aplicação sai repartida em 2,6 vezes mais lotes). O prompt do desenho foi para o codador.
-- Próximo Bananza: depois do T3a.1, no mesmo lugar, com e sem `EDEN_NX2_MACRO_REFRESH=1`.
+- Próximo Bananza: depois do T3a.1, uma rodada com diagnóstico, no mesmo ponto, como segundo perfil.
 - `7d509df`: desenho do T3a.1 (seção 3.7). Conferido pelo planejador e mandado ao revisor. O codador corrigiu
   um erro meu (`protocol.h:695`: sem registro já é ambíguo) e achou o bug dos 2 KiB.
 - **D1 (antes de implementar o T3a.1):** um `Collect` que cruza 2 KiB perde bytes (`docs/gpu-contract-inventory.md`
@@ -146,7 +149,7 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
     gerenciador); **ligada por padrão**, com uma chave temporária `EDEN_DIRTY_SPLIT_2K=0` só para o A/B,
     apagada depois dele (não fica como opção permanente);
   - testes com o header real.
-  A/B do usuário: FE no mesmo lugar e Bananza (chão). Uma queda de desempenho seria custo de invalidações antes
+  A/B do usuário: FE no mesmo lugar e Bananza. Uma queda de desempenho seria custo de invalidações antes
   perdidas: investigar, não restaurar a perda. O T3a.1 é implementado depois do D1, porque o bug contamina o
   que ele mede.
 - Revisão do desenho do T3a.1 (sobre `b34a2e4`): aceita a direção. Pede ajustes na prova da 3.7.3 (CAS repetido,
@@ -167,8 +170,11 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   fechado), e o diff vai ao revisor.
 - Feito: `7addd24` (chave do D1 removida) e `c700e86` (T3a.1), com o estado em `6598a02`. O planejador reproduziu o
   harness e os mutantes. O diff está com o revisor. Depois dele vem a medição em casa (protocolo na resposta ao
-  usuário: FE no mesmo lugar, desligado e `pop,blk` alternados, mais uma rodada `pop` com `N=1`; Bananza com e
-  sem `EDEN_NX2_MACRO_REFRESH=1`).
+  usuário: FE no mesmo lugar, desligado e `pop,blk` alternados, mais uma rodada `pop` com `N=1`; uma rodada do
+  Bananza com `pop,blk`).
+- A revisão do diff do D1 (`dee6963`) chegou depois do A/B: aprovado, sem defeito bloqueador. A correção de
+  interpretação e a leitura dos contadores foram aplicadas ao 7.4.1. O comentário deslocado já tinha saído em
+  `7addd24`. **O diff do T3a.1 (`c700e86`) ainda não foi revisado.**
 
 ## 8. Armadilhas
 

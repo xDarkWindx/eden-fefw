@@ -600,16 +600,19 @@ rodado de novo. **Não compilado aqui:** `core/memory.cpp` e `video_core/gpu.cpp
 (`EDEN_BACK_THREAD_STATS=1`), e não pelo FPS da barra do Eden. Motivos:
 - É a única métrica que já foi validada: ruído de ~1% entre as rodadas iguais a e c (`docs/list-diag-design.md` 8.4).
 - O FPS anda em degraus (30/24/22/20) e não resolve diferenças de 5%, que é o orçamento.
-- O código das estatísticas, inclusive a contagem nova do D1, roda **igual nos dois braços**, porque a contagem não
-  depende da chave. A diferença entre os braços isola o recorte, e a mesma rodada dá a contagem dos cruzamentos.
+- O código das estatísticas, inclusive a contagem nova do D1, é o mesmo nos dois braços, e a mesma rodada dá a
+  contagem dos cruzamentos. **Interpretação (correção do revisor):** o A/B mede o efeito de habilitar o D1 **nesta
+  configuração instrumentada**, incluindo o trabalho de invalidação recuperado e as interações com a instrumentação. A
+  frequência, a contenção e a divisão entre chamadas vazias e com dados podem mudar entre os braços, então o custo da
+  instrumentação não se cancela necessariamente.
 
-O que isso não mede: o custo absoluto sem as estatísticas. Isso fica declarado como limitação; não é preciso para
+O que isso não mede: o custo absoluto e o efeito relativo sem as estatísticas. Isso fica declarado como limitação; não é preciso para
 decidir o D1. Se a diferença ficar acima do ruído, o `other busy` e a linha `Invalidation batches` dizem se o custo
 novo é aplicação de escritas que antes se perdiam.
 
 Protocolo: FE no mesmo lugar das rodadas a–d (25 s depois de carregar o save, parado), quatro rodadas alternadas,
 com `EDEN_DIRTY_SPLIT_2K=0` e sem ele, sem `EDEN_LIST_DIAG`. Bananza: duas rodadas, uma de cada, no mesmo ponto
-depois de carregar o save, anotando o chão.
+depois de carregar o save.
 
 **Resultado do A/B (medido pelo usuário, 2026-11-06; logs `2a` a `2d` do FE e `banana2a`/`banana2b`).** Build com o
 D1, conferido pela linha `Dirty 2 KiB crossings` em todos os logs. A string de versão continua velha, como antes. A
@@ -623,7 +626,12 @@ configuração do protocolo acima: o FE parado no ponto de sempre, só `EDEN_BAC
 | 2c | on | 78 981 (5, 42-58 s) | 15,1% |
 | 2d | off | 78 612 (4, 43-55 s) | 15,2% |
 
-- **Custo:** ligada 78 989, desligada 79 012: **−0,03%**, muito abaixo do ruído (~1%). Não há custo mensurável.
+- **Custo:** ligada 78 989, desligada 79 012: **−0,03%**. Nas repetições novas o ruído entre rodadas iguais foi de 0,02%
+  (2a/2c) e de 1,0% (2b/2d), o que confirma a referência de ~1%. Não há custo mensurável nesta configuração.
+- **Leitura dos contadores:** `dirty_cross_bytes` soma o tamanho **inteiro** dos avisos que cruzam, não só os bytes além
+  da fronteira nem os que se perdiam. Os contadores do `InvalidateGPUCache` são lidos um por um no relatório, então
+  `total = vazias + com dados` pode diferir um pouco numa janela, por chamadas que atravessam o instante da leitura; isso
+  não é perda de chamadas.
 - **Cruzamentos de 2 KiB segurados: zero** em todas as amostras dos seis logs, nos dois jogos, com ~1 milhão de
   pedaços segurados por segundo no FE e até ~2 milhões no Bananza. Nessas cenas, o bug não acontece. As escritas
   grandes (`WriteBlock`) em páginas da GPU devem ser escritas na hora pelo cache (`written`), e não seguradas
@@ -631,7 +639,7 @@ configuração do protocolo acima: o FE parado no ponto de sempre, só `EDEN_BAC
   amostra por amostra, aos lotes de `held_writes` que já existiam (`vk_rasterizer.cpp:959`), e `CrossesTransform` é a
   mesma função que o harness testa.
 - **Bananza:** as duas rodadas não chegam a um trecho estável (o log acaba em ~52 s, ainda subindo), então não há
-  custo comparável. O chão ficou preto nas duas rodadas (relatado pelo usuário), o esperado: com zero cruzamentos, o D1 não mudou nada que o Bananza execute.
+  custo comparável.
 - **Taxa de `InvalidateGPUCache` sem diagnóstico (nova):** no FE estável, ~1 800 chamadas/s, ~77% vazias, ~400/s com
   dados. Com o diagnóstico (8.4 do `list-diag-design.md`), os totais da sessão davam ~1 240/s e 48% vazias, com os lotes
   de escritas em ~1 040/s. Os números não são do mesmo trecho, então só sugerem que o diagnóstico faz **menos**
