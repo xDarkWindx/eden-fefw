@@ -1651,8 +1651,14 @@ do menu. O filtro antigo ("trás ≥ 85% ocupada") descartava amostras válidas 
 | 5a2 | novo | 37 s | 81 138, 74 879, 76 647, 75 670, 78 207 | 77 308 |
 | 5b | antigo | 36 s | 81 016, 79 093, 80 571, 80 059, 80 771 | 80 302 |
 
-Novo (duas rodadas) 79 613 contra antigo 80 302: **−0,9%**. As duas rodadas iguais diferem entre si em 5,8%, então o ruído
-desta campanha é bem maior que o ~1% da rodada 3. **Conclusão: nenhum sinal de custo do T4.1**, dentro de um ruído grande.
+Novo (duas rodadas) 79 613 contra antigo 80 302: **−0,9%**. **Na janela escolhida, não foi demonstrada regressão líquida:**
+a diferença média é menor que a variação entre as duas rodadas do novo (5,8%, uma diferença observada entre duas
+execuções, não uma estimativa de ruído). Há uma rodada só do antigo, e o "início da cena" tem resolução de ~4 s.
+**Permanece um aumento reproduzido em `stage buffers`** (o trecho de `PrepareDraw` onde os bindings chamam `MarkUsage` e,
+com ele, `Track`): ~7,2% do tempo da trás com o antigo (5b) contra ~9,3-9,7% com o novo, nas duas rodadas (5a e 5a2), no
+trecho final. A causa não está isolada. Hipótese: o `Track` novo calcula `PageMask` por página nas faixas grandes que não
+batem no cache `recent`. Fica como investigação de desempenho do T4.1 (`t4-coherence-fix-plan.md` 9.6), sem rodada nova
+agora.
 
 **Reordenação (medido):** a fração de uploads que vai para o `upload_cmdbuf` no trecho estável foi:
 
@@ -1676,17 +1682,21 @@ de que ele reordene menos. Permissão e efeito batem em todas: toda cópia permi
 - O resultado da 8.6 deixa de depender de supor coerência **nesta máquina**: com staging coerente medido, o mesmo padrão
   aparece.
 
-**Quando as diferenças aparecem (medido, nas quatro rodadas com `blkcmp`):** todas antes de a cena estabilizar, durante a
-carga do save. Pelos totais de 30 s:
+**Quando as diferenças aparecem (medido, nas quatro rodadas com `blkcmp`; corrigido na revisão de `0e5ad1e`).** A
+evidência firme são os **horários**: todas as diferenças caem antes do início da cena (o primeiro relatório acima de 40 mil
+draws/s).
 
-| Rodada | Até o primeiro total (fim da carga) | Depois, na cena estável |
-| --- | --- | --- |
-| 4c (FE) | 125 comparadas, 6 diferentes (até 46 s) | 68 comparadas, 0 diferentes |
-| 4d (FE) | 124 comparadas, 4 diferentes (até 45 s) | 64 comparadas, 0 diferentes |
-| 5c (FE) | 59 comparadas, 6 diferentes (até 46 s) | 130 comparadas, 0 diferentes |
-| Bananza (rodada 4) | 35 comparadas, 4 diferentes (até 33 s) | 30 comparadas, 0 diferentes |
+| Rodada | Horários das diferenças | Início da cena | Comparadas até o 1º total de 30 s | Comparadas depois, até o resumo |
+| --- | --- | --- | --- | --- |
+| 4c (FE) | 24-27 s | 37 s | 125 (6 diferentes, até 46 s) | 68 (0 diferentes) |
+| 4d (FE) | 23-25 s | 37 s | 124 (4 diferentes, até 45 s) | 64 (0) |
+| 5c (FE) | 28-32 s | 56 s | 59 (6 diferentes, até 46 s) | 144 (0) |
+| Bananza (rodada 4) | 27-29 s | 45 s | 35 (4 diferentes, até 33 s) | 30 (0) |
 
-São ~240 comparações com 20 diferenças na carga, contra ~290 comparações com nenhuma diferença na cena estável.
+Somas: **343 comparações com 20 diferenças até o primeiro total, 306 comparações sem nenhuma depois.** "Depois do primeiro
+total" **não** é o mesmo que "cena estável": na 5c o primeiro total sai aos 46 s, antes de a cena começar (56 s). As contagens
+por trecho são, então, aproximadas, e os horários é que sustentam a conclusão.
+
 **Leitura (hipótese):**
 - O B aparece quando a cena é montada: dados que a GPU produz uma vez (ou nos primeiros frames) são sobrescritos pela
   cópia velha do guest.

@@ -86,7 +86,14 @@ pedaços segurados, conta tamanho e alinhamento:
   `pedaços = 1 + ((address % T) + size - 1) / T` para tamanho positivo (revisão 1);
 - quantos **grãos** cada escrita toca, que é outro custo (as faixas do `Gather` e da junção).
 
-Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Também dá para ver se os grandes vêm de
+Isso **dimensiona as escritas fora da garantia de O1** (as não alinhadas ao grão) e o custo estimado em pedaços e grãos. Não
+mede quantos bytes vizinhos têm dados da GPU divergentes, nem quantos seriam perdidos de fato (revisão 4). Especificação
+(revisão 4):
+- denominadores: o total de pedaços segurados e de bytes, por fonte;
+- o alinhamento de **endereço e tamanho** a 4 B e a 8 B, em categorias que se sobrepõem;
+- a **linha de base de 64 B** (pedaços e blocos de hoje), para comparar o aumento;
+- tamanho zero tratado antes das fórmulas;
+- só com as estatísticas, no relatório de 4 s, para que a carga e a cena estável se separem pelo horário. Também dá para ver se os grandes vêm de
 `WriteBlock`, que o contador por fonte do D1 já separa.
 
 ## 5. Confirmação e reprodução (em paralelo; não é condição para o desenho)
@@ -336,4 +343,20 @@ Conferida pelo planejador. **O corpo da seção 9 é atualizado pelo codador jun
    | Vértices (`:902`, `:945`) | faixas grandes e repetidas: manter o cache `recent` e o preenchimento de páginas inteiras, sem trabalho por bloco |
    | `JoinOverlap` e criação (`:1905`, `:1927`) | cópias e clears continuam impedindo que uploads posteriores passem à frente; testar faixa que termina na borda |
    | Downloads (`:692`, `:2232`) | são leituras da GPU que também impedem sobrescrita antecipada: "uso" não é só escrita |
+
+### 9.6 Pendência de desempenho do T4.1 (rodada 5, `list-diag-design.md` 8.7)
+
+O tempo da thread de trás em `stage buffers` subiu de ~7,2% (rastreador antigo, uma rodada) para ~9,3-9,7% (novo, duas
+rodadas), no trecho final. Em draws/s, na janela escolhida, não se demonstrou regressão líquida (−0,9%, menos que a variação
+entre as duas rodadas do novo). A causa não está isolada. Hipótese: no `Track` novo, as faixas grandes que não batem no cache
+`recent` calculam `PageMask` por página, com dois desvios, onde o antigo fazia o meio como uma sequência de `~0`. A primeira
+investigação é ler `Track`/`IsUsed` dentro de `stage buffers`, sem rodada nova nem contador novo por enquanto.
+
+### Revisão 4 (sobre `0e5ad1e`)
+
+- **A chave `EDEN_USAGE_TRACKER_OLD` e o modo antigo saem do código de produção**; a cópia congelada fica nos testes. A
+  decisão se apoia no contrato e no fim do UB, e não encerra a investigação de desempenho (9.6).
+- O contador da seção 4 segue com a especificação acima.
+- A escolha entre O1 e O2 preserva a distinção: O1 é mitigação para escritas alinhadas ao grão. Ter poucas escritas fora
+  do alinhamento não transforma O1 numa solução exata.
 

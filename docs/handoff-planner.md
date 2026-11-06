@@ -236,7 +236,10 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   2). O build está liberado para o usuário.
 - Rodada 5 (`list-diag-design.md` 8.7): o build compilou no MSVC. Com a repetição 5a2, o T4.1 dá −0,9% (ruído de ~6%
   entre rodadas iguais), sem sinal de custo. A fração reordenada varia de uma rodada para outra com o mesmo rastreador
-  (10% a 21%); a primeira leitura, "o novo reordena mais", foi retirada. O staging foi
+  (10% a 21%); a primeira leitura, "o novo reordena mais", foi retirada. Revisão: "não foi demonstrada regressão
+  líquida", e não "nenhum sinal de custo"; o `stage buffers` subiu de ~7,2% para ~9,5% (pendência 9.6 do T4); a tabela
+  do `blkcmp` foi corrigida (343 comparações até o 1º total, 306 depois; os horários sustentam a conclusão). Próximo do
+  codador: apagar a chave e fazer o contador de tamanhos e alinhamentos. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
