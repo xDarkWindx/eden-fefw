@@ -239,7 +239,13 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   (10% a 21%); a primeira leitura, "o novo reordena mais", foi retirada. Revisão: "não foi demonstrada regressão
   líquida", e não "nenhum sinal de custo"; o `stage buffers` subiu de ~7,2% para ~9,5% (pendência 9.6 do T4); a tabela
   do `blkcmp` foi corrigida (343 comparações até o 1º total, 306 depois; os horários sustentam a conclusão). Próximo do
-  codador: apagar a chave e fazer o contador de tamanhos e alinhamentos. O staging foi
+  codador: apagar a chave e fazer o contador de tamanhos e alinhamentos.
+- Feitos `d5e7158` (chave removida), `1b0d10d` (contador de tamanhos, `held_shape.h`) e `ccd9e9a` (investigação da 9.6:
+  `stage buffers` é o `BindHostStageBuffers`, ou seja, uniforms, storage e texture buffers, e não os vértices). O
+  microbenchmark foi reproduzido pelo planejador: nas faixas grandes que não acertam o `recent`, o `Track` novo custa
+  1 590-1 880 ns contra 140-270 ns do antigo; o `IsUsed` grande, 559 contra 307 ns. **Decisão do planejador:**
+  implementar a correção proposta (primeira e última palavra com `PageMask`, o meio com `std::fill`, e o mesmo no
+  `IsUsed`), sem contador por chamador antes. Depois, um build: correção mais contador de tamanhos, numa rodada do FE. O staging foi
   coerente em 203 de 203 comparações, e as diferenças continuam. **Todas as diferenças do `blkcmp` acontecem na carga da
   cena** (nas quatro rodadas; zero em ~290 comparações na cena estável). Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
