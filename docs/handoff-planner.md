@@ -64,6 +64,7 @@ mexe em `docs/` só quando o codador está parado, e diz no prompt seguinte "tra
 | `docs/gpu-contract-inventory.md` | Inventário (T2): 21 consumidores, produtores e pontos cegos, os quatro mecanismos, efeitos do nível High, apresentação, timestamps, possíveis bugs latentes, P0 (7.3) |
 | `docs/list-diag-design.md` | Desenho do diagnóstico `EDEN_LIST_DIAG` (T3): partes, livro-razão, vínculo com o lote, protocolo dos slots, custo, testes, revisões |
 | `docs/handoff-contracts-prototype.md` | Passagem do **codador** (regras, tarefas, estado) |
+| `docs/t4-coherence-fix-plan.md` | T4 (problema B): mecanismo, contrato, o que não resolve (A, M), opções O1 a O4, medições, reprodução dirigida, aceite |
 | `docs/future-optimizations-plan.md` | Preparação para engine/rasterizador separados, descriptor sets persistentes e heap bindless |
 | `docs/back-thread-split-plan.md`, `docs/perf-handoff.md`, `docs/handoff-aggressive.md` | Histórico do desempenho do FE (consulta) |
 
@@ -195,7 +196,12 @@ grep "\[ListDiag\]" LOG | sed -E 's/^\[ *[0-9.]+\] HW.GPU <Info> video_core.list
   oclusão (inventário 7.5) tem testes definidos e vem depois do T3a.2.
 - Rodada 4 (`list-diag-design.md` 8.6): o `blkcmp` achou substituições divergentes nos dois jogos, com floats próximos no
   FE e zeros no lugar de dados da GPU. O T3a.1b quase não mexeu no estouro (43,8%). Proposta: confirmar sem a
-  interferência das queries e começar o desenho do T4. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
+  interferência das queries e começar o desenho do T4.
+- Revisão da rodada 4: o desenho do T4 começa agora, e a confirmação assíncrona (T3a.2b) vai em paralelo, sem ser
+  condição. Há sete exigências do revisor para a assíncrona (staging diferido, payload próprio, fence física, fila
+  limitada, barreiras nos dois sentidos, proteção contra todas as sobrescritas, captura na posição atual). Rascunho do
+  T4: `docs/t4-coherence-fix-plan.md` (O1, grão menor no gerenciador, como candidata). Achado: `IsValid` sempre aceita.
+  O codador recebe a reprodução dirigida do B no harness e o desenho do T3a.2b. Fora do assunto: o bug de save em `profile_manager.cpp:575-586` (pasta ilegível tratada como
   vazia e apagada; `remove_all` sem `error_code`) espera o usuário dizer de qual branch partir.
 
 ## 8. Armadilhas

@@ -1,0 +1,114 @@
+# T4: corrigir a aplicação de escritas seguradas sobre bytes da GPU (rascunho do planejador)
+
+**Estado: rascunho para o revisor, sem código.** Escrito em 2026-11-06 sobre `975a068`. Graus de certeza como nos
+outros docs: **verificado** (lido no código, com `arquivo:linha`), **medido** (de quem), **hipótese**. Caminhos
+relativos a `src/`.
+
+## 1. O problema (problema B)
+
+**Mecanismo (verificado).**
+1. Uma escrita da CPU numa região que a GPU modificou é **segurada**: `OnCPUWrite` devolve `true` quando
+   `IsRegionGpuModified` (`video_core/buffer_cache/buffer_cache.h:178-182`), e o escritor só faz o `Collect`
+   (`core/memory.cpp`, `HandleRasterizerWrite`).
+2. O `GPUDirtyMemoryManager` guarda cada escrita como `TransformAddress{u32 address, u32 mask}`, num atômico de 8 B: uma
+   transformação de 2 KiB com um bit por bloco de 64 B (`core/gpu_dirty_memory_manager.h:213-224`). A posição exata da
+   escrita dentro do bloco se perde.
+3. Na aplicação, `CachedWriteMemory` lê do guest a faixa inteira dos blocos (`buffer_cache.h:159-162`).
+   `InlineMemoryImplementation` subtrai a faixa de `gpu_modified_ranges` e sobe esses bytes para o buffer do host
+   (`:2116-2136`).
+4. Em Switch 2 (`!AsyncBufferDownloads()`) só se baixa o que a CPU leu. Os bytes que só a GPU escreveu, vizinhos da
+   escrita dentro do mesmo bloco, não estão no guest, e a aplicação os sobrescreve com o valor velho do guest.
+
+**Evidência (medido pelo usuário; `docs/list-diag-design.md` 8.6, com a interpretação da revisão 7).** O `blkcmp`
+compara os bytes antigos da GPU com o payload que os substituiu, nas faixas afirmadas:
+- FE: 6 de 193 e 4 de 188 faixas com diferença.
+- Bananza: 4 de 65 faixas com diferença.
+- Formatos: no FE, floats próximos (0,42512 contra 0,41862); nos dois jogos, zeros onde a GPU tinha dado.
+
+Isso vale para a execução instrumentada; a confirmação sem `Finish` extra está na seção 5.
+
+## 2. O que o T4 precisa garantir (contrato de memória, `architecture-plan.md` 2.2)
+
+**C1.** A aplicação de uma escrita segurada só muda no host os bytes que a CPU escreveu.
+
+**C2.** Os bytes que a CPU escreveu chegam ao host antes de qualquer consumidor posterior da GPU, como hoje.
+
+**C3.** Escrita que a CPU nunca fez não aparece no host, nem com valor velho nem com zero.
+
+**O T4 não trata, e não pode dizer que trata, três problemas vizinhos (revisão da rodada 4):**
+
+| | Problema | Onde está | Por que o T4 não o resolve |
+| --- | --- | --- | --- |
+| G | Granularidade de 64 B cobrindo bytes vizinhos | este doc | é o alvo do T4 |
+| A | Download antigo publicado sobre uma escrita da CPU ainda não aplicada aos caches | `gpu-contract-inventory.md` 7.1, `list-diag-design.md` 4 | ordem entre pop e aplicação; uma máscara exata não muda essa ordem |
+| M | Aviso publicado antes de o `memcpy` terminar | `list-diag-design.md` 3.5 | o `Collect` vem antes do `memcpy` do chamador; uma aplicação no meio sobe bytes velhos |
+
+Guardar posições exatas resolve **G**. Sozinho, não resolve publicação (M), conclusão da escrita (M) nem ordem com
+downloads (A).
+
+## 3. Opções para G
+
+| # | Opção | Como | Custo e risco (hipótese, a medir) |
+| --- | --- | --- | --- |
+| O1 | **Grão menor no gerenciador** | mantém `{u32 address, u32 mask}` e o CAS de 8 B, mas troca `align_bits` de 6 para 2 ou 3. A transformação cobre 32 grãos: 128 B com grão de 4 B, 256 B com grão de 8 B. O recorte do D1 já existe (`CollectT`) | Uma mudança pequena no lugar que já foi corrigido e testado. Escritas grandes viram mais pedaços (`WriteBlock` de 4 KiB: 32 pedaços com grão de 4 B, contra 2 hoje); `back_buffer`, `Gather` e a junção por página recebem mais faixas. **Residual:** escritas menores que o grão (u8, u16 com grão de 4 B) ainda cobrem vizinhos. Com 128 B, o `address >> 7` usa todos os 32 bits, e o endereço mais alto coincide com o marcador `default_transform.address = ~0U`. Isso é inofensivo: o marcador tem máscara 0 e uma escrita ali se junta a ele (verificado na leitura de `CollectOne`, `:100-121`), mas precisa de um teste de borda |
+| O2 | **Máscara de bytes só nos blocos parciais** | mantém o grão de 64 B; quando a escrita não cobre o bloco inteiro, registra a máscara de bytes desse bloco numa estrutura à parte, por núcleo e por lote | Exato até o byte. Mas é uma segunda estrutura no caminho do escritor (~1 milhão de avisos/s no FE, medido), com o mesmo problema de capacidade do ledger do diagnóstico (estouro de 44%, medido): no estouro, ela teria de cair num comportamento seguro. Muda o protocolo do `Collect` e do `Gather` |
+| O3 | **Juntar os bytes da GPU antes de subir** | na aplicação, para um bloco que cruza `gpu_modified_ranges`, ler os bytes da GPU, sobrepor só os bytes que a CPU escreveu e subir o resultado | Precisa dos mesmos bytes exatos (O1 ou O2) para saber o que sobrepor; e ainda lê da GPU na aplicação (síncrono: picos de 20-30 ms por leitura, medido no `blkcmp`). Só faz sentido se O1 e O2 não puderem dar posições exatas |
+| O4 | **Manter o guest coerente** | baixar mais cedo o que a GPU escreve (como `AsyncBufferDownloads` em Switch 1), para que o guest tenha o valor atual e subir o bloco inteiro não estrague nada | Não muda o gerenciador. Mas traz de volta o custo de banda e de espera que o caminho de Switch 2 evita, e mexe em A (mais downloads publicados). Custo provavelmente acima do orçamento (**hipótese**) |
+
+**Proposta do planejador: O1, com o grão escolhido por medição**, e O2 só se o residual de O1 for relevante.
+Motivos:
+- muda pouco, no lugar que o D1 já corrigiu e testou;
+- não acrescenta estrutura nova com capacidade a esgotar;
+- o residual de O1 é mensurável antes de decidir.
+
+**Achado ao ler o gerenciador (verificado, preexistente, sem efeito nos dados):** `IsValid(PAddr)` testa
+`address < 2^39` (`:227-229`), mas é chamado com o campo `u32` da transformação (`:106` e `:168`), e todo `u32` passa.
+O marcador vazio (`~0U`, máscara 0) conta como válido. Então, depois de cada `Gather`, o primeiro `Collect` de cada
+núcleo com outro endereço toma o `guard` e empilha uma transformação vazia em `back_buffer`, e o `Gather` empilha a sua
+no `front_buffer`. As duas têm máscara 0 e não geram faixa; custam uma trava e uma inserção a mais por núcleo e por
+`Gather` (~1 800 `Gather`/s no FE, medido no D1). Corrigir é trocar o teste por `address != ~0U`; vale medir junto com
+O1, que mexe no mesmo lugar.
+
+## 4. Medições antes de escolher o grão (baratas, só com as estatísticas)
+
+Um contador no `BackStats`, no mesmo ponto da contagem do D1 (`core/memory.cpp`, antes de `CollectNotice`). Para os
+pedaços segurados, conta tamanho e alinhamento:
+- quantos estão alinhados e são múltiplos de 4 B e de 8 B;
+- quantos são menores que 4 B;
+- quantos pedaços a mais cada grão produziria (`ceil` do tamanho alinhado dividido pelo grão, contra o de hoje).
+
+Isso dá o residual de O1 com grão de 4 B e de 8 B e o aumento de pedaços. Também dá para ver se os grandes vêm de
+`WriteBlock`, que o contador por fonte do D1 já separa.
+
+## 5. Confirmação e reprodução (em paralelo; não é condição para o desenho)
+
+- **Reprodução dirigida no harness (antes de qualquer código do T4).** O teste usa o `GPUDirtyMemoryManager` real, um
+  `RangeSet` como `gpu_modified_ranges` e dois vetores de bytes, o host e o guest. Roteiro:
+  1. a GPU escreve os bytes [0, 32) de um bloco;
+  2. a CPU escreve [40, 44);
+  3. a aplicação lê do guest e sobe o que o `Gather` devolveu.
+  Hoje, os bytes [0, 32) do host voltam ao valor velho do guest: o teste reproduz o B. Com cada opção, o teste diz o que
+  sobra (com O1 e grão de 4 B, só [40, 44) sobe). O teste não usa `BufferCache<P>`; o que ele não cobre é dito.
+- **`blkcmp` assíncrono (T3a.2b).** Confirma ocorrências nos jogos sem `Finish` extra nem submissões a mais. Ainda é uma
+  execução instrumentada (cópias, barreiras, restrição de reordenação), como diz a revisão da rodada 4. As exigências do
+  revisor viram o escopo do desenho (`list-diag-design.md` 3.8.2, requisito da versão assíncrona).
+
+## 6. Critérios de aceite do T4 (a detalhar com o desenho escolhido)
+
+- **Reprodução dirigida:** o host mantém os bytes da GPU vizinhos à escrita; as escritas da CPU chegam inteiras.
+- **Harness do gerenciador (D1, T3a.1):** equivalência das saídas do `Gather` com o grão novo; diagnóstico com
+  `N=1` igual ao de antes, a não ser pela granularidade.
+- **Nos jogos:**
+  - `blkcmp` (síncrono e assíncrono) sem diferenças nas faixas afirmadas, ou com as que sobrarem explicadas pelo
+    residual medido;
+  - custo dentro do orçamento (`architecture-plan.md` 12.1), medido como em 7.4.1.
+- **Declarado:** A e M continuam em aberto.
+
+## 7. Perguntas para o revisor
+
+1. O1 como primeira candidata faz sentido, ou há algo no `Gather`, na junção por página ou nos consumidores das faixas
+   (`OnCachedWrites`) que quebre com grão menor que 64 B?
+2. O `IsValid` que sempre aceita (seção 3, achado) deve ser corrigido junto com O1, ou num item à parte antes dele, já que
+   muda quantas vezes o `guard` é tomado?
+3. A reprodução dirigida descrita na seção 5 basta como "reprodução" para validar opções, ou deve incluir também A e M,
+   para mostrar que O1 não os resolve?
