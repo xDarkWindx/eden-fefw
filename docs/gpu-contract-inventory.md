@@ -486,17 +486,19 @@ contra o `gpu_dirty_memory_manager.h` real (stub de página do harness, `g++ -st
 
 ### 7.4.1 D1: desenho da correção e da contagem (sem código)
 
-Só desenho; **nada do emulador foi escrito**. Números de linha são os de `72e41f1`.
+**Estado: implementado em `dee6963`, aguardando o A/B do usuário** (o revisor vê o diff antes de o usuário compilar). O texto
+abaixo é o desenho; os três ajustes do revisor (marcados **AJUSTE**) já estão incorporados. Números de linha: os de `72e41f1`.
 
 **Recorte, dentro de `CollectT` (`core/gpu_dirty_memory_manager.h:60-85`), nas duas variantes.** O corpo atual
 (`:65-84`: `BuildTransform` e o laço de CAS) vira `CollectOne<Diag, Hooks>(address, size)`, sem mudança alguma (mesmas
 ordens). `CollectT` passa a ser:
 
 ```
-size == 0 e chave ligada:  retorna (sem construir máscara)
-(address & 2047) + size <= 2048:   CollectOne(address, size)         // o caminho de hoje, sem laço e sem ler a chave
-senão, chave desligada:            CollectOne(address, size)         // o código de hoje, com o comportamento indefinido
-senão:  enquanto size > 0:  n = min(size, 2048 - (address & 2047));  CollectOne(address, n);  address += n;  size -= n
+size == 0:  retorna SEMPRE, antes de tudo (sem ler a chave, sem máscara)                  // AJUSTE 1
+size <= page_size - (address & page_mask):  CollectOne(address, size)   // o caminho de hoje, sem laço e sem ler a chave // AJUSTE 2
+senão, chave desligada:  CollectOne(address, size)   // o código de hoje, com comportamento indefinido: só referência experimental
+senão:  repete  n = min(size, page_size - (address & page_mask));  CollectOne(address, n);  address += n;  size -= n;
+        entre dois pedaços: Hooks::At("c.between_pieces")
 ```
 
 - 2048 é `page_size` (`:182`, `1 << page_bits`); a conta usa a constante, não o literal. Cada pedaço cabe numa
@@ -532,11 +534,13 @@ ou o segue, `s2 != s`: o aviso sai **ambíguo**, com `hi = s2 + 1` (3.7.3, passo
 lotes nunca recebe um lote só**: só o caso inequívoco atribui `d + 1`. O registro é um só (o aviso inteiro, com o
 tamanho original); o que a aplicação cobre de cada lote é decidido pelo `exact`/`Suspect` como hoje.
 
-**Contagem (só com `EDEN_BACK_THREAD_STATS=1`; sem as estatísticas nada é lido nem escrito).**
+**Contagem (só com `EDEN_BACK_THREAD_STATS=1`).** Sem as estatísticas **nenhum contador é atualizado**. O que o fonte não
+elimina: a checagem de `BackStats::Enabled()` (uma carga e um desvio) e a passagem de `Src` a `HandleRasterizerWrite`; o custo
+disso depende do código gerado e **não foi medido nem conferido no binário**.
 
 1. *Pedaços que cruzam 2 KiB.* Em `core/memory.cpp`, no lambda de `HandleRasterizerWrite`, **imediatamente antes** da
    chamada `CollectNotice` (`:768`), dentro de `if (BackStats::Enabled())`:
-   `if ((address & 2047) + size > 2048) { Add(shared.dirty_cross_calls, 1); Add(shared.dirty_cross_bytes, size);
+   `if (GPUDirtyMemoryManager::CrossesTransform(address, size)) {   // size > page_size - (address & page_mask), a mesma função de CollectT Add(shared.dirty_cross_calls, 1); Add(shared.dirty_cross_bytes, size);
    Add(shared.dirty_cross_by_source[src], 1); }`. Só passam por ali os pedaços **segurados** (o lambda retorna antes
    se `OnCPUWrite` não segura, `:752-755`); é o conjunto que o `Collect` vê. Também `dirty_held_calls` (o denominador).
    **Fonte:** `HandleRasterizerWrite(v_address, size, src = Src::Other)` ganha um parâmetro `enum class Src : u8`,
@@ -571,14 +575,21 @@ ASan+UBSan **com zero erro de UBSan**: o `shift exponent` do 7.4 não pode apare
 | 1 | Faixa exata de 2 KiB (`[0x10000,+2048)`, `[0x10800,+2048)`) | um pedaço; devolve a faixa inteira |
 | 2 | Página inteira de 4 KiB (`[0x10000,+4096)`) | dois pedaços; `Gather` devolve `[0x10000,+4096)` (pode vir em duas faixas contíguas) |
 | 3 | Início desalinhado (`[0x10033,+3000)`, `[0x107ff,+2)`) | cobre todo byte, arredondado a 64 B |
-| 4 | Cruzamento curto `[0x107c0,+128)` | duas faixas de 64 B; hoje (chave 0) não devolve nada |
-| 5 | Tamanho zero | chave ligada: sem efeito, sem UB; chave desligada: o de hoje (só no build sem UBSan) |
+| 4 | Cruzamento curto `[0x107c0,+128)` | duas faixas de 64 B: `[0x107c0,+64)` e `[0x10800,+64)` |
+| 5 | Tamanho zero não muda nada | **AJUSTE 3:** com a chave ligada e desligada, nas duas variantes, `Gather` vazio e sem UB |
 | 6 | Os casos da tabela do 7.4 | `[0x10000,+4096)`, `[0x10400,+2048)`, `[0x107c0,+128)`, `[0x10000,+3000)`, `[0x10000,+2048)`+`[0x10040,+64)`: faixas inteiras, arredondadas a 64 B |
 | 7 | Equivalência aleatória | para `(endereço, tamanho)` dentro de uma página de 4 KiB, a união do `Gather` cobre **todo byte escrito** e não passa do arredondamento de 64 B; nas duas variantes |
-| 8 | Chave em 0 | saída idêntica à do código de hoje (o legado de `list_diag_legacy_manager.h`) nos casos que não cruzam 2 KiB; nos que cruzam, o teste só confere que a chave 0 reproduz a tabela do 7.4 (sem UBSan) |
+| 8 | Equivalência com o legado | **AJUSTE 3:** com a chave em 0, saída idêntica à do legado (`list_diag_legacy_manager.h`) **só** em entradas válidas, que não cruzam 2 KiB. A tabela do 7.4 com a chave em 0 **não é teste** (comportamento indefinido, sem saída garantida); a correção é validada contra a união esperada, arredondada a 64 B, com UBSan limpo |
 | 9 | Determinístico: `Gather` entre os dois pedaços de um aviso, diagnóstico ligado | parada em `c.between_pieces`; o `Gather` retira; o aviso sai **ambíguo**, nenhum dos dois lotes o afirma (`blk_affirmed = 0`), os dois pedaços aparecem em lotes diferentes na saída do `Gather` |
 | 10 | Pedaços sem `Gather` no meio | aviso inequívoco, os dois pedaços no lote `d + 1` |
 | 11 | Chave lida uma vez | `DirtySplit2K()` só muda com `store` explícito do teste |
+
+**Resultado dos harnesses (`dee6963`).** `tools/list-diag-harness/run.sh`, 32 casos de teste (8 novos, `[d1]`; os testes 5/8 já com o
+AJUSTE 3): `-O2`, TSan e ASan+UBSan, cada um **All tests passed (77312 assertions in 32 test cases)**; o UBSan
+(`-fno-sanitize-recover`) não acusa nada com a chave ligada. Sensibilidade: com o recorte forçado a desligado, 5 dos 8 casos
+`[d1]` falham (7029 asserções). O harness dos contratos (`tools/gpu-contract-harness`) não inclui o gerenciador real e não foi
+rodado de novo. **Não compilado aqui:** `core/memory.cpp` e `video_core/gpu.cpp` (faltam os cabeçalhos do ffmpeg); a
+`back_thread_stats.cpp` só dá os erros de versão do `fmt` que o arquivo sem a mudança já dá.
 
 **Interação com o T3a.1 e o resto.** O D1 vem antes do T3a.1 (o bug contamina o que ele mede). A aplicação de um
 aviso recortado cobre as duas metades, e o `apply_partial` que o bug produzia deve cair (hipótese). Uma queda de
